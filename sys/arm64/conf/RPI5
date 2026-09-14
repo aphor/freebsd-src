@@ -1,0 +1,50 @@
+#
+# RPI5 -- Raspberry Pi 5 (BCM2712 + RP1) kernel configuration for FreeBSD/arm64
+#
+# Builds on BROADCOM and adds the BCM2712 SoC and RP1 southbridge drivers.
+# The Pi 5 boots either ACPI or FDT, so both are enabled.
+#
+# For more information on this file, please read the config(5) manual page,
+# and/or the handbook section on Kernel Configuration Files:
+#
+#    https://docs.freebsd.org/en/books/handbook/kernelconfig/#kernelconfig-config
+#
+
+#NO_UNIVERSE
+
+include		"BROADCOM"
+ident		RPI5
+
+options 	FDT
+
+# The CYW43455 WiFi part is on SDIO, and dev/sdio is only built with MMCCAM,
+# so the Pi 5 uses the CAM-based MMC stack rather than the classic one.
+options 	MMCCAM
+nodevice	mmc
+nodevice	mmcsd
+
+# BCM2712 SoC
+device		bcm2712			# PWM + thermal sensor
+device		bcm2712_pcie		# PCIe ACPI interrupt shim for RP1
+device		rpi5_fan		# Pi 5 cooling fan thermal control
+
+# RP1 southbridge
+device		rp1_gpio		# GPIO + pinctrl
+device		rp1_eth			# Gigabit Ethernet (Cadence GEM)
+device		rp1_pcie2_recon		# PCIe2 host controller diagnostics
+
+# 802.11 stack, required by the statically linked cyw(4) driver
+device		wlan			# 802.11 support
+options 	IEEE80211_DEBUG		# enable debug msgs
+options 	IEEE80211_SUPPORT_MESH	# enable 802.11s draft support
+device		wlan_wep		# 802.11 WEP support
+device		wlan_tkip		# 802.11 TKIP support
+device		wlan_ccmp		# 802.11 CCMP support
+device		wlan_gcmp		# 802.11 GCMP support
+device		wlan_amrr		# AMRR transmit rate control algorithm
+
+# On-board radio
+device		cyw			# CYW43455 SDIO WiFi
+
+# USB ethernet
+device		uether
