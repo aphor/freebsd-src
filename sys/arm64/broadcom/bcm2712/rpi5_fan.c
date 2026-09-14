@@ -30,6 +30,11 @@ static int rpi5_debug = 0;
 /* Sysctl context for fan control */
 static struct sysctl_ctx_list rpi5_sysctl_ctx;
 
+/* Tunable limits: milli-Celsius, except speed which is a raw PWM level. */
+#define	RPI5_FAN_TEMP_MAX	120000	/* 120C */
+#define	RPI5_FAN_HYST_MAX	10000	/* 10C */
+#define	RPI5_FAN_SPEED_MAX	255
+
 /* RPi5 Cooling Fan Control Structure */
 struct rpi5_cooling_fan {
 	struct mtx mtx;
@@ -105,6 +110,39 @@ static int rpi5_sysctl_current_temp_handler(SYSCTL_HANDLER_ARGS);
 static int rpi5_sysctl_current_state_handler(SYSCTL_HANDLER_ARGS);
 static int rpi5_sysctl_fan_rpm_handler(SYSCTL_HANDLER_ARGS);
 
+/*
+ * Return the threshold slot for a fan level, or NULL when the level is
+ * outside 0..3.  Callers pass level +/- 1 to reach a neighbour and rely
+ * on NULL meaning "no neighbour on that side".
+ */
+static uint32_t *
+rpi5_fan_temp_slot(int level)
+{
+	switch (level) {
+	case 0:		return (&cooling_fan.fan_temp0);
+	case 1:		return (&cooling_fan.fan_temp1);
+	case 2:		return (&cooling_fan.fan_temp2);
+	case 3:		return (&cooling_fan.fan_temp3);
+	default:	return (NULL);
+	}
+}
+
+/*
+ * Saturating "threshold - hysteresis".
+ *
+ * Both operands are uint32_t, so a hysteresis larger than the threshold it
+ * applies to wraps the difference to just under UINT32_MAX -- a value no
+ * plausible CPU temperature can exceed.  The comparison in
+ * rpi5_update_fan_state() would then read false where it should read true,
+ * dropping the fan out of its current level instead of holding it there.
+ * Clamp the floor at 0 rather than wrapping.
+ */
+static uint32_t
+rpi5_hyst_floor(uint32_t threshold, uint32_t hyst)
+{
+	return (hyst >= threshold ? 0 : threshold - hyst);
+}
+
 /* Check if bcm2712 module is available */
 static int
 rpi5_check_bcm2712(void)
@@ -136,15 +174,18 @@ rpi5_update_fan_state(void)
 		new_state = 4;  /* Max speed */
 	} else if (temp >= cooling_fan.fan_temp2 &&
 	           (cooling_fan.fan_prev_state < 3 ||
-	            temp >= (cooling_fan.fan_temp2 - cooling_fan.fan_temp2_hyst))) {
+	            temp >= rpi5_hyst_floor(cooling_fan.fan_temp2,
+	                cooling_fan.fan_temp2_hyst))) {
 		new_state = 3;  /* High speed */
 	} else if (temp >= cooling_fan.fan_temp1 &&
 	           (cooling_fan.fan_prev_state < 2 ||
-	            temp >= (cooling_fan.fan_temp1 - cooling_fan.fan_temp1_hyst))) {
+	            temp >= rpi5_hyst_floor(cooling_fan.fan_temp1,
+	                cooling_fan.fan_temp1_hyst))) {
 		new_state = 2;  /* Medium speed */
 	} else if (temp >= cooling_fan.fan_temp0 &&
 	           (cooling_fan.fan_prev_state == 0 ||
-	            temp >= (cooling_fan.fan_temp0 - cooling_fan.fan_temp0_hyst))) {
+	            temp >= rpi5_hyst_floor(cooling_fan.fan_temp0,
+	                cooling_fan.fan_temp0_hyst))) {
 		new_state = 1;  /* Low speed */
 	} else {
 		new_state = 0;  /* Idle */
@@ -228,6 +269,8 @@ static int
 rpi5_sysctl_temp_handler(SYSCTL_HANDLER_ARGS)
 {
 	uint32_t *temp_ptr = (uint32_t *)arg1;
+	int level = (int)arg2;
+	uint32_t *neighbor;
 	uint32_t temp;
 	int error;
 
@@ -240,10 +283,34 @@ rpi5_sysctl_temp_handler(SYSCTL_HANDLER_ARGS)
 		return (error);
 
 	/* Validate range: 0-120°C */
-	if (temp > 120000)
+	if (temp > RPI5_FAN_TEMP_MAX)
 		return (EINVAL);
 
 	mtx_lock(&cooling_fan.mtx);
+
+	/*
+	 * Thresholds must stay strictly ascending.  rpi5_update_fan_state()
+	 * tests them from the top down, so an out-of-order threshold does not
+	 * misbehave so much as disappear: the level it guards becomes
+	 * unreachable because a lower threshold already matched.  Equal
+	 * thresholds have the same effect, so reject those too.
+	 *
+	 * Each knob is checked only against its immediate neighbours, both
+	 * read under the lock so concurrent writers cannot race past one
+	 * another.  Shifting the whole curve therefore takes several writes,
+	 * ordered so the sequence stays ascending at every step.
+	 */
+	neighbor = rpi5_fan_temp_slot(level - 1);
+	if (neighbor != NULL && temp <= *neighbor) {
+		mtx_unlock(&cooling_fan.mtx);
+		return (EINVAL);
+	}
+	neighbor = rpi5_fan_temp_slot(level + 1);
+	if (neighbor != NULL && temp >= *neighbor) {
+		mtx_unlock(&cooling_fan.mtx);
+		return (EINVAL);
+	}
+
 	*temp_ptr = temp;
 	mtx_unlock(&cooling_fan.mtx);
 
@@ -266,7 +333,7 @@ rpi5_sysctl_hyst_handler(SYSCTL_HANDLER_ARGS)
 		return (error);
 
 	/* Validate range: 0-10°C */
-	if (hyst > 10000)
+	if (hyst > RPI5_FAN_HYST_MAX)
 		return (EINVAL);
 
 	mtx_lock(&cooling_fan.mtx);
@@ -292,7 +359,7 @@ rpi5_sysctl_speed_handler(SYSCTL_HANDLER_ARGS)
 		return (error);
 
 	/* Validate range: 0-255 */
-	if (speed > 255)
+	if (speed > RPI5_FAN_SPEED_MAX)
 		return (EINVAL);
 
 	mtx_lock(&cooling_fan.mtx);
@@ -384,17 +451,17 @@ rpi5_modevent(module_t mod, int event, void *data)
 					SYSCTL_ADD_PROC(&rpi5_sysctl_ctx, SYSCTL_CHILDREN(fan_tree),
 					    OID_AUTO, "temp1",
 					    CTLTYPE_UINT | CTLFLAG_RW | CTLFLAG_MPSAFE,
-					    &cooling_fan.fan_temp1, 0, rpi5_sysctl_temp_handler, "IU",
+					    &cooling_fan.fan_temp1, 1, rpi5_sysctl_temp_handler, "IU",
 					    "Level 1 temperature threshold (mC)");
 					SYSCTL_ADD_PROC(&rpi5_sysctl_ctx, SYSCTL_CHILDREN(fan_tree),
 					    OID_AUTO, "temp2",
 					    CTLTYPE_UINT | CTLFLAG_RW | CTLFLAG_MPSAFE,
-					    &cooling_fan.fan_temp2, 0, rpi5_sysctl_temp_handler, "IU",
+					    &cooling_fan.fan_temp2, 2, rpi5_sysctl_temp_handler, "IU",
 					    "Level 2 temperature threshold (mC)");
 					SYSCTL_ADD_PROC(&rpi5_sysctl_ctx, SYSCTL_CHILDREN(fan_tree),
 					    OID_AUTO, "temp3",
 					    CTLTYPE_UINT | CTLFLAG_RW | CTLFLAG_MPSAFE,
-					    &cooling_fan.fan_temp3, 0, rpi5_sysctl_temp_handler, "IU",
+					    &cooling_fan.fan_temp3, 3, rpi5_sysctl_temp_handler, "IU",
 					    "Level 3 temperature threshold (mC)");
 
 					/* Hysteresis values */
