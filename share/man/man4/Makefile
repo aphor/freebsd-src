@@ -139,6 +139,7 @@ MAN=	aac.4 \
 	cxgbe.4 \
 	cxgbev.4 \
 	cyapa.4 \
+	cyw.4 \
 	da.4 \
 	dc.4 \
 	dcons.4 \

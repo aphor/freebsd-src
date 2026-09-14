@@ -1577,6 +1577,15 @@ t7fw_cfg_uwire.fw	optional cxgbe					\
 dev/cxgbe/crypto/t4_crypto.c	optional ccr \
 	compile-with "${NORMAL_C} -I$S/dev/cxgbe"
 dev/cyapa/cyapa.c		optional cyapa iicbus
+dev/cyw/cyw.c			optional cyw mmccam
+dev/cyw/cyw_cfg.c		optional cyw mmccam
+dev/cyw/cyw_events.c		optional cyw mmccam
+dev/cyw/cyw_fw.c		optional cyw mmccam
+dev/cyw/cyw_fwil.c		optional cyw mmccam
+dev/cyw/cyw_scan.c		optional cyw mmccam
+dev/cyw/cyw_sdio.c		optional cyw mmccam
+dev/cyw/cyw_sdpcm.c		optional cyw mmccam
+dev/cyw/cyw_security.c		optional cyw mmccam
 dev/dc/if_dc.c			optional dc pci
 dev/dc/dcphy.c			optional dc pci
 dev/dc/pnphy.c			optional dc pci

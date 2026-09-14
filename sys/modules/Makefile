@@ -100,6 +100,7 @@ SUBDIR=	\
 	ctl \
 	${_cxgb} \
 	${_cxgbe} \
+	${_cyw} \
 	dc \
 	dcons \
 	dcons_crom \
@@ -747,6 +748,7 @@ _armv8crypto=	armv8crypto
 _armv8_rng=	armv8_rng
 _bcm2712=	bcm2712
 _bcm2712_pcie=	bcm2712_pcie
+_cyw=		cyw
 _rp1_eth=	rp1_eth
 _rp1_gpio=	rp1_gpio
 _rp1_pcie2_recon=	rp1_pcie2_recon
