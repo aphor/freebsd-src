@@ -61,6 +61,7 @@ SUBDIR=	\
 	axgbe \
 	backlight \
 	${_bce} \
+	${_bcm2712} \
 	${_bcm283x_clkman} \
 	${_bcm283x_pwm} \
 	bfe \
@@ -739,6 +740,7 @@ _cxgb=		cxgb
 .if ${MACHINE_CPUARCH} == "aarch64"
 _armv8crypto=	armv8crypto
 _armv8_rng=	armv8_rng
+_bcm2712=	bcm2712
 _dpaa2=		dpaa2
 _sff=		sff
 _em=		em
