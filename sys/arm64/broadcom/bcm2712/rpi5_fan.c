@@ -109,6 +109,8 @@ static int rpi5_sysctl_speed_handler(SYSCTL_HANDLER_ARGS);
 static int rpi5_sysctl_current_temp_handler(SYSCTL_HANDLER_ARGS);
 static int rpi5_sysctl_current_state_handler(SYSCTL_HANDLER_ARGS);
 static int rpi5_sysctl_fan_rpm_handler(SYSCTL_HANDLER_ARGS);
+static int rpi5_sysctl_thresholds_handler(SYSCTL_HANDLER_ARGS);
+static void rpi5_warn_collapsed(int level, uint32_t lo, uint32_t hi);
 
 /*
  * Return the threshold slot for a fan level, or NULL when the level is
@@ -351,12 +353,10 @@ rpi5_sysctl_temp_handler(SYSCTL_HANDLER_ARGS)
 	 * satisfies the higher one too, and the top-down ladder picks the
 	 * higher state.
 	 */
-	if (lower != NULL && temp == *lower)
-		printf("rpi5_fan: temp%d == temp%d (%u mC): fan state %d is "
-		    "now unreachable\n", level - 1, level, temp, level);
-	if (upper != NULL && temp == *upper)
-		printf("rpi5_fan: temp%d == temp%d (%u mC): fan state %d is "
-		    "now unreachable\n", level, level + 1, temp, level + 1);
+	if (lower != NULL)
+		rpi5_warn_collapsed(level - 1, *lower, temp);
+	if (upper != NULL)
+		rpi5_warn_collapsed(level, temp, *upper);
 
 	hyst = rpi5_fan_hyst_slot(level);
 	if (hyst != NULL && *hyst >= temp && temp != 0)
@@ -466,6 +466,100 @@ rpi5_sysctl_fan_rpm_handler(SYSCTL_HANDLER_ARGS)
 
 	rpm = bcm2712_read_fan_rpm();
 	return (sysctl_handle_int(oidp, &rpm, 0, req));
+}
+
+/*
+ * Warn about a threshold pair that collapses a fan state.  Caller holds the
+ * softc mutex.
+ */
+static void
+rpi5_warn_collapsed(int level, uint32_t lo, uint32_t hi)
+{
+	if (lo == hi)
+		printf("rpi5_fan: temp%d == temp%d (%u mC): fan state %d is "
+		    "now unreachable\n", level, level + 1, lo, level + 1);
+}
+
+/*
+ * hw.rpi5.fan.thresholds — read or replace all four thresholds at once.
+ *
+ * The per-knob temp{0..3} nodes are each validated against their immediate
+ * neighbours, which makes write ORDER significant: a target curve that
+ * crosses the current one cannot be reached in a single ascending or
+ * descending pass, because some intermediate step inverts a pair.  This
+ * node takes the whole curve as one string, validates it as a set, and
+ * applies it under a single lock — so it either takes effect completely or
+ * not at all, whatever the current values happen to be.
+ *
+ * Format is four ascending milli-Celsius values, e.g.
+ *	sysctl hw.rpi5.fan.thresholds="50000 60000 67500 75000"
+ */
+static int
+rpi5_sysctl_thresholds_handler(SYSCTL_HANDLER_ARGS)
+{
+	char buf[64];
+	uint32_t v[4];
+	uint32_t *slot, *hyst;
+	const char *cp;
+	char *ep;
+	int error, i;
+
+	mtx_lock(&cooling_fan.mtx);
+	snprintf(buf, sizeof(buf), "%u %u %u %u",
+	    cooling_fan.fan_temp0, cooling_fan.fan_temp1,
+	    cooling_fan.fan_temp2, cooling_fan.fan_temp3);
+	mtx_unlock(&cooling_fan.mtx);
+
+	error = sysctl_handle_string(oidp, buf, sizeof(buf), req);
+	if (error || req->newptr == NULL)
+		return (error);
+
+	/* Exactly four unsigned decimal values, whitespace separated. */
+	cp = buf;
+	for (i = 0; i < 4; i++) {
+		while (*cp == ' ' || *cp == '\t')
+			cp++;
+		if (*cp < '0' || *cp > '9')
+			return (EINVAL);
+		v[i] = (uint32_t)strtoul(cp, &ep, 10);
+		if (ep == cp)
+			return (EINVAL);
+		cp = ep;
+	}
+	while (*cp == ' ' || *cp == '\t' || *cp == '\n' || *cp == '\r')
+		cp++;
+	if (*cp != '\0')
+		return (EINVAL);
+
+	for (i = 0; i < 4; i++)
+		if (v[i] > RPI5_FAN_TEMP_MAX)
+			return (EINVAL);
+
+	/* Non-decreasing, same rule the per-knob nodes enforce. */
+	if (v[0] > v[1] || v[1] > v[2] || v[2] > v[3])
+		return (EINVAL);
+
+	mtx_lock(&cooling_fan.mtx);
+
+	cooling_fan.fan_temp0 = v[0];
+	cooling_fan.fan_temp1 = v[1];
+	cooling_fan.fan_temp2 = v[2];
+	cooling_fan.fan_temp3 = v[3];
+
+	for (i = 0; i < 3; i++)
+		rpi5_warn_collapsed(i, v[i], v[i + 1]);
+	for (i = 0; i < 4; i++) {
+		slot = rpi5_fan_temp_slot(i);
+		hyst = rpi5_fan_hyst_slot(i);
+		if (slot != NULL && hyst != NULL && *slot != 0 &&
+		    *hyst >= *slot)
+			printf("rpi5_fan: temp%d_hyst (%u mC) >= temp%d "
+			    "(%u mC): hysteresis floor clamps to 0\n",
+			    i, *hyst, i, *slot);
+	}
+
+	mtx_unlock(&cooling_fan.mtx);
+	return (0);
 }
 
 /* Module load handler */
@@ -585,6 +679,13 @@ rpi5_modevent(module_t mod, int event, void *data)
 					    CTLTYPE_UINT | CTLFLAG_RD | CTLFLAG_MPSAFE,
 					    NULL, 0, rpi5_sysctl_current_state_handler, "IU",
 					    "Current fan state (0-4)");
+					SYSCTL_ADD_PROC(&rpi5_sysctl_ctx, SYSCTL_CHILDREN(fan_tree),
+					    OID_AUTO, "thresholds",
+					    CTLTYPE_STRING | CTLFLAG_RW |
+					    CTLFLAG_MPSAFE,
+					    NULL, 0,
+					    rpi5_sysctl_thresholds_handler, "A",
+					    "All four thresholds (mC), ascending, set atomically");
 					SYSCTL_ADD_PROC(&rpi5_sysctl_ctx, SYSCTL_CHILDREN(fan_tree),
 					    OID_AUTO, "rpm",
 					    CTLTYPE_UINT | CTLFLAG_RD | CTLFLAG_MPSAFE,
