@@ -62,6 +62,7 @@ SUBDIR=	\
 	backlight \
 	${_bce} \
 	${_bcm2712} \
+	${_bcm2712_pcie} \
 	${_bcm283x_clkman} \
 	${_bcm283x_pwm} \
 	bfe \
@@ -741,6 +742,7 @@ _cxgb=		cxgb
 _armv8crypto=	armv8crypto
 _armv8_rng=	armv8_rng
 _bcm2712=	bcm2712
+_bcm2712_pcie=	bcm2712_pcie
 _dpaa2=		dpaa2
 _sff=		sff
 _em=		em
