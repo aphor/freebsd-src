@@ -96,7 +96,6 @@ static struct rpi5_cooling_fan cooling_fan = {
 /* Forward declarations */
 static void rpi5_thermal_tick(void *arg);
 static void rpi5_update_fan_state(void);
-static int rpi5_find_pwm_device(void);
 
 /* sysctl handlers */
 static int rpi5_sysctl_temp_handler(SYSCTL_HANDLER_ARGS);
@@ -377,67 +376,81 @@ rpi5_modevent(module_t mod, int event, void *data)
 
 				if (fan_tree != NULL) {
 					/* Temperature thresholds (in milli-Celsius) */
-					SYSCTL_ADD_UINT(&rpi5_sysctl_ctx, SYSCTL_CHILDREN(fan_tree),
-					    OID_AUTO, "temp0", CTLFLAG_RW | CTLFLAG_MPSAFE,
-					    &cooling_fan.fan_temp0, 0,
+					SYSCTL_ADD_PROC(&rpi5_sysctl_ctx, SYSCTL_CHILDREN(fan_tree),
+					    OID_AUTO, "temp0",
+					    CTLTYPE_UINT | CTLFLAG_RW | CTLFLAG_MPSAFE,
+					    &cooling_fan.fan_temp0, 0, rpi5_sysctl_temp_handler, "IU",
 					    "Level 0 temperature threshold (mC)");
-					SYSCTL_ADD_UINT(&rpi5_sysctl_ctx, SYSCTL_CHILDREN(fan_tree),
-					    OID_AUTO, "temp1", CTLFLAG_RW | CTLFLAG_MPSAFE,
-					    &cooling_fan.fan_temp1, 0,
+					SYSCTL_ADD_PROC(&rpi5_sysctl_ctx, SYSCTL_CHILDREN(fan_tree),
+					    OID_AUTO, "temp1",
+					    CTLTYPE_UINT | CTLFLAG_RW | CTLFLAG_MPSAFE,
+					    &cooling_fan.fan_temp1, 0, rpi5_sysctl_temp_handler, "IU",
 					    "Level 1 temperature threshold (mC)");
-					SYSCTL_ADD_UINT(&rpi5_sysctl_ctx, SYSCTL_CHILDREN(fan_tree),
-					    OID_AUTO, "temp2", CTLFLAG_RW | CTLFLAG_MPSAFE,
-					    &cooling_fan.fan_temp2, 0,
+					SYSCTL_ADD_PROC(&rpi5_sysctl_ctx, SYSCTL_CHILDREN(fan_tree),
+					    OID_AUTO, "temp2",
+					    CTLTYPE_UINT | CTLFLAG_RW | CTLFLAG_MPSAFE,
+					    &cooling_fan.fan_temp2, 0, rpi5_sysctl_temp_handler, "IU",
 					    "Level 2 temperature threshold (mC)");
-					SYSCTL_ADD_UINT(&rpi5_sysctl_ctx, SYSCTL_CHILDREN(fan_tree),
-					    OID_AUTO, "temp3", CTLFLAG_RW | CTLFLAG_MPSAFE,
-					    &cooling_fan.fan_temp3, 0,
+					SYSCTL_ADD_PROC(&rpi5_sysctl_ctx, SYSCTL_CHILDREN(fan_tree),
+					    OID_AUTO, "temp3",
+					    CTLTYPE_UINT | CTLFLAG_RW | CTLFLAG_MPSAFE,
+					    &cooling_fan.fan_temp3, 0, rpi5_sysctl_temp_handler, "IU",
 					    "Level 3 temperature threshold (mC)");
 
 					/* Hysteresis values */
-					SYSCTL_ADD_UINT(&rpi5_sysctl_ctx, SYSCTL_CHILDREN(fan_tree),
-					    OID_AUTO, "temp0_hyst", CTLFLAG_RW | CTLFLAG_MPSAFE,
-					    &cooling_fan.fan_temp0_hyst, 0,
+					SYSCTL_ADD_PROC(&rpi5_sysctl_ctx, SYSCTL_CHILDREN(fan_tree),
+					    OID_AUTO, "temp0_hyst",
+					    CTLTYPE_UINT | CTLFLAG_RW | CTLFLAG_MPSAFE,
+					    &cooling_fan.fan_temp0_hyst, 0, rpi5_sysctl_hyst_handler, "IU",
 					    "Level 0 hysteresis (mC)");
-					SYSCTL_ADD_UINT(&rpi5_sysctl_ctx, SYSCTL_CHILDREN(fan_tree),
-					    OID_AUTO, "temp1_hyst", CTLFLAG_RW | CTLFLAG_MPSAFE,
-					    &cooling_fan.fan_temp1_hyst, 0,
+					SYSCTL_ADD_PROC(&rpi5_sysctl_ctx, SYSCTL_CHILDREN(fan_tree),
+					    OID_AUTO, "temp1_hyst",
+					    CTLTYPE_UINT | CTLFLAG_RW | CTLFLAG_MPSAFE,
+					    &cooling_fan.fan_temp1_hyst, 0, rpi5_sysctl_hyst_handler, "IU",
 					    "Level 1 hysteresis (mC)");
-					SYSCTL_ADD_UINT(&rpi5_sysctl_ctx, SYSCTL_CHILDREN(fan_tree),
-					    OID_AUTO, "temp2_hyst", CTLFLAG_RW | CTLFLAG_MPSAFE,
-					    &cooling_fan.fan_temp2_hyst, 0,
+					SYSCTL_ADD_PROC(&rpi5_sysctl_ctx, SYSCTL_CHILDREN(fan_tree),
+					    OID_AUTO, "temp2_hyst",
+					    CTLTYPE_UINT | CTLFLAG_RW | CTLFLAG_MPSAFE,
+					    &cooling_fan.fan_temp2_hyst, 0, rpi5_sysctl_hyst_handler, "IU",
 					    "Level 2 hysteresis (mC)");
-					SYSCTL_ADD_UINT(&rpi5_sysctl_ctx, SYSCTL_CHILDREN(fan_tree),
-					    OID_AUTO, "temp3_hyst", CTLFLAG_RW | CTLFLAG_MPSAFE,
-					    &cooling_fan.fan_temp3_hyst, 0,
+					SYSCTL_ADD_PROC(&rpi5_sysctl_ctx, SYSCTL_CHILDREN(fan_tree),
+					    OID_AUTO, "temp3_hyst",
+					    CTLTYPE_UINT | CTLFLAG_RW | CTLFLAG_MPSAFE,
+					    &cooling_fan.fan_temp3_hyst, 0, rpi5_sysctl_hyst_handler, "IU",
 					    "Level 3 hysteresis (mC)");
 
 					/* PWM speeds (0-255) */
-					SYSCTL_ADD_UINT(&rpi5_sysctl_ctx, SYSCTL_CHILDREN(fan_tree),
-					    OID_AUTO, "speed0", CTLFLAG_RW | CTLFLAG_MPSAFE,
-					    &cooling_fan.fan_temp0_speed, 0,
+					SYSCTL_ADD_PROC(&rpi5_sysctl_ctx, SYSCTL_CHILDREN(fan_tree),
+					    OID_AUTO, "speed0",
+					    CTLTYPE_UINT | CTLFLAG_RW | CTLFLAG_MPSAFE,
+					    &cooling_fan.fan_temp0_speed, 0, rpi5_sysctl_speed_handler, "IU",
 					    "Level 0 PWM speed (0-255)");
-					SYSCTL_ADD_UINT(&rpi5_sysctl_ctx, SYSCTL_CHILDREN(fan_tree),
-					    OID_AUTO, "speed1", CTLFLAG_RW | CTLFLAG_MPSAFE,
-					    &cooling_fan.fan_temp1_speed, 0,
+					SYSCTL_ADD_PROC(&rpi5_sysctl_ctx, SYSCTL_CHILDREN(fan_tree),
+					    OID_AUTO, "speed1",
+					    CTLTYPE_UINT | CTLFLAG_RW | CTLFLAG_MPSAFE,
+					    &cooling_fan.fan_temp1_speed, 0, rpi5_sysctl_speed_handler, "IU",
 					    "Level 1 PWM speed (0-255)");
-					SYSCTL_ADD_UINT(&rpi5_sysctl_ctx, SYSCTL_CHILDREN(fan_tree),
-					    OID_AUTO, "speed2", CTLFLAG_RW | CTLFLAG_MPSAFE,
-					    &cooling_fan.fan_temp2_speed, 0,
+					SYSCTL_ADD_PROC(&rpi5_sysctl_ctx, SYSCTL_CHILDREN(fan_tree),
+					    OID_AUTO, "speed2",
+					    CTLTYPE_UINT | CTLFLAG_RW | CTLFLAG_MPSAFE,
+					    &cooling_fan.fan_temp2_speed, 0, rpi5_sysctl_speed_handler, "IU",
 					    "Level 2 PWM speed (0-255)");
-					SYSCTL_ADD_UINT(&rpi5_sysctl_ctx, SYSCTL_CHILDREN(fan_tree),
-					    OID_AUTO, "speed3", CTLFLAG_RW | CTLFLAG_MPSAFE,
-					    &cooling_fan.fan_temp3_speed, 0,
+					SYSCTL_ADD_PROC(&rpi5_sysctl_ctx, SYSCTL_CHILDREN(fan_tree),
+					    OID_AUTO, "speed3",
+					    CTLTYPE_UINT | CTLFLAG_RW | CTLFLAG_MPSAFE,
+					    &cooling_fan.fan_temp3_speed, 0, rpi5_sysctl_speed_handler, "IU",
 					    "Level 3 PWM speed (0-255)");
 
 					/* Read-only status */
-					SYSCTL_ADD_UINT(&rpi5_sysctl_ctx, SYSCTL_CHILDREN(fan_tree),
-					    OID_AUTO, "cpu_temp", CTLFLAG_RD | CTLFLAG_MPSAFE,
-					    &cooling_fan.cpu_temp, 0,
+					SYSCTL_ADD_PROC(&rpi5_sysctl_ctx, SYSCTL_CHILDREN(fan_tree),
+					    OID_AUTO, "cpu_temp",
+					    CTLTYPE_UINT | CTLFLAG_RD | CTLFLAG_MPSAFE,
+					    NULL, 0, rpi5_sysctl_current_temp_handler, "IU",
 					    "Current CPU temperature (mC)");
-					SYSCTL_ADD_UINT(&rpi5_sysctl_ctx, SYSCTL_CHILDREN(fan_tree),
-					    OID_AUTO, "current_state", CTLFLAG_RD | CTLFLAG_MPSAFE,
-					    &cooling_fan.fan_current_state, 0,
+					SYSCTL_ADD_PROC(&rpi5_sysctl_ctx, SYSCTL_CHILDREN(fan_tree),
+					    OID_AUTO, "current_state",
+					    CTLTYPE_UINT | CTLFLAG_RD | CTLFLAG_MPSAFE,
+					    NULL, 0, rpi5_sysctl_current_state_handler, "IU",
 					    "Current fan state (0-4)");
 					SYSCTL_ADD_PROC(&rpi5_sysctl_ctx, SYSCTL_CHILDREN(fan_tree),
 					    OID_AUTO, "rpm",
