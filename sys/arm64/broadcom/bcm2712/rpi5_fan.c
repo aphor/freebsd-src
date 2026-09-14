@@ -67,6 +67,18 @@ struct rpi5_cooling_fan {
 	/* Current CPU temperature (mC) */
 	uint32_t cpu_temp;
 
+	/*
+	 * Low and high water marks of the thermal sensor.  The minimum is
+	 * the best available proxy for inlet air temperature: the coldest
+	 * the die reaches, which happens with the fan running and no load.
+	 * Calibration uses it to express results as a rise above ambient,
+	 * so a cooler measured on a warm day compares with one measured on
+	 * a cold day.
+	 */
+	uint32_t temp_min;
+	uint32_t temp_max;
+	bool temp_seen;
+
 	/* Thermal management */
 	int thermal_active;
 	struct callout thermal_callout;
@@ -94,6 +106,7 @@ static struct rpi5_cooling_fan cooling_fan = {
 
 	.fan_current_state = 0,
 	.cpu_temp = 50000,
+	.temp_seen = false,
 };
 
 /* Forward declarations */
@@ -108,6 +121,7 @@ static int rpi5_sysctl_current_temp_handler(SYSCTL_HANDLER_ARGS);
 static int rpi5_sysctl_current_state_handler(SYSCTL_HANDLER_ARGS);
 static int rpi5_sysctl_fan_rpm_handler(SYSCTL_HANDLER_ARGS);
 static int rpi5_sysctl_thresholds_handler(SYSCTL_HANDLER_ARGS);
+static int rpi5_sysctl_watermark_handler(SYSCTL_HANDLER_ARGS);
 static void rpi5_warn_collapsed(int level, uint32_t lo, uint32_t hi);
 
 /*
@@ -315,6 +329,22 @@ rpi5_thermal_tick(void *arg)
 		temp = cooling_fan.cpu_temp;
 	} else {
 		cooling_fan.cpu_temp = temp;
+
+		/*
+		 * Seed both marks from the first real reading rather than the
+		 * placeholder cpu_temp, or the minimum would report a
+		 * temperature the sensor never produced.
+		 */
+		if (!cooling_fan.temp_seen) {
+			cooling_fan.temp_seen = true;
+			cooling_fan.temp_min = temp;
+			cooling_fan.temp_max = temp;
+		} else {
+			if (temp < cooling_fan.temp_min)
+				cooling_fan.temp_min = temp;
+			if (temp > cooling_fan.temp_max)
+				cooling_fan.temp_max = temp;
+		}
 	}
 
 	/* Update fan based on new temperature */
@@ -593,6 +623,37 @@ rpi5_sysctl_thresholds_handler(SYSCTL_HANDLER_ARGS)
 	return (0);
 }
 
+/*
+ * Low/high water marks.  Writable so a measurement run can restart the
+ * tracking: write a high value to temp_min (or a low one to temp_max) and
+ * the next tick pulls the mark to the live temperature.
+ */
+static int
+rpi5_sysctl_watermark_handler(SYSCTL_HANDLER_ARGS)
+{
+	uint32_t *mark = (uint32_t *)arg1;
+	uint32_t value;
+	int error;
+
+	mtx_lock(&cooling_fan.mtx);
+	value = cooling_fan.temp_seen ? *mark : cooling_fan.cpu_temp;
+	mtx_unlock(&cooling_fan.mtx);
+
+	error = sysctl_handle_int(oidp, &value, 0, req);
+	if (error || req->newptr == NULL)
+		return (error);
+
+	if (value > RPI5_FAN_TEMP_MAX)
+		return (EINVAL);
+
+	mtx_lock(&cooling_fan.mtx);
+	*mark = value;
+	cooling_fan.temp_seen = true;
+	mtx_unlock(&cooling_fan.mtx);
+
+	return (0);
+}
+
 /* Module load handler */
 static int
 rpi5_modevent(module_t mod, int event, void *data)
@@ -710,6 +771,20 @@ rpi5_modevent(module_t mod, int event, void *data)
 					    CTLTYPE_UINT | CTLFLAG_RD | CTLFLAG_MPSAFE,
 					    NULL, 0, rpi5_sysctl_current_state_handler, "IU",
 					    "Current fan state (0-4)");
+					SYSCTL_ADD_PROC(&rpi5_sysctl_ctx, SYSCTL_CHILDREN(fan_tree),
+					    OID_AUTO, "temp_min",
+					    CTLTYPE_UINT | CTLFLAG_RW |
+					    CTLFLAG_MPSAFE,
+					    &cooling_fan.temp_min, 0,
+					    rpi5_sysctl_watermark_handler, "IU",
+					    "Lowest temperature seen (mC); ambient proxy, writable to reset");
+					SYSCTL_ADD_PROC(&rpi5_sysctl_ctx, SYSCTL_CHILDREN(fan_tree),
+					    OID_AUTO, "temp_max",
+					    CTLTYPE_UINT | CTLFLAG_RW |
+					    CTLFLAG_MPSAFE,
+					    &cooling_fan.temp_max, 0,
+					    rpi5_sysctl_watermark_handler, "IU",
+					    "Highest temperature seen (mC); writable to reset");
 					SYSCTL_ADD_PROC(&rpi5_sysctl_ctx, SYSCTL_CHILDREN(fan_tree),
 					    OID_AUTO, "thresholds",
 					    CTLTYPE_STRING | CTLFLAG_RW |
