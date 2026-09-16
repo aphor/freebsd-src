@@ -163,6 +163,7 @@ struct rpi5_nn_state {
 	int	warned;			/* warning currently asserted */
 	int	stall_run;		/* consecutive ticks of a silent fan */
 	int	stalled;		/* stall fault currently asserted */
+	int32_t	dd_ema;			/* smoothed duty request, Q16 counts */
 };
 
 /*
@@ -180,11 +181,13 @@ struct rpi5_nn_policy {
 	int32_t	rate_up;	/* duty counts per tick, rising */
 	int32_t	rate_down;	/* duty counts per tick, falling */
 	int32_t	dd_scale;	/* output scale of the duty-delta head */
+	int32_t	dd_shift;	/* EMA of the duty request: alpha = 2^-dd_shift, 0 = off */
 };
 
 #define	NN_STALL_TICKS	10	/* silent fan at real duty -> fault */
 
 struct rpi5_nn_result {
+	int32_t	in[NN_N_IN];	/* the visible units this tick used */
 	int32_t	duty;		/* duty to program this tick */
 	int32_t	pred_now;	/* predicted equilibrium at current duty, mC */
 	int32_t	pred_max;	/* predicted equilibrium at full duty, mC */

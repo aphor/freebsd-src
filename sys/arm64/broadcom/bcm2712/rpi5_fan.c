@@ -141,10 +141,16 @@ static struct rpi5_cooling_fan cooling_fan = {
 
 	.controller = RPI5_CTRL_NN,
 	/*
-	 * Policy defaults, chosen in simulation against 200 unseen plants
-	 * (tools/rpi5_fan_nn/train.c).  tol = 14000 is the gate width at which
-	 * the learned controller matched the curve on safety, used a third less
-	 * fan, and was smoother -- better on every objective at once.  crit sits
+	 * Policy defaults, chosen in simulation against 200 unseen plants with
+	 * the measured sensor model in the loop (tools/rpi5_fan_nn/train.c).
+	 *
+	 * tol = 4000 and dd_shift = 3: safety tied with the region curve, 46%
+	 * less mean duty, corrections 29 counts/min against the curve's 31, no
+	 * reversals of 4 counts or more, and recovery from a supervisor trip to
+	 * below duty 50 in 70 s.  tol = 2000 is 2% lower on duty but makes 24%
+	 * larger corrections.  An earlier default of 14000 was a mistake: a hold
+	 * band that wide left the fan latched at full speed on an idle board after
+	 * a supervisor trip, which dunn demonstrated.  crit sits
 	 * below the 80 C throttle point so the supervisor acts before the SoC
 	 * clock-limits rather than in the same tick.  A 60 tick debounce on the
 	 * inadequate-cooling warning caught 95.6% of sustained under-cooled
@@ -153,7 +159,7 @@ static struct rpi5_cooling_fan cooling_fan = {
 	 */
 	.nn_pol = {
 		.target = 65000,
-		.tol = 14000,
+		.tol = 4000,
 		.spec = 75000,
 		.crit = 78000,
 		.warn_margin = 2000,
@@ -161,6 +167,7 @@ static struct rpi5_cooling_fan cooling_fan = {
 		.rate_up = 24,
 		.rate_down = 4,
 		.dd_scale = RPI5_NN_DD_SCALE,
+		.dd_shift = 3,
 	},
 };
 
@@ -1093,6 +1100,8 @@ rpi5_modevent(module_t mod, int event, void *data)
 						    "Maximum duty rise per tick");
 						NN_TUNE("rate_down", rate_down, 255,
 						    "Maximum duty fall per tick");
+						NN_TUNE("dd_shift", dd_shift, 8,
+						    "Request smoothing: EMA alpha = 2^-dd_shift, 0 = off");
 #undef NN_TUNE
 						SYSCTL_ADD_INT(&rpi5_sysctl_ctx, nl, OID_AUTO,
 						    "duty", CTLFLAG_RD | CTLFLAG_MPSAFE,

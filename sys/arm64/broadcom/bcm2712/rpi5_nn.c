@@ -161,6 +161,7 @@ rpi5_nn_init(struct rpi5_nn_state *s, int32_t target_mC, int32_t duty)
 	s->warned = 0;
 	s->stall_run = 0;
 	s->stalled = 0;
+	s->dd_ema = 0;
 }
 
 /* Fan rpm the commanded duty should produce; zero inside the stall band. */
@@ -295,13 +296,15 @@ rpi5_nn_step(struct rpi5_nn_state *s, const struct rpi5_nn_weights *w,
     const struct rpi5_nn_policy *pol, int32_t temp_mC, int32_t rpm,
     struct rpi5_nn_result *r)
 {
-	int32_t in[NN_N_IN], out[NN_N_OUT], dd, gap;
+	int32_t out[NN_N_OUT], dd, gap;
 	int64_t dd64;
 
 	r->gated = r->supervised = r->warn_edge = r->stall_edge = 0;
 
-	rpi5_nn_features(s, temp_mC, rpm, pol->target, in);
-	rpi5_nn_forward(w, in, out);
+	/* Features are kept in the result so a caller -- the trainer's DAgger
+	 * rounds in particular -- sees exactly the inputs this tick acted on. */
+	rpi5_nn_features(s, temp_mC, rpm, pol->target, r->in);
+	rpi5_nn_forward(w, r->in, out);
 	r->pred_now = rpi5_nn_temp_mC(out[NN_OUT_TEQ_NOW]);
 	r->pred_max = rpi5_nn_temp_mC(out[NN_OUT_TEQ_MAX]);
 
@@ -313,16 +316,55 @@ rpi5_nn_step(struct rpi5_nn_state *s, const struct rpi5_nn_weights *w,
 	dd = (int32_t)dd64;
 
 	/*
-	 * Confidence gate.  Act only when the network predicts that holding the
-	 * current duty would NOT settle near the target.  Never gate while the
-	 * die is at or above target: holding still is not a safe default there.
+	 * Confidence gate: act only when the change is predicted to CONVERGE the
+	 * die toward the target.
+	 *
+	 * The first version held whenever the predicted equilibrium was within
+	 * tol of target, in either direction.  That is a band, not a convergence
+	 * test, and it latched: after a supervisor trip an idle die predicted to
+	 * settle 12 C below target at full fan was "within 14 C", so the gate
+	 * forbade the reduction and the fan stayed at full speed indefinitely.
+	 * Any tol wider than the gap between target and the fan-off idle
+	 * equilibrium latches -- a gap that depends on the board and the room.
+	 *
+	 * Lowering duty raises the equilibrium; raising duty lowers it.  So with
+	 * gap = pred_now - target:
+	 *
+	 *   die below target  within tol of target: hold, the duty is doing its job
+	 *                     predicted below:  reductions converge, increases
+	 *                                       are noise -- block increases
+	 *                     predicted above:  block reductions
+	 *   die at or above   never block an increase; allow a reduction only if
+	 *   target            the prediction is confidently below target
+	 *
+	 * The directional rule blocks noise-driven moves the wrong way and made
+	 * the controller smoother at every tol.  It does NOT remove the latch:
+	 * the "within tol" hold still applies to convergent reductions, and in
+	 * simulation tol = 14000 still left an idle fan at duty 81 after a trip.
+	 * A wide hold zone below target keeps the fan running while the die sits
+	 * degrees under target, which the objective ranks as waste, so tol must
+	 * stay small.  Smoothing is done in time instead, by dd_shift below.
 	 */
 	gap = r->pred_now - pol->target;
-	if (gap < 0)
-		gap = -gap;
-	if (gap < pol->tol && temp_mC < pol->target) {
+	if (temp_mC < pol->target) {
+		if ((gap < 0 ? -gap : gap) < pol->tol ||
+		    (dd > 0 && gap < 0) || (dd < 0 && gap > 0)) {
+			dd = 0;
+			r->gated = 1;
+		}
+	} else if (dd < 0 && gap >= -pol->tol) {
 		dd = 0;
 		r->gated = 1;
+	}
+
+	/*
+	 * Smooth the request in time rather than holding it in value.  An EMA
+	 * averages zero-mean dither away while a sustained request still passes,
+	 * and unlike a hold band it has no zone in which the fan can latch.
+	 */
+	if (pol->dd_shift > 0) {
+		s->dd_ema += (dd - s->dd_ema) >> pol->dd_shift;
+		dd = s->dd_ema;
 	}
 
 	r->duty = rpi5_nn_apply_delta(s, dd, pol->rate_up, pol->rate_down);
@@ -336,6 +378,7 @@ rpi5_nn_step(struct rpi5_nn_state *s, const struct rpi5_nn_weights *w,
 	if (temp_mC >= pol->crit) {
 		s->duty = 255;
 		s->acc_q8 = 255 << 8;
+		s->dd_ema = 0;
 		r->duty = 255;
 		r->supervised = 1;
 	}
