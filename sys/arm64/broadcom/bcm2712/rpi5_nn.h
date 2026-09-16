@@ -101,8 +101,64 @@ struct rpi5_nn_weights {
 	int32_t	b3[NN_N_OUT];
 };
 
+/*
+ * Scaling of the integral terms.  Each tick adds the current error, so the
+ * integral is in mC*s; it is clamped to +/- the bound before scaling.
+ */
+#define	NN_TEMP_I_BOUND	300000		/* ~30 s at a 10 C error */
+#define	NN_TEMP_I_SCALE	100000
+#define	NN_RPM_I_BOUND	300000
+#define	NN_RPM_I_SCALE	100000
+
+#define	NN_WINDOW	60		/* samples in the sliding window */
+#define	NN_RPM_PER_DUTY	39		/* measured: ~39 rpm per duty count */
+#define	NN_STALL_DUTY	16		/* measured: lowest duty that spins */
+
+/*
+ * P/I/D state for one signal.  The update deliberately reproduces the P/I/D
+ * lines of pidctrl_classic() (sys/kern/subr_pidctrl.c) -- error is
+ * setpoint - input, the integral is clamped to [-bound, bound], and the
+ * derivative is the change in error since the last call.  It is carried here
+ * rather than calling pidctrl_classic() itself because the trainer must
+ * compute features bit-exactly the way the kernel does, and it cannot link a
+ * kernel symbol.  The gain divisors and output term of pidctrl are not used:
+ * the network is the controller.
+ */
+struct rpi5_nn_pid {
+	int32_t	setpoint;
+	int32_t	bound;
+	int32_t	error;		/* P */
+	int32_t	olderror;
+	int32_t	integral;	/* I */
+	int32_t	derivative;	/* D */
+};
+
+/*
+ * Everything the controller carries between ticks.  Sensor reading and PWM
+ * writing are the only parts of a tick that are not in this file.
+ */
+struct rpi5_nn_state {
+	struct rpi5_nn_pid	pid_temp;
+	struct rpi5_nn_pid	pid_wmin;
+	struct rpi5_nn_pid	pid_wmax;
+	struct rpi5_nn_pid	pid_rpm;
+	int32_t	win[NN_WINDOW];		/* recent temperatures, mC */
+	int	win_head;
+	int	win_fill;
+	int32_t	ambient;		/* since-reset low water mark, mC */
+	int	ambient_seen;
+	int32_t	acc_q8;			/* delta-sigma accumulator, duty Q8 */
+	int32_t	duty;			/* currently commanded duty, 0..255 */
+};
+
 void	rpi5_nn_forward(const struct rpi5_nn_weights *w, const int32_t *in,
 	    int32_t *out);
+void	rpi5_nn_init(struct rpi5_nn_state *s, int32_t target_mC,
+	    int32_t duty);
+void	rpi5_nn_features(struct rpi5_nn_state *s, int32_t temp_mC,
+	    int32_t rpm, int32_t target_mC, int32_t *in);
+int32_t	rpi5_nn_apply_delta(struct rpi5_nn_state *s, int32_t ddelta_q16,
+	    int32_t rate_max);
 
 /* Q16 value = scaled integer ratio, with the same floor semantics as >>. */
 int32_t	rpi5_nn_ratio(int64_t num, int64_t den);
