@@ -221,7 +221,13 @@ bcm2712_pwm_set_config(u_int channel, u_int period_ns, u_int duty_ns)
 	if (sc == NULL || !sc->pwm_mapped)
 		return (ENODEV);
 
-	/* Convert nanoseconds to RP1 PWM clock cycles (50 MHz = 20 ns/tick). */
+	/*
+	 * Convert nanoseconds to RP1 PWM clock cycles.  The clock is
+	 * 6.144 MHz, so RP1_PWM_CLK_PERIOD_NS is 163 ns per tick -- not the
+	 * 50 MHz this comment used to claim.  For the fan's 41566 ns period
+	 * that makes range exactly 255, so a 0-255 speed maps one-to-one
+	 * onto duty ticks and 255 is precisely full scale.
+	 */
 	range = (period_ns + RP1_PWM_CLK_PERIOD_NS / 2) / RP1_PWM_CLK_PERIOD_NS;
 	duty  = (duty_ns  + RP1_PWM_CLK_PERIOD_NS / 2) / RP1_PWM_CLK_PERIOD_NS;
 

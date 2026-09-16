@@ -68,12 +68,15 @@ struct rpi5_cooling_fan {
 	uint32_t cpu_temp;
 
 	/*
-	 * Low and high water marks of the thermal sensor.  The minimum is
-	 * the best available proxy for inlet air temperature: the coldest
-	 * the die reaches, which happens with the fan running and no load.
-	 * Calibration uses it to express results as a rise above ambient,
-	 * so a cooler measured on a warm day compares with one measured on
-	 * a cold day.
+	 * Low and high water marks of the thermal sensor, used by calibration
+	 * to express results as a rise above ambient so a cooler measured on a
+	 * warm day compares with one measured on a cold day.
+	 *
+	 * The minimum is only an ambient proxy while the fan is actually
+	 * running.  An idle board sits in region 0 with the fan stopped, so
+	 * the floor it reaches is bounded by temp0 - temp0_hyst rather than by
+	 * airflow.  A caller wanting the fan-cooled floor must force the fan
+	 * on first, for example thresholds="0 0 0 0".
 	 */
 	uint32_t temp_min;
 	uint32_t temp_max;
@@ -102,7 +105,7 @@ static struct rpi5_cooling_fan cooling_fan = {
 	.fan_temp0_speed = 75,
 	.fan_temp1_speed = 125,
 	.fan_temp2_speed = 175,
-	.fan_temp3_speed = 250,
+	.fan_temp3_speed = 255,
 
 	.fan_current_state = 0,
 	.cpu_temp = 50000,
@@ -152,6 +155,22 @@ rpi5_fan_hyst_slot(int level)
 	case 1:		return (&cooling_fan.fan_temp1_hyst);
 	case 2:		return (&cooling_fan.fan_temp2_hyst);
 	case 3:		return (&cooling_fan.fan_temp3_hyst);
+	default:	return (NULL);
+	}
+}
+
+/*
+ * Return the speed slot for a fan region's governing knob, or NULL outside
+ * 0..3.  Region k (k >= 1) is governed by speed[k-1]; region 0 has none.
+ */
+static uint32_t *
+rpi5_fan_speed_slot(int level)
+{
+	switch (level) {
+	case 0:		return (&cooling_fan.fan_temp0_speed);
+	case 1:		return (&cooling_fan.fan_temp1_speed);
+	case 2:		return (&cooling_fan.fan_temp2_speed);
+	case 3:		return (&cooling_fan.fan_temp3_speed);
 	default:	return (NULL);
 	}
 }
@@ -226,6 +245,45 @@ rpi5_next_state(uint32_t temp, uint32_t state)
 	return (down);
 }
 
+/*
+ * Duty for a fan region.
+ *
+ * Four thresholds cut the temperature axis into five regions, and each region
+ * above the lowest is governed by one speed knob:
+ *
+ *	region 0   T <  temp0             fan off
+ *	region 1   temp0 <= T < temp1     speed0
+ *	region 2   temp1 <= T < temp2     speed1
+ *	region 3   temp2 <= T < temp3     speed2
+ *	region 4   T >= temp3             speed3
+ *
+ * The region number equals the state number from rpi5_next_state(), so the
+ * hold band that governs leaving a state is also the hold band that governs
+ * leaving its region.
+ *
+ * Take the maximum over every knob the region has passed, not just its own.
+ * Nothing validates that the speed table ascends, and with a descending entry
+ * a plain "speed = speed[region-1]" would slow the fan down as the die got
+ * hotter.  A maximum over a growing prefix is non-decreasing in temperature
+ * whatever order the table is in, which is the property actually worth
+ * guaranteeing.  Region 0 needs no special case: its prefix is empty, so the
+ * maximum is 0 and no knob can lift the fan off its stop.
+ */
+static uint32_t
+rpi5_region_speed(uint32_t region)
+{
+	uint32_t *sp, speed;
+	int i;
+
+	speed = 0;
+	for (i = 0; i < 4 && (uint32_t)i < region; i++) {
+		sp = rpi5_fan_speed_slot(i);
+		if (sp != NULL && *sp > speed)
+			speed = *sp;
+	}
+	return (speed);
+}
+
 /* Check if bcm2712 module is available */
 static int
 rpi5_check_bcm2712(void)
@@ -274,32 +332,10 @@ rpi5_update_fan_state(void)
 	 *     current_state == N previously had no effect until the next
 	 *     state transition.  Now it takes effect within one second.
 	 *
-	 * State 0 idles at fan_temp0_speed (minimum always-on speed) rather
-	 * than 0 so the fan is never completely stopped — matching Pi 5
-	 * active-cooler design intent.
-	 *
-	 * Run at the highest speed any satisfied level calls for.  Reaching
-	 * state S means every threshold below S has been crossed, so the
-	 * speeds for levels 0..min(S,3) are all permitted by the current
-	 * thresholds; take the largest.  Nothing validates that the speed
-	 * table ascends, and with a descending entry the old
-	 * "speed = speed[state]" mapping would slow the fan down as the CPU
-	 * got hotter.  Choosing the maximum fails toward more cooling.
-	 *
-	 * For an ascending speed table this selects exactly what the old
-	 * per-state mapping did.  States 3 and 4 share fan_temp3_speed:
-	 * there are five states and only four speed knobs.
+	 * Below temp0 the fan stops outright.  See rpi5_region_speed() for the
+	 * region-to-knob mapping.
 	 */
-	speed = cooling_fan.fan_temp0_speed;
-	if (cooling_fan.fan_current_state >= 1 &&
-	    cooling_fan.fan_temp1_speed > speed)
-		speed = cooling_fan.fan_temp1_speed;
-	if (cooling_fan.fan_current_state >= 2 &&
-	    cooling_fan.fan_temp2_speed > speed)
-		speed = cooling_fan.fan_temp2_speed;
-	if (cooling_fan.fan_current_state >= 3 &&
-	    cooling_fan.fan_temp3_speed > speed)
-		speed = cooling_fan.fan_temp3_speed;
+	speed = rpi5_region_speed(cooling_fan.fan_current_state);
 
 	/* Convert speed (0-255) to duty cycle nanoseconds */
 	duty = (speed * period) / 255;
@@ -386,8 +422,9 @@ rpi5_sysctl_temp_handler(SYSCTL_HANDLER_ARGS)
 	 * neighbour does not misbehave so much as disappear: the level it
 	 * guards can never be selected.  Genuinely out-of-order values are
 	 * rejected; equal neighbours are permitted but warned about, since
-	 * collapsing two thresholds is a legitimate way to disable a level
-	 * (or the whole fan, by raising every threshold to the same value).
+	 * collapsing two thresholds is a legitimate way to disable a level.
+	 * Raising every threshold to the same value really does disable the
+	 * whole fan now: everything below the lowest threshold is region 0.
 	 *
 	 * Each knob is compared only against its immediate neighbours, both
 	 * read under the lock so concurrent writers cannot race past one
@@ -743,22 +780,22 @@ rpi5_modevent(module_t mod, int event, void *data)
 					    OID_AUTO, "speed0",
 					    CTLTYPE_UINT | CTLFLAG_RW | CTLFLAG_MPSAFE,
 					    &cooling_fan.fan_temp0_speed, 0, rpi5_sysctl_speed_handler, "IU",
-					    "Level 0 PWM speed (0-255)");
+					    "PWM speed for temp0 <= T < temp1 (0-255)");
 					SYSCTL_ADD_PROC(&rpi5_sysctl_ctx, SYSCTL_CHILDREN(fan_tree),
 					    OID_AUTO, "speed1",
 					    CTLTYPE_UINT | CTLFLAG_RW | CTLFLAG_MPSAFE,
-					    &cooling_fan.fan_temp1_speed, 0, rpi5_sysctl_speed_handler, "IU",
-					    "Level 1 PWM speed (0-255)");
+					    &cooling_fan.fan_temp1_speed, 1, rpi5_sysctl_speed_handler, "IU",
+					    "PWM speed for temp1 <= T < temp2 (0-255)");
 					SYSCTL_ADD_PROC(&rpi5_sysctl_ctx, SYSCTL_CHILDREN(fan_tree),
 					    OID_AUTO, "speed2",
 					    CTLTYPE_UINT | CTLFLAG_RW | CTLFLAG_MPSAFE,
-					    &cooling_fan.fan_temp2_speed, 0, rpi5_sysctl_speed_handler, "IU",
-					    "Level 2 PWM speed (0-255)");
+					    &cooling_fan.fan_temp2_speed, 2, rpi5_sysctl_speed_handler, "IU",
+					    "PWM speed for temp2 <= T < temp3 (0-255)");
 					SYSCTL_ADD_PROC(&rpi5_sysctl_ctx, SYSCTL_CHILDREN(fan_tree),
 					    OID_AUTO, "speed3",
 					    CTLTYPE_UINT | CTLFLAG_RW | CTLFLAG_MPSAFE,
-					    &cooling_fan.fan_temp3_speed, 0, rpi5_sysctl_speed_handler, "IU",
-					    "Level 3 PWM speed (0-255)");
+					    &cooling_fan.fan_temp3_speed, 3, rpi5_sysctl_speed_handler, "IU",
+					    "PWM speed for T >= temp3 (0-255)");
 
 					/* Read-only status */
 					SYSCTL_ADD_PROC(&rpi5_sysctl_ctx, SYSCTL_CHILDREN(fan_tree),
@@ -770,7 +807,7 @@ rpi5_modevent(module_t mod, int event, void *data)
 					    OID_AUTO, "current_state",
 					    CTLTYPE_UINT | CTLFLAG_RD | CTLFLAG_MPSAFE,
 					    NULL, 0, rpi5_sysctl_current_state_handler, "IU",
-					    "Current fan state (0-4)");
+					    "Current fan region (0-4); 0 = fan off");
 					SYSCTL_ADD_PROC(&rpi5_sysctl_ctx, SYSCTL_CHILDREN(fan_tree),
 					    OID_AUTO, "temp_min",
 					    CTLTYPE_UINT | CTLFLAG_RW |
@@ -855,5 +892,5 @@ static moduledata_t rpi5_mod = {
 };
 
 DECLARE_MODULE(rpi5_fan, rpi5_mod, SI_SUB_DRIVERS, SI_ORDER_MIDDLE);
-MODULE_VERSION(rpi5_fan, 1);
+MODULE_VERSION(rpi5_fan, 2);
 MODULE_DEPEND(rpi5_fan, bcm2712, 1, 1, 1);
