@@ -146,7 +146,10 @@ static struct rpi5_cooling_fan cooling_fan = {
 	 * the learned controller matched the curve on safety, used a third less
 	 * fan, and was smoother -- better on every objective at once.  crit sits
 	 * below the 80 C throttle point so the supervisor acts before the SoC
-	 * clock-limits rather than in the same tick.
+	 * clock-limits rather than in the same tick.  A 60 tick debounce on the
+	 * inadequate-cooling warning caught 95.6% of sustained under-cooled
+	 * episodes at 0.39 false alarms per hour, against 1.41 at 15 ticks; the
+	 * warning is a log message, and emergencies belong to the supervisor.
 	 */
 	.nn_pol = {
 		.target = 65000,
@@ -154,7 +157,7 @@ static struct rpi5_cooling_fan cooling_fan = {
 		.spec = 75000,
 		.crit = 78000,
 		.warn_margin = 2000,
-		.debounce = 15,
+		.debounce = 60,
 		.rate_up = 24,
 		.rate_down = 4,
 		.dd_scale = RPI5_NN_DD_SCALE,
@@ -1138,7 +1141,7 @@ rpi5_modevent(module_t mod, int event, void *data)
 						SYSCTL_ADD_INT(&rpi5_sysctl_ctx, nl, OID_AUTO,
 						    "temp_d", CTLFLAG_RD | CTLFLAG_MPSAFE,
 						    &cooling_fan.nn.pid_temp.derivative, 0,
-						    "Temperature D term (mC per tick)");
+						    "Temperature D term: change over NN_SLOPE_N ticks (mC)");
 						SYSCTL_ADD_PROC(&rpi5_sysctl_ctx, nl, OID_AUTO,
 						    "reset_weights",
 						    CTLTYPE_INT | CTLFLAG_WR | CTLFLAG_MPSAFE,

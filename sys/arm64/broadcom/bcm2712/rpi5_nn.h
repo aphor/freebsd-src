@@ -111,18 +111,24 @@ struct rpi5_nn_weights {
 #define	NN_RPM_I_SCALE	100000
 
 #define	NN_WINDOW	60		/* samples in the sliding window */
+#define	NN_SLOPE_N	20		/* ticks the derivative is measured over */
 #define	NN_RPM_PER_DUTY	39		/* measured: ~39 rpm per duty count */
 #define	NN_STALL_DUTY	16		/* measured: lowest duty that spins */
 
 /*
- * P/I/D state for one signal.  The update deliberately reproduces the P/I/D
- * lines of pidctrl_classic() (sys/kern/subr_pidctrl.c) -- error is
- * setpoint - input, the integral is clamped to [-bound, bound], and the
- * derivative is the change in error since the last call.  It is carried here
- * rather than calling pidctrl_classic() itself because the trainer must
- * compute features bit-exactly the way the kernel does, and it cannot link a
- * kernel symbol.  The gain divisors and output term of pidctrl are not used:
- * the network is the controller.
+ * P/I/D state for one signal.  P and I reproduce pidctrl_classic()
+ * (sys/kern/subr_pidctrl.c) exactly: error is setpoint - input and the
+ * integral is clamped to [-bound, bound].  They are carried here rather than
+ * calling pidctrl_classic() because the trainer must compute features
+ * bit-exactly the way the kernel does and cannot link a kernel symbol.
+ *
+ * D deliberately does NOT follow pidctrl_classic(), which takes the change in
+ * error since the last call.  The BCM2712 sensor quantises to 550 mC with
+ * correlated noise of about 500 mC, so at 1 Hz a one-tick difference is
+ * almost entirely noise: on dunn, a flat idle die produced one-tick changes
+ * of up to +/-2200 mC on a third of all ticks, and the first network read
+ * each flicker as a real 0.55 C/s slope.  D here is the change in error over
+ * the last NN_SLOPE_N ticks, and derivative/dspan together give the slope.
  */
 struct rpi5_nn_pid {
 	int32_t	setpoint;
@@ -130,7 +136,11 @@ struct rpi5_nn_pid {
 	int32_t	error;		/* P */
 	int32_t	olderror;
 	int32_t	integral;	/* I */
-	int32_t	derivative;	/* D */
+	int32_t	derivative;	/* change in error over dspan ticks */
+	int32_t	dspan;		/* ticks the derivative spans, 1..NN_SLOPE_N */
+	int32_t	ehist[NN_SLOPE_N];
+	int	hpos;
+	int	hfill;
 };
 
 /*

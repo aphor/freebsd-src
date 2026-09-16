@@ -93,7 +93,7 @@ static void
 rpi5_nn_pid_update(struct rpi5_nn_pid *pc, int32_t input)
 {
 	int64_t integ;
-	int32_t error;
+	int32_t error, oldest;
 
 	error = pc->setpoint - input;
 	pc->olderror = pc->error;
@@ -104,15 +104,36 @@ rpi5_nn_pid_update(struct rpi5_nn_pid *pc, int32_t input)
 	if (integ < -pc->bound)
 		integ = -pc->bound;
 	pc->integral = (int32_t)integ;
-	pc->derivative = error - pc->olderror;
+
+	/* Windowed derivative; see struct rpi5_nn_pid. */
+	if (pc->hfill == 0) {
+		pc->derivative = 0;
+		pc->dspan = 1;
+	} else {
+		oldest = pc->hfill < NN_SLOPE_N ? pc->ehist[0] :
+		    pc->ehist[pc->hpos];
+		pc->derivative = error - oldest;
+		pc->dspan = pc->hfill;
+	}
+	pc->ehist[pc->hpos] = error;
+	pc->hpos = (pc->hpos + 1) % NN_SLOPE_N;
+	if (pc->hfill < NN_SLOPE_N)
+		pc->hfill++;
 }
 
 static void
 rpi5_nn_pid_init(struct rpi5_nn_pid *pc, int32_t setpoint, int32_t bound)
 {
+	int i;
+
 	pc->setpoint = setpoint;
 	pc->bound = bound;
 	pc->error = pc->olderror = pc->integral = pc->derivative = 0;
+	pc->dspan = 1;
+	for (i = 0; i < NN_SLOPE_N; i++)
+		pc->ehist[i] = 0;
+	pc->hpos = 0;
+	pc->hfill = 0;
 }
 
 void
@@ -191,16 +212,20 @@ rpi5_nn_features(struct rpi5_nn_state *s, int32_t temp_mC, int32_t rpm,
 
 	in[NN_IN_TEMP_P] = rpi5_nn_ratio(s->pid_temp.error, NN_TEMP_SCALE);
 	in[NN_IN_TEMP_I] = rpi5_nn_ratio(s->pid_temp.integral, NN_TEMP_I_SCALE);
-	in[NN_IN_TEMP_D] = rpi5_nn_ratio(s->pid_temp.derivative, NN_DERIV_SCALE);
+	in[NN_IN_TEMP_D] = rpi5_nn_ratio(s->pid_temp.derivative,
+	    (int64_t)NN_DERIV_SCALE * s->pid_temp.dspan);
 	in[NN_IN_WMIN_P] = rpi5_nn_ratio(s->pid_wmin.error, NN_TEMP_SCALE);
 	in[NN_IN_WMIN_I] = rpi5_nn_ratio(s->pid_wmin.integral, NN_TEMP_I_SCALE);
-	in[NN_IN_WMIN_D] = rpi5_nn_ratio(s->pid_wmin.derivative, NN_DERIV_SCALE);
+	in[NN_IN_WMIN_D] = rpi5_nn_ratio(s->pid_wmin.derivative,
+	    (int64_t)NN_DERIV_SCALE * s->pid_wmin.dspan);
 	in[NN_IN_WMAX_P] = rpi5_nn_ratio(s->pid_wmax.error, NN_TEMP_SCALE);
 	in[NN_IN_WMAX_I] = rpi5_nn_ratio(s->pid_wmax.integral, NN_TEMP_I_SCALE);
-	in[NN_IN_WMAX_D] = rpi5_nn_ratio(s->pid_wmax.derivative, NN_DERIV_SCALE);
+	in[NN_IN_WMAX_D] = rpi5_nn_ratio(s->pid_wmax.derivative,
+	    (int64_t)NN_DERIV_SCALE * s->pid_wmax.dspan);
 	in[NN_IN_RPM_P] = rpi5_nn_ratio(s->pid_rpm.error, NN_RPM_SCALE);
 	in[NN_IN_RPM_I] = rpi5_nn_ratio(s->pid_rpm.integral, NN_RPM_I_SCALE);
-	in[NN_IN_RPM_D] = rpi5_nn_ratio(s->pid_rpm.derivative, NN_RPM_SCALE);
+	in[NN_IN_RPM_D] = rpi5_nn_ratio(s->pid_rpm.derivative,
+	    (int64_t)NN_RPM_SCALE * s->pid_rpm.dspan);
 	in[NN_IN_AMBIENT] = rpi5_nn_ratio(s->ambient - NN_TEMP_OFFSET,
 	    NN_TEMP_SCALE);
 	in[NN_IN_DUTY] = rpi5_nn_ratio(s->duty, NN_DUTY_SCALE);
