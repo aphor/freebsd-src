@@ -385,9 +385,15 @@ rpi5_nn_tick(uint32_t temp)
 	if (r->warn_edge) {
 		cooling_fan.nn_warnings++;
 		if (ratecheck(&cooling_fan.nn_warn_last, &rpi5_nn_log_interval))
-			printf("rpi5_fan: inadequate cooling: predicted %d.%d C at "
-			    "full fan exceeds the %d C limit; throttling is likely "
-			    "under this load\n",
+			/*
+			 * The warning asserts above spec - warn_margin, so the
+			 * prediction may sit just under spec.  Say what was
+			 * predicted and what the limit is; do not claim it
+			 * "exceeds" a limit it may not have reached.
+			 */
+			printf("rpi5_fan: inadequate cooling: full fan is predicted "
+			    "to settle at %d.%d C against a %d C limit; throttling "
+			    "is likely under this load\n",
 			    r->pred_max / 1000, (r->pred_max % 1000) / 100,
 			    cooling_fan.nn_pol.spec / 1000);
 	}
