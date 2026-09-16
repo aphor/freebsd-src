@@ -149,6 +149,39 @@ struct rpi5_nn_state {
 	int	ambient_seen;
 	int32_t	acc_q8;			/* delta-sigma accumulator, duty Q8 */
 	int32_t	duty;			/* currently commanded duty, 0..255 */
+	int	warn_run;		/* consecutive ticks predicting inadequate */
+	int	warned;			/* warning currently asserted */
+	int	stall_run;		/* consecutive ticks of a silent fan */
+	int	stalled;		/* stall fault currently asserted */
+};
+
+/*
+ * Tunables for one controller tick.  These are policy, not network: they are
+ * applied around the forward pass and can change at runtime without
+ * retraining.
+ */
+struct rpi5_nn_policy {
+	int32_t	target;		/* mC the controller settles toward */
+	int32_t	tol;		/* confidence gate half-width, mC */
+	int32_t	spec;		/* never exceed, mC */
+	int32_t	crit;		/* supervisor forces full fan at or above, mC */
+	int32_t	warn_margin;	/* warn when predicted max-fan temp > spec-margin */
+	int32_t	debounce;	/* ticks a warning must persist before it fires */
+	int32_t	rate_up;	/* duty counts per tick, rising */
+	int32_t	rate_down;	/* duty counts per tick, falling */
+	int32_t	dd_scale;	/* output scale of the duty-delta head */
+};
+
+#define	NN_STALL_TICKS	10	/* silent fan at real duty -> fault */
+
+struct rpi5_nn_result {
+	int32_t	duty;		/* duty to program this tick */
+	int32_t	pred_now;	/* predicted equilibrium at current duty, mC */
+	int32_t	pred_max;	/* predicted equilibrium at full duty, mC */
+	int	gated;		/* confidence gate held duty this tick */
+	int	supervised;	/* supervisor overrode the network this tick */
+	int	warn_edge;	/* inadequate-cooling warning just asserted */
+	int	stall_edge;	/* fan stall fault just asserted */
 };
 
 void	rpi5_nn_forward(const struct rpi5_nn_weights *w, const int32_t *in,
@@ -158,7 +191,11 @@ void	rpi5_nn_init(struct rpi5_nn_state *s, int32_t target_mC,
 void	rpi5_nn_features(struct rpi5_nn_state *s, int32_t temp_mC,
 	    int32_t rpm, int32_t target_mC, int32_t *in);
 int32_t	rpi5_nn_apply_delta(struct rpi5_nn_state *s, int32_t ddelta_q16,
-	    int32_t rate_max);
+	    int32_t rate_up, int32_t rate_down);
+int32_t	rpi5_nn_temp_mC(int32_t q16);
+void	rpi5_nn_step(struct rpi5_nn_state *s, const struct rpi5_nn_weights *w,
+	    const struct rpi5_nn_policy *pol, int32_t temp_mC, int32_t rpm,
+	    struct rpi5_nn_result *r);
 
 /* Q16 value = scaled integer ratio, with the same floor semantics as >>. */
 int32_t	rpi5_nn_ratio(int64_t num, int64_t den);

@@ -136,6 +136,10 @@ rpi5_nn_init(struct rpi5_nn_state *s, int32_t target_mC, int32_t duty)
 		duty = 255;
 	s->duty = duty;
 	s->acc_q8 = duty << 8;
+	s->warn_run = 0;
+	s->warned = 0;
+	s->stall_run = 0;
+	s->stalled = 0;
 }
 
 /* Fan rpm the commanded duty should produce; zero inside the stall band. */
@@ -209,20 +213,27 @@ rpi5_nn_features(struct rpi5_nn_state *s, int32_t temp_mC, int32_t rpm,
  * a request for half a duty step is honoured on average over time instead of
  * being lost to rounding every tick.
  *
- * rate_max bounds the per-tick change in duty counts.  Returns the new duty.
+ * The rate limits are deliberately asymmetric, and that asymmetry encodes
+ * the objective's priority order.  Overheating outranks fan noise, which
+ * outranks smoothness, so duty may rise quickly (rate_up) and fall only
+ * slowly (rate_down).  A symmetric limit claims those costs are equal; the
+ * first trained policy under one overheated more than the curve it replaced
+ * while cutting fan speed, which is exactly that false equivalence acted out.
+ *
+ * Returns the new duty.
  */
 int32_t
 rpi5_nn_apply_delta(struct rpi5_nn_state *s, int32_t ddelta_q16,
-    int32_t rate_max)
+    int32_t rate_up, int32_t rate_down)
 {
 	int64_t d_q8, acc;
 
 	/* Q16 duty counts -> Q8, flooring. */
 	d_q8 = (int64_t)ddelta_q16 >> 8;
-	if (d_q8 > (int64_t)rate_max << 8)
-		d_q8 = (int64_t)rate_max << 8;
-	if (d_q8 < -((int64_t)rate_max << 8))
-		d_q8 = -((int64_t)rate_max << 8);
+	if (d_q8 > (int64_t)rate_up << 8)
+		d_q8 = (int64_t)rate_up << 8;
+	if (d_q8 < -((int64_t)rate_down << 8))
+		d_q8 = -((int64_t)rate_down << 8);
 
 	acc = (int64_t)s->acc_q8 + d_q8;
 	/* Clamp to the representable duty range so the residue cannot wind up
@@ -234,4 +245,109 @@ rpi5_nn_apply_delta(struct rpi5_nn_state *s, int32_t ddelta_q16,
 	s->acc_q8 = (int32_t)acc;
 	s->duty = s->acc_q8 >> 8;
 	return (s->duty);
+}
+
+/*
+ * A temperature head's Q16 output as milli-Celsius, with the same floor
+ * semantics everywhere this file is built.
+ */
+int32_t
+rpi5_nn_temp_mC(int32_t q16)
+{
+	return ((int32_t)(((int64_t)q16 * NN_TEMP_SCALE) >> NN_Q) +
+	    NN_TEMP_OFFSET);
+}
+
+/*
+ * One complete controller tick.  The driver reads the sensors, calls this,
+ * programs the PWM with r->duty and logs on the edge flags; the trainer calls
+ * exactly the same function against its plant model.  So the gate, the
+ * supervisor and the warning logic -- not only the network -- are what was
+ * evaluated in training.
+ */
+void
+rpi5_nn_step(struct rpi5_nn_state *s, const struct rpi5_nn_weights *w,
+    const struct rpi5_nn_policy *pol, int32_t temp_mC, int32_t rpm,
+    struct rpi5_nn_result *r)
+{
+	int32_t in[NN_N_IN], out[NN_N_OUT], dd, gap;
+	int64_t dd64;
+
+	r->gated = r->supervised = r->warn_edge = r->stall_edge = 0;
+
+	rpi5_nn_features(s, temp_mC, rpm, pol->target, in);
+	rpi5_nn_forward(w, in, out);
+	r->pred_now = rpi5_nn_temp_mC(out[NN_OUT_TEQ_NOW]);
+	r->pred_max = rpi5_nn_temp_mC(out[NN_OUT_TEQ_MAX]);
+
+	dd64 = (int64_t)out[NN_OUT_DDUTY] * pol->dd_scale;
+	if (dd64 > NN_ACT_MAX)
+		dd64 = NN_ACT_MAX;
+	if (dd64 < -NN_ACT_MAX)
+		dd64 = -NN_ACT_MAX;
+	dd = (int32_t)dd64;
+
+	/*
+	 * Confidence gate.  Act only when the network predicts that holding the
+	 * current duty would NOT settle near the target.  Never gate while the
+	 * die is at or above target: holding still is not a safe default there.
+	 */
+	gap = r->pred_now - pol->target;
+	if (gap < 0)
+		gap = -gap;
+	if (gap < pol->tol && temp_mC < pol->target) {
+		dd = 0;
+		r->gated = 1;
+	}
+
+	r->duty = rpi5_nn_apply_delta(s, dd, pol->rate_up, pol->rate_down);
+
+	/*
+	 * Supervisor.  Not learned and not negotiable: a trained policy cannot
+	 * guarantee the first priority, so this one can.  It trips below the
+	 * throttle point, and forcing the accumulator keeps the network from
+	 * immediately walking duty back down afterwards.
+	 */
+	if (temp_mC >= pol->crit) {
+		s->duty = 255;
+		s->acc_q8 = 255 << 8;
+		r->duty = 255;
+		r->supervised = 1;
+	}
+
+	/*
+	 * Fan stall.  A fan commanded well above its stall duty that reports no
+	 * rotation for NN_STALL_TICKS is failed or disconnected; force full duty
+	 * in case it is merely stuck, and report the fault once.
+	 */
+	if (s->duty >= 2 * NN_STALL_DUTY && rpm == 0) {
+		if (++s->stall_run >= NN_STALL_TICKS && !s->stalled) {
+			s->stalled = 1;
+			r->stall_edge = 1;
+		}
+	} else {
+		s->stall_run = 0;
+		s->stalled = 0;
+	}
+	if (s->stalled) {
+		s->duty = 255;
+		s->acc_q8 = 255 << 8;
+		r->duty = 255;
+		r->supervised = 1;
+	}
+
+	/*
+	 * Inadequate cooling: the network predicts that even full duty would not
+	 * hold spec.  Debounced, and reported once per episode rather than every
+	 * tick; it re-arms when the prediction clears.
+	 */
+	if (r->pred_max > pol->spec - pol->warn_margin) {
+		if (++s->warn_run >= pol->debounce && !s->warned) {
+			s->warned = 1;
+			r->warn_edge = 1;
+		}
+	} else {
+		s->warn_run = 0;
+		s->warned = 0;
+	}
 }
