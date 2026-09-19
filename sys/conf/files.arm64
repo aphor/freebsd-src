@@ -622,6 +622,7 @@ arm64/apple/exynos_uart.c			optional soc_apple_t8103 fdt
 
 # Broadcom
 arm64/broadcom/bcm2712/bcm2712.c			optional bcm2712
+arm64/broadcom/bcm2712/bcm2712_sdhci.c			optional sdhci_bcm2712 sdhci fdt
 arm64/broadcom/bcm2712/bcm2712_pcie.c			optional bcm2712_pcie
 arm64/broadcom/bcm2712/rpi5_fan.c			optional rpi5_fan bcm2712
 arm64/broadcom/bcm2712/rpi5_nn.c			optional rpi5_fan bcm2712

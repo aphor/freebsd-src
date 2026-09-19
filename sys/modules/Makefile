@@ -63,6 +63,7 @@ SUBDIR=	\
 	${_bce} \
 	${_bcm2712} \
 	${_bcm2712_pcie} \
+	${_bcm2712_sdhci} \
 	${_bcm283x_clkman} \
 	${_bcm283x_pwm} \
 	bfe \
@@ -748,6 +749,7 @@ _armv8crypto=	armv8crypto
 _armv8_rng=	armv8_rng
 _bcm2712=	bcm2712
 _bcm2712_pcie=	bcm2712_pcie
+_bcm2712_sdhci=	bcm2712_sdhci
 _cyw=		cyw
 _rp1_eth=	rp1_eth
 _rp1_gpio=	rp1_gpio

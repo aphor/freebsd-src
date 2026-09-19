@@ -36,10 +36,11 @@ options 	FDT
 # not behind RP1/PCIe, and is already what hw.uart.console points at.
 device		pl011
 
-# SD and SDIO host controllers are native too (brcm,bcm2712-sdhci).  Note
-# that as of M0 no FreeBSD driver matches that compatible; sdhci is here for
-# the M1 driver work.
+# SD and SDIO host controllers, both native BCM2712 peripherals rather than
+# anything behind RP1.  Nothing in FreeBSD matched brcm,bcm2712-sdhci before
+# sdhci_bcm2712, which is why an FDT boot had no root filesystem to find.
 device		sdhci
+device		sdhci_bcm2712		# BCM2712 SD/SDIO host controller (FDT)
 
 # The CYW43455 WiFi part is on SDIO, and dev/sdio is only built with MMCCAM,
 # so the Pi 5 uses the CAM-based MMC stack rather than the classic one.
