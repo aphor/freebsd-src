@@ -32,11 +32,26 @@
 #include <vm/pmap.h>
 #include <machine/bus.h>
 
+#include <arm64/broadcom/bcm2712/bcm2712_fdt.h>
+
 /* -----------------------------------------------------------------------
  * Physical address of PCIe2 controller register window
+ *
+ * Read from the device tree at load time; the constants below are the
+ * fallback and record what the node says on a Raspberry Pi 5:
+ *   /axi/pcie@1000120000  compatible "brcm,bcm2712-pcie"
+ *   reg = <0x10 0x00120000  0x00 0x9310>  ->  0x10_00120000, 0x9310
+ * Unlike the RP1 windows this node is a direct child of /axi, so no PCI
+ * ranges hop is involved and the reg cells are already CPU physical.
  * ----------------------------------------------------------------------- */
 #define PCIE2_BASE_PHYS		0x1000120000UL
 #define PCIE2_MAP_SIZE		0x9310
+
+static const char * const pcie2_fdt_paths[] = {
+	"/axi/pcie@1000120000",
+	"/soc/pcie@1000120000",
+	NULL
+};
 
 /* -----------------------------------------------------------------------
  * PCI config space registers (RC Type-0 header, offset from PCIE2_BASE)
@@ -116,6 +131,9 @@ static const char * const ltssm_names[] = {
 };
 
 static void	*pcie2_kva;
+static bus_addr_t pcie2_phys;	/* resolved from FDT, else PCIE2_BASE_PHYS */
+static bus_size_t pcie2_size;
+static bool pcie2_from_fdt;
 static struct sysctl_ctx_list pcie2_sysctl_ctx;
 
 #define RD4(off) (*(volatile uint32_t *)((uintptr_t)pcie2_kva + (off)))
@@ -277,15 +295,21 @@ rp1_pcie2_recon_modevent(module_t mod __unused, int event, void *arg __unused)
 
 	switch (event) {
 	case MOD_LOAD:
-		pcie2_kva = pmap_mapdev_attr(PCIE2_BASE_PHYS, PCIE2_MAP_SIZE,
+		pcie2_phys = PCIE2_BASE_PHYS;
+		pcie2_size = PCIE2_MAP_SIZE;
+		pcie2_from_fdt = bcm2712_fdt_reg(pcie2_fdt_paths,
+		    "brcm,bcm2712-pcie", 0, &pcie2_phys, &pcie2_size);
+
+		pcie2_kva = pmap_mapdev_attr(pcie2_phys, pcie2_size,
 		    VM_MEMATTR_DEVICE);
 		if (pcie2_kva == NULL) {
 			printf("rp1_pcie2_recon: cannot map 0x%lx\n",
-			    PCIE2_BASE_PHYS);
+			    (unsigned long)pcie2_phys);
 			return (ENXIO);
 		}
-		printf("rp1_pcie2_recon: PCIe2 mapped at phys 0x%lx KVA %p\n",
-		    PCIE2_BASE_PHYS, pcie2_kva);
+		printf("rp1_pcie2_recon: PCIe2 mapped at phys 0x%lx KVA %p "
+		    "(%s)\n", (unsigned long)pcie2_phys, pcie2_kva,
+		    pcie2_from_fdt ? "from FDT" : "hardcoded, no FDT node");
 
 		/* ---- Snapshot dump to dmesg ---- */
 		vid_did = RD4(PCIE2_CFG_VENDOR_DEVICE);
@@ -416,7 +440,7 @@ rp1_pcie2_recon_modevent(module_t mod __unused, int event, void *arg __unused)
 	case MOD_UNLOAD:
 		sysctl_ctx_free(&pcie2_sysctl_ctx);
 		if (pcie2_kva != NULL) {
-			pmap_unmapdev(pcie2_kva, PCIE2_MAP_SIZE);
+			pmap_unmapdev(pcie2_kva, pcie2_size);
 			pcie2_kva = NULL;
 		}
 		printf("rp1_pcie2_recon: unloaded\n");

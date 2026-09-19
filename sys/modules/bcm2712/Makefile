@@ -2,7 +2,8 @@
 
 KMOD=	bcm2712
 SRCS=	bcm2712.c
-SRCS+=	bus_if.h device_if.h
+SRCS+=	bus_if.h device_if.h ofw_bus_if.h
+SRCS+=	opt_platform.h
 
 EXPORT_SYMS=	bcm2712_read_cpu_temp
 EXPORT_SYMS+=	bcm2712_get_softc

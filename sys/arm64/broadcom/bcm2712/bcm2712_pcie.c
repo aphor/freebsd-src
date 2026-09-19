@@ -61,6 +61,7 @@
 #include <dev/acpica/acpivar.h>
 #endif
 
+#include "bcm2712_fdt.h"
 #include "bcm2712_pcie.h"
 
 /* GEM interrupt status register — checked in the filter to confirm GEM fired */
@@ -83,17 +84,45 @@
  */
 #define GEM_MAC_PHYS		0x1f00100000UL	/* ethernet@100000 */
 #define GEM_MAC_SIZE		0x1000
-#define ETH_CFG_PHYS		0x1f00104000UL	/* eth_cfg@104000 */
+/*
+ * ToDo: ETH_CFG_PHYS cannot come from the device tree -- no device tree
+ * describes the block.  There is no eth_cfg node in the firmware-supplied
+ * DTB, and none upstream: in Linux's rp1.dtsi ethernet@100000 is the only
+ * node in the area and its reg is <0xc0 0x40100000 0x0 0x4000>, which ends
+ * exactly where eth_cfg begins.  Linux has no use for it (macb(4) does not
+ * touch the RGMII glue, RP1 firmware owns it), so there is no binding to
+ * adopt.  If one appears -- an eth_cfg@104000 node, or a second reg entry on
+ * ethernet@100000 with reg-names = "mac", "cfg" -- resolve it here.
+ */
+#define ETH_CFG_PHYS		0x1f00104000UL	/* eth_cfg, no FDT node */
 #define ETH_CFG_SIZE		0x1000
 
-/* RP1 PCIE_CFG registers for MSIx IACK re-arm (RP-008370-DS-1 ss6.2) */
-#define PCIE_CFG_PHYS       0x1f00108000UL  /* BCM2712 CPU physical address */
+/*
+ * RP1 PCIE_CFG registers for MSIx IACK re-arm (RP-008370-DS-1 ss6.2).
+ *
+ * ToDo: also absent from every device tree.  RP1's PCIe endpoint config
+ * block at 0x108000 has no node in the vendor DTB or in Linux's rp1.dtsi --
+ * on Linux the MSI-X plumbing is the host controller's business, so nothing
+ * needs to name it.  A brcm,bcm2712-pcie host driver (the PCIe milestone)
+ * would make this mapping unnecessary rather than resolvable: the GEM would
+ * become a real PCI device and its MSI would be re-armed by the MSI
+ * controller.  Until then this address is derived, not read: RP1 window base
+ * 0x1f_00000000 + RP1 offset 0x108000.
+ */
+#define PCIE_CFG_PHYS       0x1f00108000UL  /* no FDT node; see above */
 #define PCIE_CFG_SIZE       0x200
 #define PCIE_CFG_MSIX_CFG_0 0x008   /* MSIX_CFG_n base; vector n at offset +n*4 */
 #define MSIX_CFG_IACK       (1u << 2) /* SC: write 1 to re-arm vector */
 #define PCIE_CFG_INTSTATL   0x108   /* vectors 0-31 assertion status (RO) */
 #define PCIE_CFG_INTSTATH   0x10c   /* vectors 32-63 assertion status (RO) */
-#define RP1_INT_ETH          6      /* RP1 GEM MSI vector (INTSTATL bit 6 = 0x40, verified at runtime) */
+/*
+ * RP1 GEM MSI vector.  This one *is* in the device tree: ethernet@100000 has
+ * interrupts = <6 4> against rp1's #interrupt-cells = <2>, so cell 0 is the
+ * RP1 interrupt number and cell 1 the trigger type.  Resolved at attach into
+ * rp1_int_eth; the constant is the fallback and matches INTSTATL bit 6
+ * (0x40), verified at runtime.
+ */
+#define RP1_INT_ETH          6      /* fallback; see rp1_int_eth */
 
 /*
  * The shared line, as a GIC interrupt specifier.
@@ -109,16 +138,41 @@
 #define GIC_ICELLS		3
 #define GIC_TYPE_SPI		0
 #define GIC_IRQ_LEVEL_HIGH	4
-#define RP1_GEM_GIC_SPI		229
+#define RP1_GEM_GIC_SPI		229	/* fallback; see the interrupt-map walk */
 
-#ifndef DEV_ACPI
+/*
+ * interrupt-map layout on pcie@1000120000, with #address-cells = <3> and
+ * #interrupt-cells = <1> on the PCI side and 3 GIC cells on the other:
+ *
+ *   child-addr[3]  child-irq[1]  parent-phandle[1]  parent-irq[3]
+ *
+ * so eight cells per entry, and the entry whose child-irq is 1 (INTA) is the
+ * one the GEM's MSI is routed onto -- <0 0 0 1 &gicv2 0 229 4>.
+ */
+#define PCIE_IMAP_ENTRY_CELLS	8
+#define PCIE_IMAP_CHILD_IRQ	3	/* index of child-irq within an entry */
+#define PCIE_IMAP_IPARENT	4
+#define PCIE_IMAP_PARENT_IRQ	5
+#define PCIE_INTA		1
+
 /* Where the GEM lives in the device trees this board is known to publish. */
-static const char *bcm2712_pcie_gem_paths[] = {
+static const char * const bcm2712_pcie_gem_paths[] = {
 	"/axi/pcie@1000120000/rp1/ethernet@100000",
 	"/soc/rp1/ethernet@100000",
 	NULL
 };
+
+#ifndef DEV_ACPI
+/* The PCIe2 root complex the RP1 hangs off, for its interrupt-map. */
+static const char * const bcm2712_pcie_rc_paths[] = {
+	"/axi/pcie@1000120000",
+	"/soc/pcie@1000120000",
+	NULL
+};
 #endif /* !DEV_ACPI */
+
+/* RP1 MSI-X vector for the GEM, from the device tree where available. */
+static u_int rp1_int_eth = RP1_INT_ETH;
 
 struct bcm2712_pcie_softc {
 	device_t	 dev;
@@ -214,14 +268,13 @@ bcm2712_pcie_gem_iack(void)
 {
 	if (g_pciecfg_mapped)
 		bus_space_write_4(g_pciecfg_bst, g_pciecfg_bsh,
-		    PCIE_CFG_MSIX_CFG_0 + RP1_INT_ETH * 4, MSIX_CFG_IACK);
+		    PCIE_CFG_MSIX_CFG_0 + rp1_int_eth * 4, MSIX_CFG_IACK);
 }
 
 /*
  * Is this board's device tree describing an RP1 GEM?  Used as the presence
  * test; the registers themselves are reached by physical address.
  */
-#ifndef DEV_ACPI
 static phandle_t
 bcm2712_pcie_find_gem_node(void)
 {
@@ -236,7 +289,33 @@ bcm2712_pcie_find_gem_node(void)
 	}
 	return (-1);
 }
-#endif /* !DEV_ACPI */
+
+/*
+ * Resolve the GEM's RP1 interrupt number from its interrupts property.  Used
+ * on both bus methods: OFW is initialised before bus_probe() chooses one, so
+ * the device tree is readable even on an ACPI boot.
+ */
+static void
+bcm2712_pcie_resolve_int_eth(device_t dev)
+{
+	phandle_t gem;
+	pcell_t cells[2];
+	int len;
+
+	gem = bcm2712_pcie_find_gem_node();
+	if (gem == -1)
+		return;
+	len = OF_getencprop(gem, "interrupts", cells, sizeof(cells));
+	if (len < (int)sizeof(cells[0])) {
+		device_printf(dev, "no interrupts property on the GEM node, "
+		    "using RP1 vector %d\n", RP1_INT_ETH);
+		return;
+	}
+	rp1_int_eth = cells[0];
+	if (rp1_int_eth != RP1_INT_ETH)
+		device_printf(dev, "RP1 GEM vector %u from FDT (built-in "
+		    "default is %d)\n", rp1_int_eth, RP1_INT_ETH);
+}
 
 #ifdef DEV_ACPI
 /*
@@ -283,17 +362,50 @@ bcm2712_pcie_probe(device_t dev)
  * is what intr_map_irq() keys on.
  */
 #ifndef DEV_ACPI
+/*
+ * Map the shared RP1 line to an interrupt number we can allocate.  Returns 0
+ * on failure.
+ *
+ * Preferred source is pcie@1000120000's interrupt-map: its INTA entry names
+ * both the interrupt parent and the three GIC cells, so neither the SPI
+ * number nor the trigger type has to be hardcoded.  If the map is missing or
+ * has no INTA entry, fall back to naming GIC SPI 229 against the
+ * arm,gic-400 node -- which is what the ACPI DSDT override did as GSI 261.
+ */
 static u_int
 bcm2712_pcie_map_gic_spi(device_t dev, u_int spi)
 {
-	phandle_t gic;
+	phandle_t rc, gic;
+	pcell_t imap[PCIE_IMAP_ENTRY_CELLS * 8];
 	pcell_t cells[GIC_ICELLS];
+	int len, n, i;
+
+	rc = bcm2712_fdt_find(bcm2712_pcie_rc_paths, "brcm,bcm2712-pcie");
+	if (rc != -1) {
+		len = OF_getencprop(rc, "interrupt-map", imap, sizeof(imap));
+		n = (len > 0) ? len / (int)sizeof(imap[0]) : 0;
+		for (i = 0; i + PCIE_IMAP_ENTRY_CELLS <= n;
+		    i += PCIE_IMAP_ENTRY_CELLS) {
+			if (imap[i + PCIE_IMAP_CHILD_IRQ] != PCIE_INTA)
+				continue;
+			device_printf(dev, "INTA -> GIC <%u %u %u> from the "
+			    "pcie interrupt-map\n",
+			    imap[i + PCIE_IMAP_PARENT_IRQ + 0],
+			    imap[i + PCIE_IMAP_PARENT_IRQ + 1],
+			    imap[i + PCIE_IMAP_PARENT_IRQ + 2]);
+			return (ofw_bus_map_intr(dev,
+			    imap[i + PCIE_IMAP_IPARENT], GIC_ICELLS,
+			    &imap[i + PCIE_IMAP_PARENT_IRQ]));
+		}
+	}
 
 	gic = ofw_bus_find_compatible(OF_peer(0), "arm,gic-400");
 	if (gic == 0 || gic == -1) {
 		device_printf(dev, "cannot find arm,gic-400 node in FDT\n");
 		return (0);
 	}
+	device_printf(dev, "no INTA entry in the pcie interrupt-map; "
+	    "naming GIC SPI %u\n", spi);
 
 	cells[0] = GIC_TYPE_SPI;
 	cells[1] = spi;
@@ -310,10 +422,13 @@ bcm2712_pcie_attach(device_t dev)
 	struct bcm2712_pcie_softc *sc = device_get_softc(dev);
 	int rid, error;
 #ifndef DEV_ACPI
+	bus_addr_t gem_phys;
 	u_int irq;
 #endif
 
 	sc->dev = dev;
+
+	bcm2712_pcie_resolve_int_eth(dev);
 
 #ifndef DEV_ACPI
 	/*
@@ -323,7 +438,12 @@ bcm2712_pcie_attach(device_t dev)
 	 * below finds them.  Under ACPI the _CRS supplies both windows and the
 	 * interrupt instead, and all of this is skipped.
 	 */
-	error = bus_set_resource(dev, SYS_RES_MEMORY, 0, GEM_MAC_PHYS,
+	gem_phys = GEM_MAC_PHYS;
+	if (!bcm2712_fdt_rp1(bcm2712_pcie_gem_paths, "raspberrypi,rp1-gem", 0,
+	    &gem_phys, NULL))
+		device_printf(dev, "GEM reg not resolvable from FDT, "
+		    "using 0x%lx\n", (unsigned long)gem_phys);
+	error = bus_set_resource(dev, SYS_RES_MEMORY, 0, gem_phys,
 	    GEM_MAC_SIZE);
 	if (error != 0) {
 		device_printf(dev, "cannot set GEM MAC resource: %d\n", error);

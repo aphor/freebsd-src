@@ -25,6 +25,7 @@
 #include <machine/bus.h>
 
 
+#include "bcm2712_fdt.h"
 #include "bcm2712_var.h"
 
 MALLOC_DEFINE(M_BCM2712, "bcm2712", "BCM2712 driver memory");
@@ -57,6 +58,23 @@ static int bcm2712_debug = 0;
  * DTS address 0x7d542000 + soc base 0x1000000000 = physical 0x107d542000
  */
 #define BCM2712_AVS_BASE_PHYS		0x107d542000UL
+
+/*
+ * Device tree nodes for the four windows this driver maps.  Each is resolved
+ * at load time and the *_BASE_PHYS constants are only the fallback; see
+ * bcm2712_fdt.h for why the addresses are resolved rather than allocated
+ * through a bus.
+ */
+static const char * const avs_fdt_paths[] = {
+	"/soc@107c000000/avs-monitor@7d542000",
+	"/soc/avs-monitor@7d542000",
+	NULL
+};
+static const char * const pwm1_fdt_paths[] = BCM2712_RP1_PATHS("pwm@9c000");
+static const char * const rp1_clk_fdt_paths[] =
+    BCM2712_RP1_PATHS("clocks@18000");
+static const char * const rp1_gpio_fdt_paths[] =
+    BCM2712_RP1_PATHS("gpio@d0000");
 
 /* Temperature register offset within AVS monitor */
 #define BCM2712_AVS_TEMP_OFFSET		0x200
@@ -358,6 +376,8 @@ bcm2712_modevent(module_t mod __unused, int event, void *arg __unused)
 {
 	struct bcm2712_softc *sc;
 	struct sysctl_oid *tree, *thermal_tree;
+	bus_addr_t avs_phys, pwm_phys;
+	bool avs_from_fdt, pwm_from_fdt;
 	int error = 0;
 
 	switch (event) {
@@ -380,13 +400,23 @@ bcm2712_modevent(module_t mod __unused, int event, void *arg __unused)
 		sc->cached_temp_mc = 50000;  /* 50°C */
 		sc->last_update = 0;
 
+		/*
+		 * Map the AVS monitor.  Its node is a plain child of the soc
+		 * simple-bus, so the reg cells translate with a single
+		 * identity ranges hop: reg = <0x7d542000 0xf00> becomes
+		 * 0x10_7d542000.
+		 */
+		avs_phys = BCM2712_AVS_BASE_PHYS;
+		avs_from_fdt = bcm2712_fdt_reg(avs_fdt_paths,
+		    "brcm,bcm2711-avs-monitor", 0, &avs_phys, NULL);
+
 		/* Map physical memory using pmap with cache-inhibited attributes */
-		sc->avs_vaddr = pmap_mapdev_attr(BCM2712_AVS_BASE_PHYS, 0x1000,
+		sc->avs_vaddr = pmap_mapdev_attr(avs_phys, 0x1000,
 		    VM_MEMATTR_DEVICE);
 
 		if (sc->avs_vaddr == NULL) {
 			printf("bcm2712: Cannot map memory at 0x%lx\n",
-			    (unsigned long)BCM2712_AVS_BASE_PHYS);
+			    (unsigned long)avs_phys);
 			mtx_destroy(&sc->thermal_mtx);
 			mtx_destroy(&sc->mtx);
 			free(sc, M_BCM2712);
@@ -394,16 +424,27 @@ bcm2712_modevent(module_t mod __unused, int event, void *arg __unused)
 		}
 
 		sc->avs_mapped = 1;
-		printf("bcm2712: AVS thermal sensor mapped at 0x%lx\n",
-		    (unsigned long)BCM2712_AVS_BASE_PHYS);
+		printf("bcm2712: AVS thermal sensor mapped at 0x%lx (%s)\n",
+		    (unsigned long)avs_phys,
+		    avs_from_fdt ? "from FDT" : "hardcoded, no FDT node");
 
-		/* Map RP1 PWM1 controller (via pcie2 outbound window). */
-		sc->pwm_vaddr = pmap_mapdev_attr(RP1_PWM1_BASE_PHYS, RP1_PWM_MAP_SIZE,
+		/*
+		 * Map RP1 PWM1, via the pcie2 outbound window.  RP1 has two
+		 * PWM blocks and the unit address is what tells them apart:
+		 * pwm@9c000 is PWM1, which drives the fan, and is the one the
+		 * Pi 5 device tree marks status = "okay"; pwm@98000 (PWM0) is
+		 * disabled.  Hence located by path, with compatible as a guard.
+		 */
+		pwm_phys = RP1_PWM1_BASE_PHYS;
+		pwm_from_fdt = bcm2712_fdt_rp1(pwm1_fdt_paths,
+		    "raspberrypi,rp1-pwm", 0, &pwm_phys, NULL);
+
+		sc->pwm_vaddr = pmap_mapdev_attr(pwm_phys, RP1_PWM_MAP_SIZE,
 		    VM_MEMATTR_DEVICE);
 
 		if (sc->pwm_vaddr == NULL) {
 			printf("bcm2712: Cannot map PWM memory at 0x%lx\n",
-			    (unsigned long)RP1_PWM1_BASE_PHYS);
+			    (unsigned long)pwm_phys);
 			pmap_unmapdev(sc->avs_vaddr, 0x1000);
 			sc->avs_vaddr = NULL;
 			sc->avs_mapped = 0;
@@ -414,8 +455,9 @@ bcm2712_modevent(module_t mod __unused, int event, void *arg __unused)
 		}
 
 		sc->pwm_mapped = 1;
-		printf("bcm2712: RP1 PWM1 controller mapped at 0x%lx\n",
-		    (unsigned long)RP1_PWM1_BASE_PHYS);
+		printf("bcm2712: RP1 PWM1 controller mapped at 0x%lx (%s)\n",
+		    (unsigned long)pwm_phys,
+		    pwm_from_fdt ? "from FDT" : "hardcoded, no FDT node");
 
 		/*
 		 * Enable RP1 PWM1 clock (clock index 18).
@@ -436,8 +478,13 @@ bcm2712_modevent(module_t mod __unused, int event, void *arg __unused)
 		{
 			void *clk_map;
 			volatile uint32_t *clk;
+			bus_addr_t clk_phys = RP1_CLK_BASE_PHYS;
+			bool clk_from_fdt;
 
-			clk_map = pmap_mapdev_attr(RP1_CLK_BASE_PHYS,
+			clk_from_fdt = bcm2712_fdt_rp1(rp1_clk_fdt_paths,
+			    "raspberrypi,rp1-clocks", 0, &clk_phys, NULL);
+
+			clk_map = pmap_mapdev_attr(clk_phys,
 			    RP1_CLK_MAP_SIZE, VM_MEMATTR_DEVICE);
 			if (clk_map != NULL) {
 				clk = (volatile uint32_t *)clk_map;
@@ -454,14 +501,17 @@ bcm2712_modevent(module_t mod __unused, int event, void *arg __unused)
 				clk[RP1_CLK_PWM1_CTRL / 4] =
 				    RP1_CLK_PWM1_CTRL_ENA;
 				printf("bcm2712: RP1 PWM1 clock enabled "
-				    "(CTRL=0x%08x DIV_INT=%u)\n",
+				    "(CTRL=0x%08x DIV_INT=%u) at 0x%lx (%s)\n",
 				    clk[RP1_CLK_PWM1_CTRL / 4],
-				    clk[RP1_CLK_PWM1_DIV_INT / 4]);
+				    clk[RP1_CLK_PWM1_DIV_INT / 4],
+				    (unsigned long)clk_phys,
+				    clk_from_fdt ? "from FDT" :
+				    "hardcoded, no FDT node");
 				pmap_unmapdev(clk_map, RP1_CLK_MAP_SIZE);
 			} else {
 				printf("bcm2712: WARNING: cannot map RP1 "
 				    "clock controller at 0x%lx\n",
-				    (unsigned long)RP1_CLK_BASE_PHYS);
+				    (unsigned long)clk_phys);
 			}
 		}
 
@@ -474,8 +524,18 @@ bcm2712_modevent(module_t mod __unused, int event, void *arg __unused)
 			void *gpio_map;
 			volatile uint32_t *ctrl_reg;
 			uint32_t ctrl_val;
+			bus_addr_t gpio_phys = RP1_GPIO_BASE_PHYS;
+			bool gpio_from_fdt;
 
-			gpio_map = pmap_mapdev_attr(RP1_GPIO_BASE_PHYS,
+			/*
+			 * reg[0] of gpio@d0000 is IO_BANK, which carries the
+			 * CTRL registers this uses; reg[1] is SYS_RIO and
+			 * reg[2] PADS_BANK (rp1_gpio maps all three).
+			 */
+			gpio_from_fdt = bcm2712_fdt_rp1(rp1_gpio_fdt_paths,
+			    "raspberrypi,rp1-gpio", 0, &gpio_phys, NULL);
+
+			gpio_map = pmap_mapdev_attr(gpio_phys,
 			    RP1_GPIO_MAP_SIZE, VM_MEMATTR_DEVICE);
 			if (gpio_map != NULL) {
 				ctrl_reg = (volatile uint32_t *)
@@ -483,8 +543,12 @@ bcm2712_modevent(module_t mod __unused, int event, void *arg __unused)
 				    RP1_GPIO_CTRL_OFFSET(RP1_GPIO_FAN_PIN));
 				ctrl_val = *ctrl_reg;
 				printf("bcm2712: GPIO%d CTRL before=0x%x "
-				    "(FUNCSEL=%u)\n", RP1_GPIO_FAN_PIN,
-				    ctrl_val, ctrl_val & RP1_GPIO_FUNCSEL_MASK);
+				    "(FUNCSEL=%u) via 0x%lx (%s)\n",
+				    RP1_GPIO_FAN_PIN, ctrl_val,
+				    ctrl_val & RP1_GPIO_FUNCSEL_MASK,
+				    (unsigned long)gpio_phys,
+				    gpio_from_fdt ? "from FDT" :
+				    "hardcoded, no FDT node");
 				ctrl_val &= ~RP1_GPIO_FUNCSEL_MASK;
 				ctrl_val |= RP1_GPIO_FSEL_ALT0;
 				*ctrl_reg = ctrl_val;
