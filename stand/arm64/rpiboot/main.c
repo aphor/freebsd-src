@@ -121,12 +121,15 @@ main(void)
 	}
 
 	/*
-	 * Point currdev at the memory disk.  Set with the hook installed so
-	 * that a later assignment from the prompt remounts properly.
+	 * Point currdev at the memory disk.
+	 *
+	 * set_currdev() is the MI helper in stand/common/misc.c: it sets both
+	 * currdev and loaddev and installs gen_setcurrdev() as the hook, so a
+	 * later assignment from the prompt re-parses and remounts properly.
+	 * An earlier version of this file installed a local hook that
+	 * duplicated gen_setcurrdev() badly enough to break every path.
 	 */
-	env_setenv("currdev", EV_VOLATILE, "md0:", rpi_setcurrdev,
-	    env_nounset);
-	env_setenv("loaddev", EV_VOLATILE, "md0:", env_noset, env_nounset);
+	set_currdev("md0:");
 	setenv("LINES", "24", 1);
 
 	interact();			/* doesn't return */

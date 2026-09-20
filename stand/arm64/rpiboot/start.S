@@ -37,10 +37,18 @@ _start:
 	.long	0			/* res2				*/
 
 real_start:
-	/* Stash the entry contract before anything can clobber it. */
-	adrp	x4, rpi_dtb_pa
-	add	x4, x4, :lo12:rpi_dtb_pa
-	str	x0, [x4]
+	/*
+	 * Keep the DTB address in a register across BSS zeroing, and store it
+	 * only afterwards.
+	 *
+	 * The first version stored it immediately and then zeroed BSS, which
+	 * wiped it: rpi_dtb_pa lives in BSS, so the loader reported
+	 * "Device tree: 0x0 (from x0)" on hardware even though the firmware
+	 * had passed 0x4000000 -- a fact three earlier probes had confirmed.
+	 * The variable now lives in .data as well, so neither reordering this
+	 * nor moving the section can bring the bug back.
+	 */
+	mov	x19, x0
 
 	/* Stack.  AArch64 checks SP alignment on every stack access. */
 	adrp	x4, __stack_top
@@ -62,6 +70,11 @@ real_start:
 	b	1b
 2:
 
+	/* Now that BSS is zeroed, publish the entry contract. */
+	adrp	x4, rpi_dtb_pa
+	add	x4, x4, :lo12:rpi_dtb_pa
+	str	x19, [x4]
+
 	bl	main
 
 	/*
@@ -72,7 +85,11 @@ real_start:
 3:	wfi
 	b	3b
 
-	.section .bss
+	/*
+	 * In .data, not .bss, deliberately: a value the BSS-zeroing loop
+	 * cannot reach even if someone later moves the store back before it.
+	 */
+	.section .data
 	.align	3
 	.globl	rpi_dtb_pa
 rpi_dtb_pa:
