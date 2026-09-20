@@ -48,6 +48,73 @@ extern char	_end[];
 /* Sanity values checked at startup and reported; see rpi_report_entry(). */
 #define	RPI_LOAD_ADDR	0x00200000UL
 
+/*
+ * PSCI, which is how this loader resets the board.
+ *
+ * There is no firmware service to call and the VideoCore mailbox is out of
+ * reach this early, but ARM Trusted Firmware is live at EL3 -- its banner
+ * prints immediately before we are entered:
+ *
+ *	NOTICE:  BL31: v2.6(release):v2.6-240-gfc45bc492
+ *
+ * and the firmware's device tree advertises it:
+ *
+ *	/psci { compatible = "arm,psci-1.0", "arm,psci-0.2"; method = "smc"; }
+ *	/cpus/cpu@0..3 { enable-method = "psci"; }
+ *
+ * so an SMC from EL2 reaches BL31.  Function IDs are from
+ * sys/dev/psci/psci.h; SYSTEM_RESET and SYSTEM_OFF are both SMC32 calls, so
+ * the 0x84 prefix rather than 0xc4.
+ *
+ * Note this is the ATF the VPU firmware carries, which is NOT the one the
+ * EDK2 lane uses -- RPI_EFI.fd ships its own v2.10.0.  A PSCI difference
+ * between the two lanes would show up here first.
+ */
+#define	PSCI_FNID_VERSION	0x84000000U
+#define	PSCI_FNID_SYSTEM_OFF	0x84000008U
+#define	PSCI_FNID_SYSTEM_RESET	0x84000009U
+
+static uint64_t
+psci_smc(uint32_t fnid, uint64_t a1, uint64_t a2, uint64_t a3)
+{
+	register uint64_t x0 __asm__("x0") = fnid;
+	register uint64_t x1 __asm__("x1") = a1;
+	register uint64_t x2 __asm__("x2") = a2;
+	register uint64_t x3 __asm__("x3") = a3;
+
+	__asm__ __volatile__("smc #0"
+	    : "+r"(x0), "+r"(x1), "+r"(x2), "+r"(x3)
+	    :
+	    : "memory");
+
+	return (x0);
+}
+
+/*
+ * Reset via PSCI.  Does not return when it works.
+ *
+ * SYSTEM_RESET is specified never to return, so reaching the code after it
+ * means the call failed -- and the caller wants to know that rather than sit
+ * in a silent hang.
+ */
+static void
+rpi_psci_reset(void)
+{
+	printf("Resetting via PSCI SYSTEM_RESET (SMC to BL31)...\n");
+
+	/*
+	 * Let the console drain before the world stops.  Without this the
+	 * message above can be lost in the UART FIFO, which makes a failed
+	 * reset look like a hang with no explanation.
+	 */
+	delay(100000);
+
+	(void)psci_smc(PSCI_FNID_SYSTEM_RESET, 0, 0, 0);
+
+	printf("PSCI SYSTEM_RESET returned, so it did not work.\n");
+	printf("Power-cycle the board.\n");
+}
+
 static void
 rpi_report_entry(void)
 {
@@ -77,6 +144,25 @@ rpi_report_entry(void)
 		    "move device_tree_address.\n");
 	if ((uint64_t)(uintptr_t)_end > RPI_HEAP_START)
 		printf("   WARNING: the loader image overlaps the heap.\n");
+
+	/*
+	 * Ask PSCI its version.  Cheap, harmless, and it answers up front
+	 * whether "reboot" will work rather than finding out when it is
+	 * needed.  A sane reply is major:minor in bits 31:16 / 15:0; PSCI
+	 * NOT_SUPPORTED is returned as -1.
+	 */
+	{
+		uint64_t v = psci_smc(PSCI_FNID_VERSION, 0, 0, 0);
+
+		if ((int64_t)v < 0)
+			printf("   PSCI:            not supported; "
+			    "reboot will not work\n");
+		else
+			printf("   PSCI:            v%lu.%lu via smc "
+			    "(reboot available)\n",
+			    (unsigned long)((v >> 16) & 0xffff),
+			    (unsigned long)(v & 0xffff));
+	}
 }
 
 int
@@ -147,30 +233,63 @@ rpi_autoload(void)
 	return (0);
 }
 
+/*
+ * reboot and poweroff are registered per-platform, not by MI code: there is a
+ * COMMAND_SET for them in stand/efi/loader/main.c, stand/uboot/main.c and so
+ * on, and none in stand/common.  Their absence here is why the first build
+ * reached its prompt with no way to reset the board, which on this hardware
+ * meant a physical power cycle for every iteration.
+ */
+static int
+command_reboot(int argc __unused, char *argv[] __unused)
+{
+	rpi_psci_reset();
+
+	/* Only reached if the reset failed; rpi_psci_reset() has said so. */
+	for (;;)
+		__asm__ __volatile__("wfi");
+
+	return (CMD_OK);
+}
+COMMAND_SET(reboot, "reboot", "reboot the system", command_reboot);
+
+static int
+command_poweroff(int argc __unused, char *argv[] __unused)
+{
+	printf("Powering off via PSCI SYSTEM_OFF...\n");
+	delay(100000);
+	(void)psci_smc(PSCI_FNID_SYSTEM_OFF, 0, 0, 0);
+
+	printf("PSCI SYSTEM_OFF returned, so it did not work.\n");
+	for (;;)
+		__asm__ __volatile__("wfi");
+
+	return (CMD_OK);
+}
+COMMAND_SET(poweroff, "poweroff", "power off the system", command_poweroff);
+
+/*
+ * exit() is what "quit" reaches.  Resetting is the useful thing to do: there
+ * is no firmware menu to fall back to, so halting would just strand the
+ * board.  This cannot loop, because nothing calls exit() except an explicit
+ * quit from the prompt.
+ */
 void
 exit(int code)
 {
-	printf("\nLoader exit(%d), and there is nothing to exit to.\n", code);
-	printf("Halting; power-cycle the board.\n");
+	printf("\nLoader exit(%d); there is nothing to exit to, so "
+	    "resetting.\n", code);
+	rpi_psci_reset();
+
 	for (;;)
 		__asm__ __volatile__("wfi");
 }
 
-/*
- * The firmware offers no reboot service we can call from here, and the
- * VideoCore mailbox is not reachable this early (see the TryBoot
- * investigation in doc/LOADER_ZIMAGE.md).  A PSCI SYSTEM_RESET via BL31 is
- * the right answer and BL31 is live -- "NOTICE: BL31: v2.6" appears just
- * before we are entered -- so this is a small, well-defined piece of work
- * rather than an unknown.  Until then, say so honestly rather than hanging
- * with no explanation.
- */
 void
 reboot(void)
 {
-	printf("reboot is not implemented yet: PSCI SYSTEM_RESET via BL31 is "
-	    "the intended route.\n");
-	printf("Power-cycle the board.\n");
+	rpi_psci_reset();
+
 	for (;;)
 		__asm__ __volatile__("wfi");
 }
