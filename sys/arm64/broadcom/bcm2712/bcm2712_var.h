@@ -153,10 +153,31 @@ struct bcm2712_softc {
 	struct mtx thermal_mtx;			/* Protect thermal reads */
 	struct callout thermal_callout;		/* Periodic update timer */
 	uint32_t cached_temp_mc;		/* Cached milli-°C value */
-	time_t last_update;			/* Timestamp of last read */
+	time_t last_update;			/* Timestamp of last *valid* read */
+
+	/*
+	 * Sensor health.  The AVS ring oscillator does not always present a
+	 * valid reading, and the old behaviour was to silently substitute the
+	 * last cached value -- so a sensor that stopped answering left
+	 * cpu_temp frozen at a comfortable number while the die heated, with
+	 * nothing to see in any sysctl and no way for the fan controller's
+	 * critical-temperature supervisor to trip.  Count the misses instead,
+	 * and stop claiming to know the temperature once they persist.
+	 */
+	uint32_t thermal_invalid_total;		/* ticks with no valid reading */
+	uint32_t thermal_invalid_run;		/* consecutive such ticks */
+	bool thermal_healthy;			/* temperature is trustworthy */
 	struct sysctl_ctx_list sysctl_ctx;	/* sysctl context */
 	struct sysctl_oid *sysctl_tree;		/* sysctl tree root */
 };
+
+/*
+ * Consecutive invalid reads before the temperature is declared untrusted.
+ * The tick is 1 s, so this is a few seconds of silence -- long enough not to
+ * fire on an isolated miss, short enough that the fan goes to full well
+ * before the die reaches the throttle point from an idle start.
+ */
+#define BCM2712_THERMAL_STALE_TICKS	5
 
 /* Function prototypes for other modules */
 int bcm2712_read_cpu_temp(uint32_t *temp);

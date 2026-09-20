@@ -99,16 +99,33 @@ static const char * const rp1_gpio_fdt_paths[] =
  * temperature. The raw register value contains a 10-bit code that must be
  * converted to actual temperature using calibration formula.
  */
-static uint32_t
-bcm2712_thermal_read_raw(struct bcm2712_softc *sc)
+/*
+ * Pretend the sensor has stopped answering, so the fan fail-safe downstream
+ * can be exercised deliberately instead of only ever running for the first
+ * time during a real sensor failure.  Safe to leave in: every effect of it
+ * errs towards more cooling, never less.
+ */
+static int bcm2712_thermal_fail_inject = 0;
+
+static bool
+bcm2712_thermal_read_raw(struct bcm2712_softc *sc, uint32_t *temp_out)
 {
 	uint32_t raw_value;
 
 	mtx_assert(&sc->thermal_mtx, MA_OWNED);
 
-	/* If AVS memory not mapped, return cached value */
+	if (bcm2712_thermal_fail_inject != 0)
+		return (false);
+
+	/*
+	 * Returns true only when the hardware produced a reading this call.
+	 * It deliberately does not fall back to the cached value: the caller
+	 * has to know the difference between "the die is at N" and "the
+	 * sensor did not answer", because the second one is a reason to run
+	 * the fan, not a reason to reuse a number.
+	 */
 	if (!sc->avs_mapped || sc->avs_vaddr == NULL) {
-		return (sc->cached_temp_mc);
+		return (false);
 	}
 
 	/*
@@ -124,7 +141,7 @@ bcm2712_thermal_read_raw(struct bcm2712_softc *sc)
 	 * even with valid readings. Accept reading if bit 16 is set.
 	 */
 	if ((raw_value & 0x10000) == 0) {
-		return (sc->cached_temp_mc);
+		return (false);
 	}
 
 	/* Extract 10-bit temperature code from lower bits */
@@ -145,7 +162,8 @@ bcm2712_thermal_read_raw(struct bcm2712_softc *sc)
 	if (temp_mc > 120000)
 		temp_mc = 120000;
 
-	return ((uint32_t)temp_mc);
+	*temp_out = (uint32_t)temp_mc;
+	return (true);
 }
 
 /*
@@ -189,14 +207,38 @@ static void
 bcm2712_thermal_update(void *arg)
 {
 	struct bcm2712_softc *sc = arg;
-	uint32_t raw_value;
+	uint32_t temp_mc;
 
 	mtx_assert(&sc->thermal_mtx, MA_OWNED);
 
-	/* Read hardware and cache result */
-	raw_value = bcm2712_thermal_read_raw(sc);
-	sc->cached_temp_mc = bcm2712_thermal_raw_to_millic(raw_value);
-	sc->last_update = time_uptime;
+	if (bcm2712_thermal_read_raw(sc, &temp_mc)) {
+		sc->cached_temp_mc = bcm2712_thermal_raw_to_millic(temp_mc);
+		sc->last_update = time_uptime;
+		sc->thermal_invalid_run = 0;
+		if (!sc->thermal_healthy) {
+			sc->thermal_healthy = true;
+			printf("bcm2712: thermal sensor is answering again "
+			    "(%u.%u C)\n", sc->cached_temp_mc / 1000,
+			    (sc->cached_temp_mc % 1000) / 100);
+		}
+	} else {
+		sc->thermal_invalid_total++;
+		if (sc->thermal_invalid_run < UINT32_MAX)
+			sc->thermal_invalid_run++;
+		/*
+		 * Leave cached_temp_mc and last_update alone -- they are the
+		 * last thing actually measured, and callers can tell how old
+		 * that is from hw.bcm2712.thermal.invalid_run.
+		 */
+		if (sc->thermal_healthy &&
+		    sc->thermal_invalid_run >= BCM2712_THERMAL_STALE_TICKS) {
+			sc->thermal_healthy = false;
+			printf("bcm2712: thermal sensor produced no valid "
+			    "reading for %u ticks; temperature is untrusted "
+			    "and the fan will be forced to full\n",
+			    sc->thermal_invalid_run);
+		}
+	}
 
 	/* Reschedule for next update (1 second interval) */
 	callout_reset(&sc->thermal_callout, hz, bcm2712_thermal_update, sc);
@@ -212,6 +254,10 @@ bcm2712_read_cpu_temp(uint32_t *temp)
 		return (ENODEV);
 
 	mtx_lock(&sc->thermal_mtx);
+	if (!sc->thermal_healthy) {
+		mtx_unlock(&sc->thermal_mtx);
+		return (EIO);
+	}
 	*temp = sc->cached_temp_mc;
 	mtx_unlock(&sc->thermal_mtx);
 
@@ -399,6 +445,9 @@ bcm2712_modevent(module_t mod __unused, int event, void *arg __unused)
 		/* Initialize cached temperature */
 		sc->cached_temp_mc = 50000;  /* 50°C */
 		sc->last_update = 0;
+		sc->thermal_invalid_total = 0;
+		sc->thermal_invalid_run = 0;
+		sc->thermal_healthy = true;
 
 		/*
 		 * Map the AVS monitor.  Its node is a plain child of the soc
@@ -609,6 +658,37 @@ bcm2712_modevent(module_t mod __unused, int event, void *arg __unused)
 				    OID_AUTO, "cpu_temp", CTLFLAG_RD | CTLTYPE_INT | CTLFLAG_MPSAFE,
 				    sc, 0, bcm2712_thermal_sysctl_temp, "IK",
 				    "CPU temperature in deciKelvin");
+
+				/*
+				 * Sensor health.  A board that overheats while
+				 * cpu_temp looks fine is the failure these
+				 * exist to make visible.
+				 */
+				SYSCTL_ADD_BOOL(&sc->sysctl_ctx,
+				    SYSCTL_CHILDREN(thermal_tree),
+				    OID_AUTO, "healthy",
+				    CTLFLAG_RD | CTLFLAG_MPSAFE,
+				    &sc->thermal_healthy, 0,
+				    "Temperature is trustworthy");
+				SYSCTL_ADD_UINT(&sc->sysctl_ctx,
+				    SYSCTL_CHILDREN(thermal_tree),
+				    OID_AUTO, "invalid_total",
+				    CTLFLAG_RD | CTLFLAG_MPSAFE,
+				    &sc->thermal_invalid_total, 0,
+				    "Ticks the sensor produced no valid reading");
+				SYSCTL_ADD_UINT(&sc->sysctl_ctx,
+				    SYSCTL_CHILDREN(thermal_tree),
+				    OID_AUTO, "invalid_run",
+				    CTLFLAG_RD | CTLFLAG_MPSAFE,
+				    &sc->thermal_invalid_run, 0,
+				    "Consecutive such ticks (age of cpu_temp)");
+				SYSCTL_ADD_INT(&sc->sysctl_ctx,
+				    SYSCTL_CHILDREN(thermal_tree),
+				    OID_AUTO, "fail_inject",
+				    CTLFLAG_RW | CTLFLAG_MPSAFE,
+				    &bcm2712_thermal_fail_inject, 0,
+				    "Simulate a silent sensor, to test the fan "
+				    "fail-safe (errs towards cooling)");
 			}
 		}
 

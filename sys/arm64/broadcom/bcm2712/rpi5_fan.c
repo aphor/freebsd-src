@@ -96,6 +96,13 @@ struct rpi5_cooling_fan {
 	uint32_t temp_max;
 	bool temp_seen;
 
+	/*
+	 * Set while the thermal sensor is not answering.  The fan runs at full
+	 * for as long as it is set, because there is no temperature to control
+	 * on; see the fail-safe in rpi5_update_fan_state().
+	 */
+	bool sensor_failed;
+
 	/* Thermal management */
 	int thermal_active;
 	struct callout thermal_callout;
@@ -417,6 +424,17 @@ rpi5_update_fan_state(void)
 	temp = cooling_fan.cpu_temp;
 	new_state = cooling_fan.fan_current_state;
 
+	/*
+	 * Fail-safe.  Ahead of both controllers, because neither can make a
+	 * sound decision without a temperature: the learned controller's
+	 * supervisor only trips on a reading at or above crit, and the region
+	 * curve would sit in whatever region the stale value names.
+	 */
+	if (cooling_fan.sensor_failed) {
+		speed = 255;
+		goto program;
+	}
+
 	if (cooling_fan.controller == RPI5_CTRL_NN) {
 		speed = rpi5_nn_tick(temp);
 		goto program;
@@ -474,9 +492,31 @@ rpi5_thermal_tick(void *arg)
 	/* Read CPU temperature from BCM2712 thermal sensor */
 	error = bcm2712_read_cpu_temp(&temp);
 	if (error) {
-		/* Fallback to previous reading on error */
+		/*
+		 * The sensor is not answering, so there is no temperature to
+		 * control on.  Reusing the last reading -- which is what this
+		 * used to do -- is the dangerous choice: it leaves the
+		 * controller and its critical-temperature supervisor acting on
+		 * a number that stopped tracking the die, and a board can
+		 * overheat with every sysctl looking healthy.  Run the fan at
+		 * full until the sensor comes back.
+		 */
 		temp = cooling_fan.cpu_temp;
+		if (!cooling_fan.sensor_failed) {
+			cooling_fan.sensor_failed = true;
+			printf("rpi5_fan: temperature unreadable (error %d); "
+			    "forcing the fan to full until it returns\n",
+			    error);
+		}
 	} else {
+		if (cooling_fan.sensor_failed) {
+			cooling_fan.sensor_failed = false;
+			printf("rpi5_fan: temperature readable again "
+			    "(%u.%u C); returning to %s control\n",
+			    temp / 1000, (temp % 1000) / 100,
+			    cooling_fan.controller == RPI5_CTRL_NN ?
+			    "learned" : "region curve");
+		}
 		cooling_fan.cpu_temp = temp;
 
 		/*
