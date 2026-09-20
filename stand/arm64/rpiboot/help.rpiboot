@@ -1,0 +1,15 @@
+################################################################################
+# Trpiboot DRaspberry Pi 5 specifics
+
+	This loader is started directly by the Raspberry Pi 5 VPU firmware,
+	with no EFI and no EDK2 in the boot path.  The device tree comes from
+	the firmware as a physical address in x0; there is no EFI memory map,
+	so all memory information comes from the tree's /memory node.
+
+	The console is the SoC PL011 at 0x107d001000, which the firmware has
+	already configured to 115200 8N1 before entry.
+
+	md0: is a memory disk embedded in the loader image itself, so it is
+	available with no storage driver at all.
+
+################################################################################

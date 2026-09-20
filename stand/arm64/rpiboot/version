@@ -1,0 +1,6 @@
+$FreeBSD$
+
+NOTE ANY CHANGES YOU MAKE TO THE BOOTBLOCKS HERE.
+
+0.1:	Initial Raspberry Pi 5 non-EFI loader: PL011 console and an
+	embedded memory disk, entered directly by the VPU firmware.
