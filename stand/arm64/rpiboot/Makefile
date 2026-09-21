@@ -33,7 +33,18 @@ LOADER_INTERP?=	simp
 # sys/tools/embed_mfs.sh patches a real image over it after the link.  That
 # script has a non-ELF path using strings(1), so it works on the raw binary.
 LOADER_MD_SUPPORT=	yes
-MD_IMAGE_SIZE?=		1048576		# 1 MiB, must be a multiple of 512
+#
+# 14 MiB, so the image can carry a stripped kernel.
+#
+# This is what lets the handoff be tested with one new variable instead of
+# two: the loader has no storage driver yet, so without an embedded kernel
+# there would be nothing to boot, and wiring the SD card at the same time
+# would leave a failure ambiguous between the two.  A 14 MiB image makes the
+# loader binary about 14.5 MiB, which the firmware loads at 0x200000 and which
+# still ends far below the device tree at 0x4000000.
+#
+# Must be a multiple of 512; stand/common/md.c #errors otherwise.
+MD_IMAGE_SIZE?=		14680064
 
 # What this loader does and does not carry.  Network and ZFS are off because
 # there are no drivers for them here yet; MSDOS is on because the firmware
@@ -53,7 +64,23 @@ HELP_FILENAME=	loader.help.rpiboot
 SRCS=	start.S
 SRCS+=	main.c conf.c copy.c time.c devicename.c
 SRCS+=	pl011.c pl011_console.c
+SRCS+=	exec.c bootinfo_arch.c
 SRCS+=	vers.c
+
+# bi_load() builds the metadata the kernel reads, which is a contract with
+# sys/arm64 -- so share the file rather than reimplement it.  It is already
+# #ifdef EFI-guarded and stand/kboot reuses it exactly this way.  Compiled
+# without -DEFI here, its non-EFI branch wants "kboot.h" and bi_loadsmap();
+# see kboot.h and bootinfo_arch.c for why both are provided rather than
+# patching a file shared with kboot.
+.PATH:		${BOOTSRC}/efi/loader
+SRCS+=		bootinfo.c
+
+# cpu_flush_dcache()/cpu_inval_icache() for the handoff, the same two lines
+# stand/efi/loader/arch/arm64/Makefile.inc uses.
+.PATH:		${BOOTSRC}/arm64/libarm64
+CFLAGS+=	-I${BOOTSRC}/arm64/libarm64
+SRCS+=		cache.c
 
 # FDT comes from x0, so the platform contract is three small functions.
 .if ${MK_FDT} != "no"

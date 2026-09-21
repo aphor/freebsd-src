@@ -44,18 +44,11 @@ struct fs_ops *file_system[] = {
 };
 
 /*
- * File formats.
- *
- * Empty until the kernel handoff lands: booting a kernel needs the arm64
- * elf64_exec from stand/efi/loader/arch/arm64/exec.c with its EFI
- * dependencies removed, plus bi_load() from stand/efi/loader/bootinfo.c
- * compiled without -DEFI, the way stand/kboot reuses it.  Leaving this empty
- * rather than half-wired means "load" reports honestly that it cannot, which
- * is better than a partial path that fails somewhere less obvious.
+ * File formats live in exec.c, which defines file_formats[] alongside the
+ * arm64 ELF handoff it implements.  Kept there rather than here because the
+ * table and the l_exec it points at have to agree, and splitting them is how
+ * they come to disagree.
  */
-struct file_format *file_formats[] = {
-	NULL
-};
 
 /*
  * Consoles.
