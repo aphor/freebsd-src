@@ -1,0 +1,70 @@
+#
+# RPI5-FDT-NORP1 -- RPI5-FDT with every driver that touches RP1 removed.
+#
+# WHY THIS EXISTS
+#
+# On 2026-09-20 the non-EFI loader handed control to an RPI5-FDT kernel for
+# the first time.  The kernel started, took its memory from the device tree,
+# brought all four CPUs up over PSCI, and then panicked:
+#
+#	rp1_pcie2_recon: PCIe2 mapped at phys 0x1000120000
+#	esr: 0x00000000be000011
+#	panic: Unhandled System Error
+#
+# and every RP1 register read in that boot had returned 0xdeaddead:
+#
+#	bcm2712: RP1 PWM1 clock enabled (CTRL=0xdeaddead ...)
+#	rp1_eth: PHY@1 ID 0xdead:0xdead
+#
+# while SoC-native accesses in the same boot worked:
+#
+#	bcm2712: AVS thermal sensor mapped at 0x107d542000 (from FDT)
+#	bcm2712: Thermal sensor initialized
+#
+# The cause is in the firmware log, three lines before it hands over:
+#
+#	6.52 PCI1 reset
+#	6.53 PCI2 reset
+#	6.58 Starting OS 6589 ms
+#
+# The VPU firmware resets PCIe and leaves it un-enumerated with no outbound
+# windows.  On the EDK2 lane, EDK2 enumerates it and programs the windows
+# before the kernel runs, which is why the same drivers work there.  With no
+# EDK2 there is nothing behind PCIe at all until a brcm,bcm2712-pcie host
+# driver brings the bridge up -- and RP1 is behind PCIe, so that means GPIO,
+# PWM, the cooling fan and Ethernet as well as NVMe and USB.
+#
+# This configuration removes those drivers so the rest of the boot can be
+# measured on its own.  It is a measurement tool, not a destination: the
+# destination is a PCIe host driver, after which RPI5-FDT works as intended.
+#
+# WHAT IS DELIBERATELY KEPT
+#
+# The SD and SDIO host controllers stay, because they are native BCM2712
+# peripherals at 0x1000fff000 and 0x1001100000 rather than anything behind
+# RP1 -- the same window the loader's own SDHCI block reader was proven
+# against.  So this kernel may well find a real root filesystem rather than
+# stopping at mountroot, which is the interesting thing to find out.
+#
+
+#NO_UNIVERSE
+
+include		"RPI5-FDT"
+ident		RPI5-FDT-NORP1
+
+# Everything below is behind PCIe, which is not enumerated on this lane.
+# Each of these maps a hardcoded RP1 physical address and reads it without
+# first checking that the bus answers, so against a dead fabric they return
+# 0xdeaddead and eventually raise an SError.
+nodevice	bcm2712			# RP1 PWM at 0x1f0009c000, GPIO, clocks
+nodevice	rpi5_fan		# depends on bcm2712 for PWM and thermal
+nodevice	bcm2712_pcie		# RP1 GEM interrupt router, 0x1f00100000
+nodevice	rp1_gpio		# RP1 IO_BANK/RIO/PADS at 0x1f000d0000
+nodevice	rp1_eth			# RP1 Cadence GEM at 0x1f00100000
+nodevice	rp1_pcie2_recon		# PCIe2 host bridge at 0x1000120000
+
+# NOTE: the AVS thermal sensor at 0x107d542000 is native and worked fine in
+# the failing boot, but it is reached through bcm2712 which has to go.  So
+# this kernel has no temperature reading and no fan control, and the firmware
+# left the fan at RPM 194 of 208 on the boot that panicked.  Do not leave a
+# board running this configuration unattended.
