@@ -9,6 +9,13 @@ struct env_var;
 
 /* main.c */
 int	rpi_autoload(void);
+void	rpi_psci_reset(void);
+
+/* rpi_mbox.c -- the VPU property mailbox and TryBoot. */
+void	rpi_print_boot_config(void);
+
+/* rpi_fdt.c */
+int	rpi_fdt_tryboot(void);
 
 /* copy.c -- and the staging translation; see that file for why one is needed. */
 void	*rpi_translate(vm_offset_t va);

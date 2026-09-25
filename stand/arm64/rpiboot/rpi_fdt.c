@@ -66,3 +66,27 @@ fdt_platform_fixups(void)
 {
 	fdt_apply_overlays();
 }
+
+/*
+ * Which config file did the firmware boot us with?  The bootloader records it
+ * in /chosen/bootloader/tryboot, a single cell: 0 for config.txt, 1 for
+ * tryboot.txt.  Read straight off the blob at x0 so it works before, and
+ * without, the MI FDT code loading a copy.  Returns -1 when absent.
+ */
+int
+rpi_fdt_tryboot(void)
+{
+	const void *fdt = (const void *)(uintptr_t)rpi_dtb_pa;
+	const fdt32_t *p;
+	int len, node;
+
+	if (rpi_dtb_pa == 0 || fdt_check_header(fdt) != 0)
+		return (-1);
+	node = fdt_path_offset(fdt, "/chosen/bootloader");
+	if (node < 0)
+		return (-1);
+	p = fdt_getprop(fdt, node, "tryboot", &len);
+	if (p == NULL || len != sizeof(*p))
+		return (-1);
+	return ((int)fdt32_to_cpu(*p));
+}

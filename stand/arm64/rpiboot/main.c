@@ -51,9 +51,8 @@ extern char	_end[];
 /*
  * PSCI, which is how this loader resets the board.
  *
- * There is no firmware service to call and the VideoCore mailbox is out of
- * reach this early, but ARM Trusted Firmware is live at EL3 -- its banner
- * prints immediately before we are entered:
+ * There is no firmware reset service to call, but ARM Trusted Firmware is
+ * live at EL3 -- its banner prints immediately before we are entered:
  *
  *	NOTICE:  BL31: v2.6(release):v2.6-240-gfc45bc492
  *
@@ -97,7 +96,7 @@ psci_smc(uint32_t fnid, uint64_t a1, uint64_t a2, uint64_t a3)
  * means the call failed -- and the caller wants to know that rather than sit
  * in a silent hang.
  */
-static void
+void
 rpi_psci_reset(void)
 {
 	printf("Resetting via PSCI SYSTEM_RESET (SMC to BL31)...\n");
@@ -163,6 +162,13 @@ rpi_report_entry(void)
 			    (unsigned long)((v >> 16) & 0xffff),
 			    (unsigned long)(v & 0xffff));
 	}
+
+	/*
+	 * config.txt or tryboot.txt?  The firmware records which one in the
+	 * tree, and after a "tryboot" it is the only proof the one-shot was
+	 * honoured rather than merely requested.
+	 */
+	rpi_print_boot_config();
 }
 
 int

@@ -13,3 +13,31 @@
 	available with no storage driver at all.
 
 ################################################################################
+# Ttryboot DReboot once using tryboot.txt
+
+	tryboot [-n]
+
+	Asks the VPU firmware, through its property mailbox, to read
+	tryboot.txt instead of config.txt for the next boot only, then
+	resets.  The flag is consumed by that boot, so every later boot is
+	back on config.txt: a tryboot.txt that fails to boot costs one power
+	cycle.  The flag is read back before resetting.
+
+	-n	arm the flag without resetting.
+
+################################################################################
+# Tuntryboot DClear an armed TryBoot flag
+
+	untryboot
+
+################################################################################
+# Tvcinfo DShow VPU firmware, board and TryBoot state
+
+	vcinfo
+
+	Firmware revision, board revision and serial, SoC temperature (there
+	is no fan control at this prompt), the reboot flags that
+	will apply to the next boot, and which config file this boot used
+	(from /chosen/bootloader/tryboot in the firmware's device tree).
+
+################################################################################

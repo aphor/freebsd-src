@@ -65,6 +65,7 @@ SRCS=	start.S
 SRCS+=	main.c conf.c copy.c time.c devicename.c
 SRCS+=	pl011.c pl011_console.c
 SRCS+=	exec.c bootinfo_arch.c
+SRCS+=	rpi_mbox.c
 SRCS+=	vers.c
 
 # bi_load() builds the metadata the kernel reads, which is a contract with
