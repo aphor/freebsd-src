@@ -2,5 +2,9 @@ $FreeBSD$
 
 NOTE ANY CHANGES YOU MAKE TO THE BOOTBLOCKS HERE.
 
+0.3:	VPU property mailbox: vcinfo, tryboot and untryboot, and the
+	banner says whether this boot used config.txt or tryboot.txt.
+0.2:	Kernel handoff (arm64 ELF, staging translation, modulep above
+	KERNBASE), and reboot/poweroff via PSCI.
 0.1:	Initial Raspberry Pi 5 non-EFI loader: PL011 console and an
 	embedded memory disk, entered directly by the VPU firmware.
