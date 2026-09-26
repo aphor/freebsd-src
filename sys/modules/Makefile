@@ -366,6 +366,7 @@ SUBDIR=	\
 	${_rp1_gpio} \
 	${_rp1_pcie2_recon} \
 	${_rpi5_fan} \
+	${_rpi_fw} \
 	rtsx \
 	${_rtw88} \
 	${_rtw89} \
@@ -755,6 +756,7 @@ _rp1_eth=	rp1_eth
 _rp1_gpio=	rp1_gpio
 _rp1_pcie2_recon=	rp1_pcie2_recon
 _rpi5_fan=	rpi5_fan
+_rpi_fw=	rpi_fw
 _dpaa2=		dpaa2
 _sff=		sff
 _em=		em
