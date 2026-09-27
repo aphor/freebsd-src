@@ -48,8 +48,9 @@
  * property buffer is handed to the VPU as a plain physical address: the
  * firmware node carries an empty dma-ranges, and loader/mboxtest.bin
  * confirmed it on this board (board revision and serial matched the
- * firmware's own log).  The buffer must be below 4 GB, because the message
- * is a 32-bit address with the channel in its low four bits.
+ * firmware's own log).  The message is a 32-bit address with the channel
+ * in its low four bits, but the VPU only processes buffers below 1 GB --
+ * measured on both lanes; see the allocation in rpi_fw_attach().
  *
  * Found through the device tree like the other drivers in this directory,
  * and attached to nexus for the same reason (see bcm2712_fdt.h): OFW is
@@ -128,6 +129,7 @@ struct rpi_fw_softc {
 	bus_size_t		sc_regs_size;
 	eventhandler_tag	sc_shutdown_tag;
 	bool			sc_tryboot_armed;
+	uint32_t		sc_last_code;	/* buf[1] of the last reply */
 };
 
 static inline uint32_t
@@ -212,6 +214,7 @@ rpi_fw_tag_locked(struct rpi_fw_softc *sc, uint32_t tag, uint32_t *val,
 	}
 	dsb(sy);
 
+	sc->sc_last_code = buf[1];
 	if (buf[1] != RESP_SUCCESS)
 		return (EIO);
 	if ((buf[4] & RESP_SUCCESS) == 0)
@@ -390,12 +393,19 @@ rpi_fw_attach(device_t dev)
 	sc->sc_regs = pmap_mapdev_attr(pa, sz, VM_MEMATTR_DEVICE);
 
 	/*
-	 * One page, below 4 GB, uncached.  Uncached is what makes it safe to
-	 * share with the VPU without cache maintenance; below 4 GB is what
-	 * fits the 32-bit mailbox message.
+	 * One page, below 1 GB, uncached.  Uncached is what makes it safe to
+	 * share with the VPU without cache maintenance.
+	 *
+	 * Below 1 GB is measured, not documented.  Every buffer the VPU has
+	 * processed was under 0x40000000 -- 0x2f282000, 0x3cc000, 0x3b0d3000
+	 * and 0x4cd000 on the ACPI lane, and the loader's near 0x200000 --
+	 * while the one allocated at 0x40233000 on an FDT boot was answered
+	 * on our channel with buf[1] still 0: the VPU never read it.  So the
+	 * device tree's identity dma-ranges does not mean the VPU can reach
+	 * all of it.  The 32-bit mailbox message alone would allow 4 GB.
 	 */
 	sc->sc_buf = kmem_alloc_contig(PAGE_SIZE, M_WAITOK | M_ZERO, 0,
-	    0xffffffffUL, PAGE_SIZE, 0, VM_MEMATTR_UNCACHEABLE);
+	    0x3fffffffUL, PAGE_SIZE, 0, VM_MEMATTR_UNCACHEABLE);
 	if (sc->sc_buf == NULL) {
 		device_printf(dev, "cannot allocate the property buffer\n");
 		rpi_fw_detach(dev);
@@ -408,8 +418,17 @@ rpi_fw_attach(device_t dev)
 	if (error == 0)
 		error = rpi_fw_tag(sc, TAG_GET_REBOOT_FLAGS, &flags, 4, 0);
 	if (error != 0) {
-		device_printf(dev, "mailbox at 0x%jx did not answer (%d)\n",
-		    (uintmax_t)pa, error);
+		/*
+		 * Say where the buffer was and what the VPU wrote back.  EIO
+		 * means the VPU replied on our channel but left buf[1] other
+		 * than 0x80000000: it answered without processing the buffer
+		 * it was given, which is the address question, not a dead
+		 * channel.  Seen on the FDT lane on 2026-09-27, where the
+		 * same code works on the ACPI lane.
+		 */
+		device_printf(dev, "mailbox at 0x%jx did not answer (%d): "
+		    "buffer PA 0x%jx, response code 0x%08x\n", (uintmax_t)pa,
+		    error, (uintmax_t)sc->sc_buf_pa, sc->sc_last_code);
 		rpi_fw_detach(dev);
 		return (ENXIO);
 	}
