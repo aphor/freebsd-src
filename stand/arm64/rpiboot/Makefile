@@ -34,17 +34,24 @@ LOADER_INTERP?=	simp
 # script has a non-ELF path using strings(1), so it works on the raw binary.
 LOADER_MD_SUPPORT=	yes
 #
-# 14 MiB, so the image can carry a stripped kernel.
+# 16 MiB, so the image can carry a stripped kernel and the cyw43455
+# firmware.
 #
 # This is what lets the handoff be tested with one new variable instead of
 # two: the loader has no storage driver yet, so without an embedded kernel
 # there would be nothing to boot, and wiring the SD card at the same time
-# would leave a failure ambiguous between the two.  A 14 MiB image makes the
-# loader binary about 14.5 MiB, which the firmware loads at 0x200000 and which
-# still ends far below the device tree at 0x4000000.
+# would leave a failure ambiguous between the two.  The firmware has to be
+# here too, and preloaded by loader.rc, because cyw(4) attaches before root
+# is mounted.
 #
-# Must be a multiple of 512; stand/common/md.c #errors otherwise.
-MD_IMAGE_SIZE?=		14680064
+# 14 MiB held the 12.45 MB kernel alone; with the 0.61 MB of firmware added,
+# makefs ran out of space.  16 MiB makes the loader about 17 MiB, which the
+# firmware loads at 0x200000 and which ends near 0x1300000 -- still far below
+# the device tree at 0x4000000 and the heap at 0x8000000.
+#
+# Must be a multiple of 512; stand/common/md.c #errors otherwise.  Changing it
+# needs a clean build: md.o takes it through CFLAGS, which make does not track.
+MD_IMAGE_SIZE?=		16777216
 
 # What this loader does and does not carry.  Network and ZFS are off because
 # there are no drivers for them here yet; MSDOS is on because the firmware
@@ -65,7 +72,7 @@ SRCS=	start.S
 SRCS+=	main.c conf.c copy.c time.c devicename.c
 SRCS+=	pl011.c pl011_console.c
 SRCS+=	exec.c bootinfo_arch.c
-SRCS+=	rpi_mbox.c
+SRCS+=	rpi_mbox.c rpi_peek.c
 SRCS+=	vers.c
 
 # bi_load() builds the metadata the kernel reads, which is a contract with
