@@ -267,7 +267,13 @@ cyw_fil_txrx(struct cyw_softc *sc, uint32_t cmd, uint32_t bcdc_flags,
 	uint16_t id;
 	int err, i;
 
-	frame = malloc(framelen, M_CYW, M_WAITOK | M_ZERO);
+	/*
+	 * Allocated to the CYW_F2_BLKSIZE multiple that cyw_f2_write_block()
+	 * actually sends, not to framelen: the padding goes to the card and
+	 * must be zeros from this buffer, not whatever follows it in the heap.
+	 */
+	frame = malloc(roundup2(framelen, CYW_F2_BLKSIZE), M_CYW,
+	    M_WAITOK | M_ZERO);
 
 	sx_xlock(&sc->ioctl_sx);
 	id = ++sc->ioctl_id;

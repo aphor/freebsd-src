@@ -829,7 +829,7 @@ static int
 cyw_tx_data_frame(struct cyw_softc *sc, struct mbuf *m)
 {
 	struct cyw_sdpcm_hdr *sph;
-	struct ether_header *eh;
+	struct ether_header ehdr, *eh;
 	uint8_t *bdc, *frame_buf, *pkt;
 	size_t eth_len, framelen;
 	uint16_t ethertype;
@@ -837,15 +837,21 @@ cyw_tx_data_frame(struct cyw_softc *sc, struct mbuf *m)
 	uint8_t priority;
 	int err;
 
-	/* Linearize — mbuf chain may be scattered. */
-	if (m->m_next != NULL) {
-		struct mbuf *n = m_pullup(m, m->m_pkthdr.len);
-		if (n == NULL)
-			return (ENOBUFS);
-		m = n;
-	}
-	eth_len  = m->m_len;
+	/*
+	 * The frame is copied out of the mbuf chain below, straight into the
+	 * flat SDPCM buffer, so the chain never needs linearising.  This used
+	 * to m_pullup() the whole packet first, and m_pullup() refuses any
+	 * length over MHLEN (about 200 bytes): every chained frame larger
+	 * than that -- most TCP data, and anything the stack built in two
+	 * mbufs -- was freed with ENOBUFS before it reached the bus.  The
+	 * Ethernet header is copied to the stack for classification.
+	 */
+	eth_len  = m->m_pkthdr.len;
 	framelen = ALIGN4(CYW_SDPCM_HDR_LEN + CYW_BDC_DATA_HDR_LEN + eth_len);
+	if (eth_len >= sizeof(ehdr))
+		m_copydata(m, 0, sizeof(ehdr), (caddr_t)&ehdr);
+	else
+		memset(&ehdr, 0, sizeof(ehdr));
 
 	/*
 	 * EAPOL classification — mirrors Linux brcmf_netdev_start_xmit
@@ -853,7 +859,7 @@ cyw_tx_data_frame(struct cyw_softc *sc, struct mbuf *m)
 	 * data (cfg80211_classify8021d() returns 0 for non-IP traffic).
 	 * Log every EAPOL TX so we can confirm M2 / M4 actually leave.
 	 */
-	eh = mtod(m, struct ether_header *);
+	eh = &ehdr;
 	if (eth_len >= sizeof(*eh)) {
 		ethertype = ntohs(eh->ether_type);
 		is_eapol  = (ethertype == ETHERTYPE_PAE);
@@ -879,15 +885,32 @@ cyw_tx_data_frame(struct cyw_softc *sc, struct mbuf *m)
 		return (ENOBUFS);
 	}
 
-	pkt = malloc(framelen, M_CYW, M_NOWAIT | M_ZERO);
+	/*
+	 * Allocated to the CYW_F2_BLKSIZE multiple that cyw_f2_write_block()
+	 * actually sends, not to framelen: the padding goes to the card and
+	 * must be zeros from this buffer, not whatever follows it in the heap.
+	 */
+	pkt = malloc(roundup2(framelen, CYW_F2_BLKSIZE), M_CYW,
+	    M_NOWAIT | M_ZERO);
 	if (pkt == NULL) {
 		m_freem(m);
 		return (ENOBUFS);
 	}
 
 	sph = (struct cyw_sdpcm_hdr *)pkt;
-	sph->len         = htole16((uint16_t)framelen);
-	sph->len_inv     = htole16(~(uint16_t)framelen);
+	/*
+	 * The header carries the real length -- SDPCM + BDC headers plus the
+	 * Ethernet frame -- not framelen.  framelen is ALIGN4'd, and the
+	 * firmware takes this field as the frame's extent: with the padding
+	 * counted, a 1513- or 1514-byte Ethernet frame looked like 1516 bytes,
+	 * over the maximum, and was silently dropped (ping payload 1470
+	 * answered, 1471 not), while shorter frames went out with up to three
+	 * trailing junk bytes.  Linux brcmf_sdio_txpkt_prep() likewise sets
+	 * hd_info.len before any tail padding.
+	 */
+	sph->len         = htole16((uint16_t)(CYW_SDPCM_HDR_LEN +
+	    CYW_BDC_DATA_HDR_LEN + eth_len));
+	sph->len_inv     = htole16((uint16_t)~le16toh(sph->len));
 	sph->chan_flags  = CYW_SDPCM_CHAN_DATA;
 	sph->data_offset = CYW_SDPCM_HDR_LEN;
 
@@ -898,7 +921,7 @@ cyw_tx_data_frame(struct cyw_softc *sc, struct mbuf *m)
 	bdc[3] = 0;				/* data_offset: no padding */
 
 	frame_buf = pkt + CYW_SDPCM_HDR_LEN + CYW_BDC_DATA_HDR_LEN;
-	memcpy(frame_buf, mtod(m, void *), eth_len);
+	m_copydata(m, 0, eth_len, (caddr_t)frame_buf);
 
 	sx_xlock(&sc->f2_sx);
 	sph->seq = sc->sdpcm_tx_seq++;
