@@ -52,6 +52,9 @@ nodevice	mmcsd
 device		bcm2712			# PWM + thermal sensor
 device		bcm2712_pcie		# RP1 GEM interrupt router (FDT)
 device		rpi5_fan		# Pi 5 cooling fan thermal control
+device		rpi_fw			# VPU firmware mailbox, TryBoot
+device		brcmstb_gpio		# SoC-native GPIO (WL_ON, SD power)
+device		bcm2712_pinctrl		# SoC pin mux (SDIO2 for WiFi)
 
 # RP1 southbridge
 device		rp1_gpio		# GPIO + pinctrl

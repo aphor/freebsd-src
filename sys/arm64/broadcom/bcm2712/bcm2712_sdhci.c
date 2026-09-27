@@ -44,17 +44,31 @@
  *    sdhci-caps-mask on mmc@1100000, which a full driver would apply through
  *    it.  Nothing needs them while the CAPS register already reads correctly.
  *  - cd-gpios is ignored, so card detect comes from the controller's own
- *    present-state bit.  Wiring the GPIO needs rp1_gpio, and the pin is on
- *    the BCM2712 side (gio_aon), not RP1, so it needs a second GPIO driver
- *    that does not exist yet.
- *  - vmmc-supply and vqmmc-supply are ignored; the regulators are always-on
- *    fixed regulators on this board, and regfix(4) does attach to them under
- *    FDT, so voltage switching for UHS modes would go through them.
- *  - pinctrl-0 is not applied.  There is no RP1-independent pinctrl driver,
- *    and the firmware has already muxed these pins.
+ *    present-state bit.  The pin is on the always-on BCM2712 controller
+ *    (gio_aon, line 5), which brcmstb_gpio(4) now drives; it is simply not
+ *    wired up here.
+ *  - vqmmc-supply is not consumed, so there is no 1.8 V switching for UHS.
  *  - sd-uhs-sdr50/ddr50/sdr104, mmc-ddr-3_3v and supports-cqe are not
  *    consumed.  The controller is left in the speed modes sdhci(4) derives
  *    from CAPS, which is how the ACPI path runs today.
+ *
+ * POWER AND PINS
+ *
+ * pinctrl-0 is applied and vmmc-supply is enabled before the slot starts
+ * looking for a card.  An earlier version of this file ignored both, on the
+ * assumption that the firmware had muxed the pins and that the supplies were
+ * always-on.  That holds for the microSD slot and is false for the SDIO slot.
+ * The loader's peek, before any kernel ran, found gpio30..35 still muxed as
+ * plain GPIO, and WL_ON -- the GPIO behind wl-on-reg, mmc@1100000's
+ * vmmc-supply -- an input reading 0.  So the WiFi chip had no power and no
+ * bus.  Both are now done here, as Linux does in its mmc core.
+ *
+ * Holding vmmc-supply matters for the microSD slot too, for a different
+ * reason.  Its supply, sd-vcc-reg, is regulator-boot-on but not always-on.
+ * Once brcmstb_gpio(4) gives it a GPIO it registers, and
+ * regulator_shutdown() at SI_SUB_LAST -- before root is mounted -- turns off
+ * every enabled regulator that is not always-on and has no users.  Unheld,
+ * that would cut power to the card holding the root filesystem.
  *
  * References:
  *   sys/dev/sdhci/sdhci_acpi.c  the working attachment for this same hardware
@@ -78,6 +92,8 @@
 
 #include <dev/ofw/ofw_bus.h>
 #include <dev/ofw/ofw_bus_subr.h>
+#include <dev/fdt/fdt_pinctrl.h>
+#include <dev/regulator/regulator.h>
 
 #include <dev/mmc/bridge.h>
 #include <dev/mmc/mmcreg.h>
@@ -102,6 +118,7 @@ struct bcm2712_sdhci_softc {
 	struct resource		*cfg_res;	/* reg[1], "cfg" -- see ToDo */
 	struct resource		*irq_res;
 	void			*intrhand;
+	regulator_t		vmmc;		/* held while attached */
 };
 
 static void bcm2712_sdhci_intr(void *arg);
@@ -242,6 +259,29 @@ bcm2712_sdhci_attach(device_t dev)
 	if (sc->cfg_res == NULL && bootverbose)
 		device_printf(dev, "no cfg register window\n");
 
+	/*
+	 * Pins, then power, before sdhci_start_slot() looks for a card: see
+	 * POWER AND PINS in the file comment.  Neither is fatal when absent,
+	 * because the microSD slot works without both.  A supply that exists
+	 * but cannot be enabled is reported.
+	 */
+	err = fdt_pinctrl_configure_by_name(dev, "default");
+	if (err != 0 && err != ENOENT)
+		device_printf(dev, "pinctrl-0 not applied: %d\n", err);
+
+	err = regulator_get_by_ofw_property(dev, 0, "vmmc-supply", &sc->vmmc);
+	if (err == 0) {
+		err = regulator_enable(sc->vmmc);
+		if (err != 0) {
+			device_printf(dev, "cannot enable vmmc-supply: %d\n",
+			    err);
+			regulator_release(sc->vmmc);
+			sc->vmmc = NULL;
+		} else
+			device_printf(dev, "vmmc-supply enabled\n");
+	} else if (err != ENOENT)
+		device_printf(dev, "vmmc-supply unavailable: %d\n", err);
+
 	sc->slot.quirks = BCM2712_SDHCI_QUIRKS;
 
 	/*
@@ -292,6 +332,11 @@ bcm2712_sdhci_detach(device_t dev)
 		bus_release_resource(dev, SYS_RES_MEMORY,
 		    rman_get_rid(sc->mem_res), sc->mem_res);
 		sc->mem_res = NULL;
+	}
+	if (sc->vmmc != NULL) {
+		regulator_disable(sc->vmmc);
+		regulator_release(sc->vmmc);
+		sc->vmmc = NULL;
 	}
 	return (0);
 }
