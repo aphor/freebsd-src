@@ -144,12 +144,13 @@ cyw_probe(device_t dev)
 /* -------------------------------------------------------------------------
  * Attach
  * ------------------------------------------------------------------------- */
+static void cyw_init_task(void *, int);
+
 static int
 cyw_attach(device_t dev)
 {
 	struct cyw_softc *sc;
 	device_t parent, *children;
-	uint32_t pm;
 	int i, nchildren, err;
 
 	sc = device_get_softc(dev);
@@ -217,6 +218,10 @@ cyw_attach(device_t dev)
 	    SYSCTL_CHILDREN(sc->sysctl_tree), OID_AUTO,
 	    "rx_eio_count", CTLFLAG_RD, &sc->rx_eio_count, 0,
 	    "F2 CMD53 reads that returned EIO");
+	SYSCTL_ADD_U64(&sc->sysctl_ctx,
+	    SYSCTL_CHILDREN(sc->sysctl_tree), OID_AUTO,
+	    "tx_eio_count", CTLFLAG_RD, &sc->tx_eio_count, 0,
+	    "F2 writes that failed and were terminated (cyw_txfail)");
 	SYSCTL_ADD_U64(&sc->sysctl_ctx,
 	    SYSCTL_CHILDREN(sc->sysctl_tree), OID_AUTO,
 	    "rx_eagain_count", CTLFLAG_RD, &sc->rx_eagain_count, 0,
@@ -320,11 +325,51 @@ cyw_attach(device_t dev)
 	    CTLTYPE_INT | CTLFLAG_RD | CTLFLAG_MPSAFE, sc, 0,
 	    cyw_sysctl_fw_pm, "I", "firmware power management mode (live GET)");
 
+	/*
+	 * The firmware bring-up runs on a taskqueue of our own, not here.
+	 * sdiob(4) attaches us from its discovery task on taskqueue_thread,
+	 * and sdda(4) initializes the SD card from that same single thread:
+	 * a bring-up that stalls in an SDIO transfer used to stall the root
+	 * file system with it, and a slow one delayed it (cyw43455.md).
+	 * Linux also brings the chip up asynchronously, in
+	 * brcmf_sdio_firmware_callback() after request_firmware_nowait().
+	 */
+	sc->init_tq = taskqueue_create("cyw_init", M_WAITOK,
+	    taskqueue_thread_enqueue, &sc->init_tq);
+	taskqueue_start_threads(&sc->init_tq, 1, PWAIT, "%s init",
+	    device_get_nameunit(dev));
+	TASK_INIT(&sc->init_task, 0, cyw_init_task, sc);
+	taskqueue_enqueue(sc->init_tq, &sc->init_task);
+	return (0);
+
+fail_mtx:
+	sx_destroy(&sc->ioctl_sx);
+	mtx_destroy(&sc->mtx);
+	return (err);
+}
+
+/* -------------------------------------------------------------------------
+ * Firmware bring-up (init_tq)
+ *
+ * Everything that talks to the chip.  On failure it undoes what it did and
+ * leaves cyw0 attached with WiFi down; kldunload/kldload retries.
+ * ------------------------------------------------------------------------- */
+static void
+cyw_init_task(void *arg, int pending __unused)
+{
+	struct cyw_softc *sc = arg;
+	device_t dev = sc->dev;
+	sbintime_t t0;
+	uint32_t pm;
+	int err;
+
+	t0 = sbinuptime();
+
 	/* SDIO attach: enable F1, enable clock, read chip ID */
 	err = cyw_sdio_attach(sc);
 	if (err != 0) {
 		device_printf(dev, "SDIO attach failed: %d\n", err);
-		goto fail_sysctl;
+		goto fail;
 	}
 
 	device_printf(dev, "chip 0x%04x rev %d\n", sc->chip_id, sc->chip_rev);
@@ -476,17 +521,19 @@ cyw_attach(device_t dev)
 	 * the FreeBSD equivalent and issues WLC_UP on first ic_nrunning > 0.
 	 */
 
-	return (0);
+	sc->init_done = true;
+	device_printf(dev, "firmware bring-up took %d ms, done %d ms "
+	    "after boot\n", (int)((sbinuptime() - t0) / SBT_1MS),
+	    (int)(sbinuptime() / SBT_1MS));
+	return;
 
 fail_cfg:
 	cyw_cfg_detach(sc);
 fail_sdio:
 	cyw_sdio_detach(sc);
-fail_sysctl:
-	sysctl_ctx_free(&sc->sysctl_ctx);
-fail_mtx:
-	mtx_destroy(&sc->mtx);
-	return (err);
+fail:
+	device_printf(dev, "firmware bring-up failed (%d); WiFi is down\n",
+	    err);
 }
 
 /* -------------------------------------------------------------------------
@@ -497,9 +544,14 @@ cyw_detach(device_t dev)
 {
 	struct cyw_softc *sc = device_get_softc(dev);
 
-	cyw_cfg_detach(sc);	/* ieee80211_ifdetach before SDPCM stops */
-	cyw_sdpcm_detach(sc);	/* stop callout; wake any sleeping fwil */
-	cyw_sdio_detach(sc);
+	/* A bring-up still running finishes (or unwinds) first. */
+	taskqueue_drain(sc->init_tq, &sc->init_task);
+	taskqueue_free(sc->init_tq);
+	if (sc->init_done) {
+		cyw_cfg_detach(sc);	/* ieee80211_ifdetach before SDPCM stops */
+		cyw_sdpcm_detach(sc);	/* stop callout; wake any sleeping fwil */
+	}
+	cyw_sdio_detach(sc);	/* no-op unless the SDIO side is up */
 	sysctl_ctx_free(&sc->sysctl_ctx);
 	sx_destroy(&sc->ioctl_sx);
 	mtx_destroy(&sc->mtx);

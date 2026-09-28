@@ -175,6 +175,33 @@ cyw_sdpcm_update_credit(struct cyw_softc *sc, uint8_t credit)
 }
 
 /* -------------------------------------------------------------------------
+ * cyw_txfail — recover from a failed F2 write, as Linux brcmf_sdio_txfail()
+ * does: abort F2, terminate the write frame, and read the write frame byte
+ * count until it clears (three tries, as Linux).
+ * ------------------------------------------------------------------------- */
+void
+cyw_txfail(struct cyw_softc *sc)
+{
+	device_t parent = device_get_parent(sc->dev);
+	uint8_t hi, lo;
+	int e = 0, i;
+
+	CYW_LOCK(sc);
+	sc->tx_eio_count++;
+	CYW_UNLOCK(sc);
+
+	(void)SDIO_WRITE_DIRECT(parent, 0 /* F0/CCCR */, SD_IO_CCCR_CTL, 2);
+	sdio_write_1(sc->f1, SBSDIO_FUNC1_FRAMECTRL,
+	    SBSDIO_FUNC1_FRAMECTRL_WF_TERM, &e);
+	for (i = 0; i < 3; i++) {
+		hi = sdio_read_1(sc->f1, SBSDIO_FUNC1_WFRAMEBCHI, &e);
+		lo = sdio_read_1(sc->f1, SBSDIO_FUNC1_WFRAMEBCLO, &e);
+		if (hi == 0 && lo == 0)
+			break;
+	}
+}
+
+/* -------------------------------------------------------------------------
  * cyw_rxfail — recover from an F2 CMD53 read failure.
  *
  * After a failed SDIO_READ_EXTENDED on F2, the chip's RX FIFO may still
@@ -221,6 +248,42 @@ cyw_rxfail(struct cyw_softc *sc)
 		device_printf(sc->dev,
 		    "cyw_rxfail: FIFO drain timeout (RBC=%u)\n",
 		    ((unsigned)hi << 8) | lo);
+}
+
+/* -------------------------------------------------------------------------
+ * cyw_tx_eio_diag — after a failed F2 write and its cyw_txfail(), log the
+ * chip's power and clock state.  CMD52 reads only.
+ * ------------------------------------------------------------------------- */
+void
+cyw_tx_eio_diag(struct cyw_softc *sc, size_t txlen, int err, const char *tag)
+{
+	uint8_t sleepcsr, clkcsr;
+	int e1 = 0, e2 = 0;
+
+	/*
+	 * A failed IOCTL write.  At 50 MHz the first ones after firmware
+	 * download sometimes fail; record the chip's power and clock state and
+	 * how long after FWREADY this was (cyw43455.md, "F2 writes fail right
+	 * after firmware download").  Called after cyw_txfail(), and limited
+	 * to CMD52 reads: a CMD53 backplane read here (INTSTATUS) preceded the
+	 * two attaches that wedged the SDIO bus.
+	 */
+	sleepcsr = sdio_read_1(sc->f1, SBSDIO_FUNC1_SLEEPCSR, &e1);
+	clkcsr = sdio_read_1(sc->f1, SBSDIO_FUNC1_CHIPCLKCSR, &e2);
+	device_printf(sc->dev,
+	    "TX EIO[%s] txlen=%zu err=%d %d ms after FWREADY "
+	    "SLEEPCSR=0x%02x%s%s CLKCSR=0x%02x%s%s "
+	    "(f1errs=%d/%d)\n",
+	    tag, txlen, err,
+	    sc->fwready_ticks != 0 ?
+	    (int)((int64_t)(ticks - sc->fwready_ticks) * 1000 / hz) : -1,
+	    sleepcsr,
+	    (sleepcsr & SBSDIO_FUNC1_SLEEPCSR_KSO_EN) ? " KSO" : " !KSO",
+	    (sleepcsr & SBSDIO_FUNC1_SLEEPCSR_DEVON_MASK) ? " DEVON" : " !DEVON",
+	    clkcsr,
+	    (clkcsr & SBSDIO_HT_AVAIL) ? " HT" : " !HT",
+	    (clkcsr & SBSDIO_ALP_AVAIL) ? " ALP" : " !ALP",
+	    e1, e2);
 }
 
 /* -------------------------------------------------------------------------
@@ -371,6 +434,16 @@ cyw_fil_txrx(struct cyw_softc *sc, uint32_t cmd, uint32_t bcdc_flags,
 		sx_xlock(&sc->f2_sx);
 		err = cyw_f2_write_block(sc, frame, framelen);
 		if (err != 0) {
+			cyw_txfail(sc);
+			cyw_tx_eio_diag(sc, framelen, err, name != NULL ? name : "cmd");
+			err = cyw_f2_write_block(sc, frame, framelen);
+			if (err == 0)
+				device_printf(sc->dev,
+				    "cyw_fil: %s written on retry\n",
+				    name != NULL ? name : "cmd");
+		}
+		if (err != 0) {
+			cyw_txfail(sc);
 			sx_xunlock(&sc->f2_sx);
 			CYW_LOCK(sc);
 			sc->ioctl_waiting = false;
@@ -430,11 +503,35 @@ cyw_fil_txrx(struct cyw_softc *sc, uint32_t cmd, uint32_t bcdc_flags,
 			goto out_poll;
 		}
 
-		sc->sdpcm_tx_seq++;
-
 		err = cyw_f2_write_block(sc, frame, framelen);
-		if (err)
-			goto out_poll;
+		if (!sc->first_tx_logged && sc->fwready_ticks != 0) {
+			sc->first_tx_logged = true;
+			device_printf(sc->dev, "first IOCTL write (%s) %d ms "
+			    "after FWREADY: %s\n", name != NULL ? name : "cmd",
+			    (int)((int64_t)(ticks - sc->fwready_ticks) * 1000 /
+			    hz), err == 0 ? "ok" : "failed");
+		}
+		if (err != 0) {
+			/*
+			 * Terminate the failed frame as Linux does, then send it
+			 * once more.  At 50 MHz the first writes after firmware
+			 * download sometimes fail, and losing them loses
+			 * bus:txglom=0 and roam_off (cyw43455.md).  Recovery
+			 * comes first, as in Linux; the diagnostic reads after it.
+			 */
+			cyw_txfail(sc);
+			cyw_tx_eio_diag(sc, framelen, err, name != NULL ? name : "cmd");
+			err = cyw_f2_write_block(sc, frame, framelen);
+			if (err != 0) {
+				cyw_txfail(sc);
+				cyw_tx_eio_diag(sc, framelen, err, "retry");
+				goto out_poll;
+			}
+			device_printf(sc->dev, "cyw_fil: %s written on retry\n",
+			    name != NULL ? name : "cmd");
+		}
+		/* As Linux: the sequence number advances only once sent. */
+		sc->sdpcm_tx_seq++;
 
 		if (sc->sdio_core_base != 0)
 			cyw_bp_write32(sc,

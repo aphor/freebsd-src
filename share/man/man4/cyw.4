@@ -1,6 +1,6 @@
 .\" cyw.4 — manual page for the cyw CYW43455 SDIO WiFi driver
 .\"
-.Dd September 27, 2026
+.Dd September 28, 2026
 .Dt CYW 4
 .Os
 .Sh NAME
@@ -179,6 +179,10 @@ Frames dropped at the bus for lack of credit.
 Expected to stay 0.
 .It Va tx_queue_drops
 Frames dropped because the transmit queue was full.
+.It Va tx_eio_count
+Writes to the chip that failed and were terminated, as Linux
+.Fn brcmf_sdio_txfail
+does: F2 aborted, the write frame terminated, and its byte count polled.
 .It Va rx_credit_clamps
 Received credit values more than 0x40 ahead of
 .Va tx_seq ,
@@ -225,6 +229,21 @@ The first number is the mode the firmware held before attach.
 .It "cyw0: cyw_attach: WLC_SET_PM failed"
 The firmware refused to turn power management off.
 Non-fatal; the firmware's own mode stays in effect.
+.It "cyw0: firmware bring-up took %d ms, done %d ms after boot"
+Informational.
+The chip is brought up on a taskqueue of the driver's own after attach
+returns, so a slow or stuck chip does not hold up the rest of the boot.
+.It "cyw0: firmware bring-up failed (%d); WiFi is down"
+The bring-up stopped and undid itself.
+The device stays attached;
+.Xr kldunload 8
+and
+.Xr kldload 8
+retry.
+.It "cyw0: TX EIO[%s] ..."
+A write to the chip failed.
+It is logged after the failed frame has been terminated, with the chip's
+sleep and clock state.
 .El
 .Sh SEE ALSO
 .Xr sdiob 4 ,

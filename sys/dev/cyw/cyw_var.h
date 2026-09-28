@@ -94,7 +94,14 @@
 #define SBSDIO_WATERMARK		0x10008	/* F2 RX watermark */
 #define SBSDIO_DEVICE_CTL		0x10009	/* device control */
 #define SBSDIO_FUNC1_FRAMECTRL		0x1000d	/* F2 frame control (SFC_*) */
-#define  SBSDIO_FUNC1_FRAMECTRL_RF_TERM	0x02	/* terminate current RX frame */
+/*
+ * Linux sdio.c: SFC_RF_TERM (1 << 0), SFC_WF_TERM (1 << 1).  RF_TERM used to
+ * be 0x02 here, so cyw_rxfail() terminated the write frame, not the read.
+ */
+#define  SBSDIO_FUNC1_FRAMECTRL_RF_TERM	0x01	/* terminate current RX frame */
+#define  SBSDIO_FUNC1_FRAMECTRL_WF_TERM	0x02	/* terminate current TX frame */
+#define SBSDIO_FUNC1_WFRAMEBCLO		0x10019	/* TX frame byte count low */
+#define SBSDIO_FUNC1_WFRAMEBCHI		0x1001a	/* TX frame byte count high */
 #define SBSDIO_FUNC1_RFRAMEBCLO		0x1001b	/* RX frame byte count low */
 #define SBSDIO_FUNC1_RFRAMEBCHI		0x1001c	/* RX frame byte count high */
 
@@ -152,8 +159,8 @@
 /* RX buffer size: max frame + one extra block for the two-read protocol */
 #define CYW_SDPCM_BUF_SIZE		(CYW_SDPCM_MAX_FRAME + CYW_F2_BLKSIZE)
 
-/* F2 watermark for BCM43455 (CY_435X family, sdio.c:58) */
-#define CYW_F2_WATERMARK		0x40	/* was 0x60 — wrong for 435x */
+/* F2 watermark and MES busy control: Linux's CY_435X values; see cyw_f2_bringup(). */
+#define CYW_F2_WATERMARK		0x40
 #define CYW_MES_WATERMARK		0xc0	/* 0x40 watermark | 0x80 enable */
 #define SBSDIO_DEVCTL_F2WM_ENAB		0x10	/* SBSDIO_DEVICE_CTL: enable F2 watermark */
 
@@ -523,6 +530,11 @@ struct cyw_softc {
 	struct sysctl_ctx_list	sysctl_ctx;
 	struct sysctl_oid	*sysctl_tree;
 
+	/* Firmware bring-up, deferred from attach to cyw_init_task */
+	struct taskqueue	*init_tq;
+	struct task		init_task;
+	bool			init_done;	/* bring-up succeeded */
+
 	/* RX poll callout + taskqueue task */
 	struct taskqueue	*rx_tq;
 	struct callout		rx_callout;
@@ -576,9 +588,12 @@ struct cyw_softc {
 	/* RX diagnostic counters (Step 6 — F2 EIO classification) */
 	uint64_t		rx_ok_count;	/* successful F2 reads */
 	uint64_t		rx_eio_count;	/* CMD53 returned EIO */
+	uint64_t		tx_eio_count;	/* F2 write failed (cyw_txfail) */
 	uint64_t		rx_eagain_count; /* gate or hdr checks bounced */
 	int			rx_last_ok_ticks; /* ticks of last successful read */
 	int			rx_last_eio_ticks; /* ticks of last EIO */
+	int			fwready_ticks;	/* ticks at FWREADY, for TX EIO diag */
+	bool			first_tx_logged; /* first IOCTL write timing logged */
 
 	/* Data-channel RX counters (Step 7 — RX path verification) */
 	uint64_t		rx_data_frames;	/* SDPCM chan-2 frames delivered up */
@@ -765,8 +780,10 @@ void cyw_tx_task(void *arg, int pending);
 /* cyw_fwil.c — IOVAR/IOCTL encoding layer */
 int  cyw_sdpcm_recv_one(struct cyw_softc *, uint8_t *buf, uint16_t *out_flen);
 void cyw_rxfail(struct cyw_softc *);
+void cyw_txfail(struct cyw_softc *);
 void cyw_sdpcm_update_credit(struct cyw_softc *, uint8_t credit);
 void cyw_rx_eio_diag(struct cyw_softc *, size_t rdlen, int err, const char *tag);
+void cyw_tx_eio_diag(struct cyw_softc *, size_t txlen, int err, const char *tag);
 int  cyw_fil_iovar_data_get(struct cyw_softc *, const char *name,
 		void *buf, size_t len);
 int  cyw_fil_iovar_data_set(struct cyw_softc *, const char *name,

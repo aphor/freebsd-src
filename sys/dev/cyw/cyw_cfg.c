@@ -965,6 +965,8 @@ cyw_tx_data_frame(struct cyw_softc *sc, struct mbuf *m)
 	m_freem(m);
 
 	err = cyw_f2_write_block(sc, pkt, framelen);
+	if (err != 0)
+		cyw_txfail(sc);		/* as Linux brcmf_sdio_txpkt(); no retry */
 	sx_xunlock(&sc->f2_sx);
 
 	free(pkt, M_CYW);

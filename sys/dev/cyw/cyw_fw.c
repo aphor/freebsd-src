@@ -320,7 +320,14 @@ cyw_f2_bringup(struct cyw_softc *sc)
 	}
 	CYW_DPRINTF(sc, CYW_DBG_BRINGUP, "F2 ready\n");
 
-	/* Watermarks and device control (brcmfmac sets these after F2 enable) */
+	/*
+	 * Watermarks and MES busy control.  These are Linux's CY_435X values.
+	 * Linux itself takes its default case for this part (F1 device ID
+	 * 0x4345: DEFAULT_F2_WATERMARK, no F2WM_ENAB, no MESBUSYCTRL).  Using
+	 * that at 50 MHz on 2026-09-28 did not stop the first IOCTL writes
+	 * failing, and one of two boots wedged the bus, so these stay until
+	 * the cause is known (rpi5_modules.git doc/cyw43455.md).
+	 */
 	w_err = 0;
 	sdio_write_1(sc->f1, SBSDIO_WATERMARK, CYW_F2_WATERMARK, &w_err);
 	devctl = sdio_read_1(sc->f1, SBSDIO_DEVICE_CTL, &w_err);
@@ -435,6 +442,7 @@ cyw_fw_download(struct cyw_softc *sc)
 		intstat = cyw_bp_read32(sc,
 		    sc->sdio_core_base + SD_REG_INTSTATUS);
 		if (tohost & HMB_DATA_FWREADY) {
+			sc->fwready_ticks = ticks;
 			CYW_DPRINTF(sc, CYW_DBG_BRINGUP,
 			    "fw handshake at %d ms: TOHOST=0x%08x"
 			    " INTSTATUS=0x%08x\n",
