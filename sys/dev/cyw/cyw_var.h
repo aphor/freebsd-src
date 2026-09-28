@@ -101,15 +101,6 @@
 /* CCCR I/O Abort register (F0 address space, SDIO spec §6.9) */
 #define SD_IO_CCCR_CTL			0x06	/* I/O Abort: bits[2:0] = func# to abort */
 
-/*
- * Maximum bytes per CMD53 F2 read in byte-mode.
- *
- * sdiob's F2 block size is 512.  Any SDIO_READ_EXTENDED with size >= 512
- * triggers block-mode CMD53, which fails on this hardware (EIO).  Cap each
- * call to 448 bytes (7 × CYW_F2_BLKSIZE = 7 × 64) to stay in byte-mode.
- * See doc/cyw43455.md §16 and the rxfail diagnosis in the Step 6 notes.
- */
-#define CYW_F2_MAX_BYTE_XFER		448
 #define SBSDIO_FUNC1_MESBUSYCTRL	0x1001d	/* busy control */
 #define SBSDIO_FUNC1_WAKEUPCTRL	0x1001e	/* SR wakeup control */
 #define  SBSDIO_FUNC1_WCTRL_ALPWAIT_SHIFT	0	/* ULP chips */
@@ -146,9 +137,14 @@
 #define  SDIO_CCCR_BRCM_CARDCAP_CMD14_SUPPORT	0x02
 #define  SDIO_CCCR_BRCM_CARDCAP_CMD14_EXT	0x04
 
-/* F1 and F2 block sizes for BCM43455 */
+/*
+ * F1 and F2 block sizes for BCM43455, both set with sdio_set_block_size()
+ * so the card and sdiob agree.  Linux uses 64 for F1 and 512 for this
+ * chip's F2 (bcmsdh.c SDIO_FUNC2_BLOCKSIZE); 64 works for F2 and costs at
+ * most 63 bytes of padding per frame instead of 511.
+ */
 #define CYW_F1_BLKSIZE			64
-#define CYW_F2_BLKSIZE			64	/* bump to 512 once F2 is stable */
+#define CYW_F2_BLKSIZE			64
 
 /* F2 FIFO address and transfer alignment (brcmfmac-freebsd sdpcm.c) */
 #define CYW_F2_FIFO_ADDR		0x8000	/* fixed address for F2 FIFO CMD53 */

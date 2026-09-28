@@ -105,32 +105,20 @@ cyw_sdpcm_recv_one(struct cyw_softc *sc, uint8_t *buf, uint16_t *out_flen)
 
 	if (flen > CYW_F2_BLKSIZE) {
 		/*
-		 * Read the tail of the frame in byte-mode CMD53 chunks.
-		 *
-		 * sdiob uses F2 block size 512.  Any SDIO_READ_EXTENDED call
-		 * with size >= 512 is issued as block-mode CMD53, which fails
-		 * on this hardware (EIO, "b_count 1 blksz 512").  We stay in
-		 * byte-mode by capping each transfer at CYW_F2_MAX_BYTE_XFER
-		 * (448 = 7 × 64 bytes) and looping until the full tail has been
-		 * read.  (Linux does the same: brcmf_sdio_readframes loops with
-		 * brcmf_sdiod_recv_pkt which caps at a similarly-safe limit.)
+		 * The rest of the frame, padded to whole F2 blocks, in one
+		 * CMD53 -- as Linux brcmf_sdio_readframes() does after its
+		 * BRCMF_FIRSTREAD header read.  flen <= CYW_SDPCM_MAX_FRAME,
+		 * so this fits CYW_SDPCM_BUF_SIZE.
 		 */
-		uint8_t *dst      = buf + CYW_F2_BLKSIZE;
-		size_t  remaining = ((size_t)(flen - CYW_F2_BLKSIZE) +
-		    CYW_F2_BLKSIZE - 1) & ~(size_t)(CYW_F2_BLKSIZE - 1);
+		size_t tail = roundup2((size_t)flen - CYW_F2_BLKSIZE,
+		    CYW_F2_BLKSIZE);
 
-		while (remaining > 0) {
-			size_t chunk = (remaining > CYW_F2_MAX_BYTE_XFER)
-			    ? CYW_F2_MAX_BYTE_XFER : remaining;
-			err = SDIO_READ_EXTENDED(parent, 2 /* F2 */,
-			    CYW_F2_FIFO_ADDR, chunk, dst, false);
-			if (err) {
-				cyw_rx_eio_diag(sc, chunk, err, "tail");
-				cyw_rxfail(sc);
-				return (err);
-			}
-			dst       += chunk;
-			remaining -= chunk;
+		err = SDIO_READ_EXTENDED(parent, 2 /* F2 */,
+		    CYW_F2_FIFO_ADDR, tail, buf + CYW_F2_BLKSIZE, false);
+		if (err) {
+			cyw_rx_eio_diag(sc, tail, err, "tail");
+			cyw_rxfail(sc);
+			return (err);
 		}
 	}
 

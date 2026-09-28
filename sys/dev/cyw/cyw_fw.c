@@ -89,8 +89,6 @@ cyw_fw_get(struct cyw_softc *sc, const char *relname)
 	return (fw);
 }
 
-#define CYW_CLM_CHUNK	16384	/* bytes per clmload iovar call */
-
 /* -------------------------------------------------------------------------
  * NVRAM parsing
  *
@@ -480,22 +478,12 @@ cyw_fw_download(struct cyw_softc *sc)
  * ------------------------------------------------------------------------- */
 
 /*
- * CYW_CLM_MAX_CHUNK — max CLM data bytes per clmload IOVAR call.
- *
- * sdiob uses cur_blksize=512 for F2 (independent of our CCCR write).
- * sdiob_rw_extended_sc uses block-mode CMD53 when txlen >= cur_blksize (512),
- * and byte-mode CMD53 when txlen < 512.  Block-mode CMD53 fails during the
- * boot-time polling phase with a spurious sdhci data interrupt.
- *
- * Frame overhead per chunk: SDPCM(12) + BCDC(16) + "clmload"\0(8) + dload hdr(12) = 48 B.
- * txlen = ceil(ALIGN4(48+D) / 64) * 64.
- * For D=256: ALIGN4(304)=304, ceil(304/64)*64 = 5*64 = 320 < 512.  Byte mode.  Safe.
- * For D=400: ALIGN4(448)=448, ceil(448/64)*64 = 7*64 = 448 < 512.  Byte mode.  Safe.
- * For D=401: ALIGN4(449)=452, ceil(452/64)*64 = 8*64 = 512.  Block mode.  FAILS.
- *
- * Use 256 bytes for a generous safety margin (CLM blob is 2676 bytes → 11 chunks).
+ * CYW_CLM_MAX_CHUNK — max CLM data bytes per clmload IOVAR call, Linux
+ * MAX_CHUNK_LEN (fwil_types.h).  With SDPCM(12) + BCDC(16) + "clmload\0"(8)
+ * + dload header(12) the frame is 1448 bytes, within CYW_SDPCM_MAX_FRAME
+ * for both the request and its echo.  The 2676-byte blob goes in 2 calls.
  */
-#define CYW_CLM_MAX_CHUNK	256
+#define CYW_CLM_MAX_CHUNK	1400
 #define CYW_CLM_DLOAD_HDR_LEN	12		/* flag+type+len+crc */
 #define CYW_CLM_DL_TYPE_CLM	2
 #define CYW_CLM_DL_BEGIN	0x0002
