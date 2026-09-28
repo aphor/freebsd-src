@@ -1,6 +1,6 @@
 .\" cyw.4 — manual page for the cyw CYW43455 SDIO WiFi driver
 .\"
-.Dd September 13, 2026
+.Dd September 27, 2026
 .Dt CYW 4
 .Os
 .Sh NAME
@@ -148,6 +148,32 @@ Live firmware security state (wsec cipher mask, wpa_auth key-mgmt mask,
 auth type).
 Read-only; each read issues a live firmware IOVAR GET.
 Only valid once the SDPCM layer is running.
+.It Va fw_pm
+Live firmware power management mode
+.Pq 0 off, 1 maximum, 2 fast ,
+read with the
+.Dv WLC_GET_PM
+command.
+The driver sets 0 at attach.
+.It Va tx_seq , Va tx_max
+The SDPCM transmit sequence number and the firmware's credit ceiling.
+Frames may be sent while the 8-bit window
+.Va tx_max No \- Va tx_seq
+is non-zero and below 0x80.
+.It Va tx_queue_len
+Frames queued for transmission.
+.It Va tx_credit_waits
+Times the transmit task stopped for lack of firmware credit, leaving frames
+queued until a received header returned credit.
+.It Va tx_credit_drops
+Frames dropped at the bus for lack of credit.
+Expected to stay 0.
+.It Va tx_queue_drops
+Frames dropped because the transmit queue was full.
+.It Va rx_credit_clamps
+Received credit values more than 0x40 ahead of
+.Va tx_seq ,
+treated as corrupt and replaced.
 .El
 .Sh FILES
 .Bl -tag -width "/boot/firmware/cyw43455/brcmfmac43455-sdio.clm_blob"
@@ -184,18 +210,19 @@ Not fatal.
 The firmware did not assert HMB_DATA_FWREADY within 1 second of HOSTINTMASK
 being written.
 Subsequent IOVAR transactions will fail.
-.It "cyw0: cyw_attach: pm IOVAR failed"
-The
-.Dq pm
-(power management) IOVAR is rejected by this firmware version.
-Non-fatal; the driver continues without power management control.
+.It "cyw0: power management: firmware mode %d, set to 0 (off)"
+Informational.
+The first number is the mode the firmware held before attach.
+.It "cyw0: cyw_attach: WLC_SET_PM failed"
+The firmware refused to turn power management off.
+Non-fatal; the firmware's own mode stays in effect.
 .El
 .Sh SEE ALSO
-.Xr firmware 9 ,
 .Xr sdiob 4 ,
 .Xr loader.conf 5 ,
+.Xr dmesg 8 ,
 .Xr kldload 8 ,
-.Xr dmesg 8
+.Xr firmware 9
 .Sh HISTORY
 The
 .Nm
@@ -203,5 +230,7 @@ driver was written for FreeBSD/arm64 on the Raspberry Pi 5.
 .Sh BUGS
 Bluetooth is not yet supported.
 The driver uses polling rather than interrupt-driven SDIO I/O.
+On the Raspberry Pi 5 the SDIO bus is left at 400 kHz and 1 bit wide,
+which limits throughput to about 40 KB/s.
 WPA/WPA2 association is implemented but 802.11r fast BSS transition and
 802.11w management frame protection are not.
