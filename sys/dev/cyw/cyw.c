@@ -233,6 +233,34 @@ cyw_attach(device_t dev)
 	    "Frames handed to cyw_transmit");
 	SYSCTL_ADD_U64(&sc->sysctl_ctx,
 	    SYSCTL_CHILDREN(sc->sysctl_tree), OID_AUTO,
+	    "tx_credit_waits", CTLFLAG_RD, &sc->tx_credit_waits, 0,
+	    "Times tx_task paused, frames queued, for firmware credit");
+	SYSCTL_ADD_U64(&sc->sysctl_ctx,
+	    SYSCTL_CHILDREN(sc->sysctl_tree), OID_AUTO,
+	    "tx_credit_drops", CTLFLAG_RD, &sc->tx_credit_drops, 0,
+	    "Frames dropped for lack of credit (backstop; expect 0)");
+	SYSCTL_ADD_U64(&sc->sysctl_ctx,
+	    SYSCTL_CHILDREN(sc->sysctl_tree), OID_AUTO,
+	    "tx_queue_drops", CTLFLAG_RD, &sc->tx_queue_drops, 0,
+	    "Frames dropped because tx_queue was full");
+	SYSCTL_ADD_UINT(&sc->sysctl_ctx,
+	    SYSCTL_CHILDREN(sc->sysctl_tree), OID_AUTO,
+	    "tx_queue_len", CTLFLAG_RD, &sc->tx_queue_len, 0,
+	    "Frames currently queued for TX");
+	SYSCTL_ADD_U64(&sc->sysctl_ctx,
+	    SYSCTL_CHILDREN(sc->sysctl_tree), OID_AUTO,
+	    "rx_credit_clamps", CTLFLAG_RD, &sc->rx_credit_clamps, 0,
+	    "RX headers whose credit ceiling was implausible and clamped");
+	SYSCTL_ADD_U8(&sc->sysctl_ctx,
+	    SYSCTL_CHILDREN(sc->sysctl_tree), OID_AUTO,
+	    "tx_seq", CTLFLAG_RD, &sc->sdpcm_tx_seq, 0,
+	    "SDPCM TX sequence number");
+	SYSCTL_ADD_U8(&sc->sysctl_ctx,
+	    SYSCTL_CHILDREN(sc->sysctl_tree), OID_AUTO,
+	    "tx_max", CTLFLAG_RD, &sc->sdpcm_rx_max, 0,
+	    "SDPCM credit ceiling from firmware");
+	SYSCTL_ADD_U64(&sc->sysctl_ctx,
+	    SYSCTL_CHILDREN(sc->sysctl_tree), OID_AUTO,
 	    "tx_eapol_frames", CTLFLAG_RD, &sc->tx_eapol_frames, 0,
 	    "TX subset with EtherType 0x888E");
 	SYSCTL_ADD_U64(&sc->sysctl_ctx,

@@ -879,8 +879,12 @@ cyw_tx_data_frame(struct cyw_softc *sc, struct mbuf *m)
 		    eh->ether_shost, ":", eh->ether_dhost, ":");
 	}
 
-	/* Drop rather than block if no TX credits. */
-	if ((uint8_t)(sc->sdpcm_rx_max - sc->sdpcm_tx_seq) == 0) {
+	/*
+	 * cyw_tx_task only calls here with credit available, so this is a
+	 * backstop: a frame dropped here is lost to TCP until it retransmits.
+	 */
+	if (!cyw_tx_credits_ok(sc)) {
+		sc->tx_credit_drops++;
 		m_freem(m);
 		return (ENOBUFS);
 	}
@@ -975,6 +979,8 @@ cyw_tx_task(void *arg, int pending __unused)
 	struct cyw_softc *sc = arg;
 	struct mbuf *m, *tx_list;
 
+	u_int sent = 0;
+
 	mtx_lock(&sc->tx_queue_mtx);
 	tx_list = sc->tx_queue_head;
 	sc->tx_queue_head = NULL;
@@ -982,10 +988,37 @@ cyw_tx_task(void *arg, int pending __unused)
 	mtx_unlock(&sc->tx_queue_mtx);
 
 	while ((m = tx_list) != NULL) {
+		if (!cyw_tx_credits_ok(sc)) {
+			struct mbuf *last = tx_list;
+
+			/*
+			 * Out of credit: put the unsent frames back at the
+			 * head of the queue, in order, and stop.  Frames
+			 * queued meanwhile stay behind them.  RX restarts
+			 * this task when a header brings more credit (see
+			 * cyw_sdpcm_recv_one).  Sleeping here instead would
+			 * block that very RX, which runs on this taskqueue.
+			 */
+			while (last->m_nextpkt != NULL)
+				last = last->m_nextpkt;
+			mtx_lock(&sc->tx_queue_mtx);
+			last->m_nextpkt = sc->tx_queue_head;
+			if (sc->tx_queue_head == NULL)
+				sc->tx_queue_tail = &last->m_nextpkt;
+			sc->tx_queue_head = tx_list;
+			sc->tx_queue_len -= sent;
+			sc->tx_credit_waits++;
+			mtx_unlock(&sc->tx_queue_mtx);
+			return;
+		}
 		tx_list = m->m_nextpkt;
 		m->m_nextpkt = NULL;
+		sent++;
 		(void)cyw_tx_data_frame(sc, m);
 	}
+	mtx_lock(&sc->tx_queue_mtx);
+	sc->tx_queue_len -= sent;
+	mtx_unlock(&sc->tx_queue_mtx);
 }
 
 /*
@@ -1042,9 +1075,18 @@ cyw_vap_transmit(if_t ifp, struct mbuf *m)
 	 * MTX_DEF), then enqueue tx_task on rx_tq (sleepable thread).
 	 */
 	mtx_lock(&sc->tx_queue_mtx);
+	if (sc->tx_queue_len >= CYW_TX_QUEUE_MAX) {
+		/* Out of credit for a long time; do not grow without bound. */
+		sc->tx_queue_drops++;
+		mtx_unlock(&sc->tx_queue_mtx);
+		m_freem(m);
+		if_inc_counter(ifp, IFCOUNTER_OERRORS, 1);
+		return (ENOBUFS);
+	}
 	m->m_nextpkt = NULL;
 	*sc->tx_queue_tail = m;
 	sc->tx_queue_tail = &m->m_nextpkt;
+	sc->tx_queue_len++;
 	mtx_unlock(&sc->tx_queue_mtx);
 
 	taskqueue_enqueue(sc->rx_tq, &sc->tx_task);

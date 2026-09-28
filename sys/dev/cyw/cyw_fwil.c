@@ -135,10 +135,27 @@ cyw_sdpcm_recv_one(struct cyw_softc *sc, uint8_t *buf, uint16_t *out_flen)
 	}
 
 	CYW_LOCK(sc);
-	sc->sdpcm_rx_max = hdr->credit;
+	/*
+	 * Credit ceiling.  As Linux brcmf_sdio_hdparse() does, a ceiling more
+	 * than 0x40 ahead of tx_seq is taken as corrupt and replaced by
+	 * tx_seq + 2 rather than believed.
+	 */
+	if ((uint8_t)(hdr->credit - sc->sdpcm_tx_seq) > 0x40) {
+		sc->sdpcm_rx_max = sc->sdpcm_tx_seq + 2;
+		sc->rx_credit_clamps++;
+	} else
+		sc->sdpcm_rx_max = hdr->credit;
 	sc->rx_ok_count++;
 	sc->rx_last_ok_ticks = ticks;
 	CYW_UNLOCK(sc);
+
+	/*
+	 * cyw_tx_task stops, leaving frames queued, when credit runs out; the
+	 * only thing that returns credit is an RX header like this one.  So
+	 * restart it here.  It runs on this same taskqueue, after us.
+	 */
+	if (sc->tx_queue_head != NULL && cyw_tx_credits_ok(sc))
+		taskqueue_enqueue(sc->rx_tq, &sc->tx_task);
 
 	if (out_flen != NULL)
 		*out_flen = flen;
@@ -305,11 +322,11 @@ cyw_fil_txrx(struct cyw_softc *sc, uint32_t cmd, uint32_t bcdc_flags,
 
 		/* Wait for a TX credit; task keeps rx_max current. */
 		for (i = 0; i < 200; i++) {
-			if ((uint8_t)(sc->sdpcm_rx_max - sc->sdpcm_tx_seq) > 0)
+			if (cyw_tx_credits_ok(sc))
 				break;
 			DELAY(5000);
 		}
-		if ((uint8_t)(sc->sdpcm_rx_max - sc->sdpcm_tx_seq) == 0) {
+		if (!cyw_tx_credits_ok(sc)) {
 			device_printf(sc->dev,
 			    "cyw_fil: no TX credits (runtime) cmd %u\n", cmd);
 			err = ENOBUFS;
@@ -381,14 +398,14 @@ cyw_fil_txrx(struct cyw_softc *sc, uint32_t cmd, uint32_t bcdc_flags,
 
 		/* Drain RX until firmware grants at least one TX credit. */
 		for (i = 0; i < 100; i++) {
-			if ((uint8_t)(sc->sdpcm_rx_max - sc->sdpcm_tx_seq) > 0)
+			if (cyw_tx_credits_ok(sc))
 				break;
 			err = cyw_sdpcm_recv_one(sc, rsp, NULL);
 			if (err != 0 && err != EAGAIN)
 				goto out_poll;
 			DELAY(10000);
 		}
-		if ((uint8_t)(sc->sdpcm_rx_max - sc->sdpcm_tx_seq) == 0) {
+		if (!cyw_tx_credits_ok(sc)) {
 			device_printf(sc->dev,
 			    "cyw_fil: no TX credits for cmd %u\n", cmd);
 			err = ENOBUFS;

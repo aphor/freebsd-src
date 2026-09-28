@@ -533,6 +533,7 @@ struct cyw_softc {
 	struct mtx		tx_queue_mtx;
 	struct mbuf		*tx_queue_head;
 	struct mbuf		**tx_queue_tail;
+	u_int			tx_queue_len;	/* frames on tx_queue */
 
 	/*
 	 * F2 exclusion lock — serializes all SDIO F2 reads and writes.
@@ -576,6 +577,11 @@ struct cyw_softc {
 	uint64_t		rx_eapol_frames; /* subset with EtherType 0x888E */
 	/* Data-channel TX counters (added for 4-way handshake diagnosis) */
 	uint64_t		tx_data_frames;	/* all frames handed to cyw_transmit */
+	/* TX flow control, see cyw_tx_credits_ok() */
+	uint64_t		tx_credit_waits; /* tx_task paused for credits */
+	uint64_t		tx_credit_drops; /* dropped for credits (should be 0) */
+	uint64_t		tx_queue_drops;	/* dropped, tx_queue full */
+	uint64_t		rx_credit_clamps; /* implausible credit headers */
 	uint64_t		tx_eapol_frames; /* TX subset with EtherType 0x888E */
 	uint64_t		tx_eapol_bytes;	/* TX EAPOL byte total */
 	int			tx_hdr_debug;	/* dump SDPCM/BDC TX hdrs when set */
@@ -715,6 +721,33 @@ int  cyw_sdpcm_attach(struct cyw_softc *);
 void cyw_sdpcm_detach(struct cyw_softc *);
 
 /* cyw_cfg.c — deferred TX task driven by cyw_vap_transmit */
+/*
+ * TX flow control.  The firmware grants credits as a sequence-number
+ * ceiling (sdpcm_rx_max, from every RX header); a frame may be sent while
+ * sdpcm_tx_seq is below it.  The window is 8-bit and wraps, so -- as
+ * Linux brcmf_sdio data_ok() does -- a difference with the top bit set
+ * means the ceiling is *behind* tx_seq, i.e. no credit, not 200-odd of
+ * them.  Testing only for zero, as this driver did, let a burst overrun
+ * the firmware whenever the ceiling lagged.
+ */
+/*
+ * Frames held while waiting for the bus or for credit.  Kept short on
+ * purpose: with the SDIO bus at 400 kHz, 1-bit, one 1536-byte frame takes
+ * about 36 ms (measured 28 frames/s, ~41 KB/s), so 512 queued frames meant
+ * about 17 s of queueing delay -- long enough for ARP and TCP to give up
+ * ("Host is down") mid-transfer.  64 is about 2.3 s; past that, dropping
+ * lets TCP back off instead.
+ */
+#define	CYW_TX_QUEUE_MAX	64
+
+static inline bool
+cyw_tx_credits_ok(struct cyw_softc *sc)
+{
+	uint8_t w = (uint8_t)(sc->sdpcm_rx_max - sc->sdpcm_tx_seq);
+
+	return (w != 0 && (w & 0x80) == 0);
+}
+
 void cyw_tx_task(void *arg, int pending);
 
 /* cyw_fwil.c — IOVAR/IOCTL encoding layer */

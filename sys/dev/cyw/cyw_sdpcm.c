@@ -275,11 +275,19 @@ int
 cyw_sdpcm_attach(struct cyw_softc *sc)
 {
 	/*
-	 * Seed 4 initial TX credits (brcmfmac convention: bus->tx_max = 4).
-	 * The firmware updates this via hdr->credit in its first response.
-	 * Without seeding, sdpcm_rx_max==sdpcm_tx_seq==0 blocks the first TX.
+	 * Keep the credit ceiling the boot-time IOCTLs have already learned
+	 * from the firmware's headers.  This used to re-seed it to 4, the
+	 * brcmfmac starting value -- which means "4 frames past tx_seq 0" and
+	 * was set by cyw_attach already.  By the time this runs, those IOCTLs
+	 * have moved tx_seq to about 20, so a fixed 4 put the ceiling 16
+	 * frames *behind* tx_seq.  The old zero-only credit test read that as
+	 * 240 credits, i.e. no flow control at all; the correct test reads it
+	 * as none, and with nothing sent the firmware never sends the header
+	 * that would correct it.  Seed relative to tx_seq only if the window
+	 * is not valid.
 	 */
-	sc->sdpcm_rx_max = 4;
+	if (!cyw_tx_credits_ok(sc))
+		sc->sdpcm_rx_max = sc->sdpcm_tx_seq + 4;
 
 	cv_init(&sc->ioctl_cv, "cyw_ioctl");
 	sx_init(&sc->f2_sx, "cyw_f2");
