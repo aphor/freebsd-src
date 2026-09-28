@@ -569,6 +569,7 @@ struct mmc_request {
 #define	SD_IO_CCCR_CARDCAP		0x08	/* SDIO card capabilities */
 #define	 CCCR_CC_SMB			(1 << 1) /* CMD53 block mode support */
 #define	 CCCR_CC_LSC			(1 << 6)
+#define	 CCCR_CC_4BLS			(1 << 7) /* 4-bit low-speed card */
 
 #define	SD_IO_CCCR_CISPTR		0x09    /* 0x09 - 0x0B */
 #define SD_IO_CCCR_FN0_BLKSZ            0x10    /* 0x10 - 0x11 */

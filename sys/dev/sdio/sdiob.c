@@ -72,6 +72,7 @@
 #include <sys/malloc.h>
 #include <sys/module.h>
 #include <sys/mutex.h>
+#include <sys/sysctl.h>
 
 #include <cam/cam.h>
 #include <cam/cam_ccb.h>
@@ -900,6 +901,126 @@ sdiob_get_card_info(struct sdiob_softc *sc)
 
 /* -------------------------------------------------------------------------- */
 /*
+ * Optional bus setup.  mmc_xpt(4) leaves an SDIO card at 1-bit, 400 kHz.
+ * With hw.sdiob.bus_setup=1, switch it to high speed and 4-bit when both the
+ * card and the host support them, as Linux mmc_sdio_init_card() does for
+ * cards not using UHS: high speed first, then the clock, then the width.  The
+ * card is switched before the host each time, and a failed CMD52 leaves the
+ * host as it was.  Off by default so that existing setups are unchanged.
+ */
+static int sdiob_bus_setup = 0;
+static SYSCTL_NODE(_hw, OID_AUTO, sdiob, CTLFLAG_RD | CTLFLAG_MPSAFE, NULL,
+    "SDIO bus");
+SYSCTL_INT(_hw_sdiob, OID_AUTO, bus_setup, CTLFLAG_RDTUN, &sdiob_bus_setup, 0,
+    "Switch SDIO cards to high speed and 4-bit at attach when supported");
+
+static int
+sdiob_trans_settings(struct sdiob_softc *sc, uint32_t valid,
+    struct ccb_trans_settings_mmc *mmc)
+{
+	struct ccb_trans_settings_mmc *cts;
+
+	memset(sc->ccb, 0, sizeof(*sc->ccb));
+	xpt_setup_ccb(&sc->ccb->ccb_h, sc->periph->path, CAM_PRIORITY_NORMAL);
+	sc->ccb->ccb_h.func_code = (valid == 0) ?
+	    XPT_GET_TRAN_SETTINGS : XPT_SET_TRAN_SETTINGS;
+	sc->ccb->ccb_h.flags = CAM_DIR_NONE;
+	cts = &sc->ccb->cts.proto_specific.mmc;
+	if (valid != 0) {
+		cts->ios = mmc->ios;
+		cts->ios_valid = valid;
+	}
+	xpt_action(sc->ccb);
+	if ((sc->ccb->ccb_h.status & CAM_STATUS_MASK) != CAM_REQ_CMP)
+		return (EIO);
+	if (valid == 0)
+		*mmc = *cts;
+	return (0);
+}
+
+static void
+sdiob_set_bus(struct sdiob_softc *sc)
+{
+	struct ccb_trans_settings_mmc mmc;
+	struct mmc_params *mmcp;
+	uint32_t caps, clock;
+	uint8_t cap, speed, width;
+	bool hs;
+	int error;
+
+	/* SDIO-only: a combo card's memory side would need switching too. */
+	mmcp = &sc->periph->path->device->mmc_ident_data;
+	if ((mmcp->card_features & CARD_FEATURE_MEMORY) != 0)
+		return;
+
+	error = sdiob_trans_settings(sc, 0, &mmc);
+	if (error == 0)
+		error = sdiob_rw_direct_sc(sc, 0, SD_IO_CCCR_CARDCAP, false,
+		    &cap);
+	if (error == 0)
+		error = sdiob_rw_direct_sc(sc, 0, SD_IO_CCCR_SPEED, false,
+		    &speed);
+	if (error != 0)
+		goto out;
+	caps = mmc.host_caps;
+
+	/* High speed. */
+	hs = false;
+	if ((caps & MMC_CAP_HSPEED) != 0 && (speed & CCCR_SPEED_SHS) != 0) {
+		speed |= CCCR_SPEED_EHS;
+		error = sdiob_rw_direct_sc(sc, 0, SD_IO_CCCR_SPEED, true, &speed);
+		if (error != 0)
+			goto out;
+		mmc.ios.timing = bus_timing_hs;
+		error = sdiob_trans_settings(sc, MMC_BT, &mmc);
+		if (error != 0)
+			goto out;
+		hs = true;
+	}
+
+	/* Clock: 50 MHz at high speed, 25 MHz for any other full-speed card. */
+	clock = 0;
+	if (hs)
+		clock = 50000000;
+	else if ((cap & CCCR_CC_LSC) == 0)
+		clock = 25000000;
+	if (clock != 0) {
+		mmc.ios.clock = MIN(clock, mmc.host_f_max);
+		error = sdiob_trans_settings(sc, MMC_CLK, &mmc);
+		if (error != 0)
+			goto out;
+	}
+
+	/* 4-bit: mandatory for full-speed cards, 4BLS for low-speed ones. */
+	if ((caps & MMC_CAP_4_BIT_DATA) != 0 &&
+	    ((cap & CCCR_CC_LSC) == 0 || (cap & CCCR_CC_4BLS) != 0)) {
+		error = sdiob_rw_direct_sc(sc, 0, SD_IO_CCCR_BUS_WIDTH, false,
+		    &width);
+		if (error != 0)
+			goto out;
+		width = (width & ~0x03) | CCCR_BUS_WIDTH_4;	/* bits 1:0 */
+		error = sdiob_rw_direct_sc(sc, 0, SD_IO_CCCR_BUS_WIDTH, true,
+		    &width);
+		if (error != 0)
+			goto out;
+		mmc.ios.bus_width = bus_width_4;
+		error = sdiob_trans_settings(sc, MMC_BW, &mmc);
+	}
+
+out:
+	if (error == 0)		/* Report what the host now holds. */
+		error = sdiob_trans_settings(sc, 0, &mmc);
+	if (error != 0)
+		xpt_print(sc->periph->path, "bus setup failed: %d\n", error);
+	else
+		xpt_print(sc->periph->path, "bus: %d-bit, %u kHz%s\n",
+		    (mmc.ios.bus_width == bus_width_4) ? 4 : 1,
+		    mmc.ios.clock / 1000,
+		    (mmc.ios.timing == bus_timing_hs) ? ", high speed" : "");
+}
+
+/* -------------------------------------------------------------------------- */
+/*
  * CAM periph registration, allocation, and detached from that a discovery
  * task, which goes off reads cardinfo, and then adds ourselves to our SIM's
  * device adding the devclass and registering the driver.  This keeps the
@@ -984,6 +1105,8 @@ sdiobdiscover(void *context, int pending)
 	 */
 	cam_periph_lock(periph);
 	error = sdiob_get_card_info(sc);
+	if (error == 0 && sdiob_bus_setup != 0)
+		sdiob_set_bus(sc);
 	if  (error == 0)
 		sc->sdio_state = SDIO_STATE_READY;
 	else
