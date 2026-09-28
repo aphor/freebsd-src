@@ -417,6 +417,10 @@ cyw_erom_find_sdio_core_base(struct cyw_softc *sc)
 			(void)ndp;
 
 			in_sdiod = (corid == BHND_COREID_SDIOD);
+			if (in_sdiod)
+				sc->sdio_core_rev =
+				    (coreb & BCMA_EROM_COREB_REV_MASK) >>
+				    BCMA_EROM_COREB_REV_SHIFT;
 			CYW_DPRINTF(sc, CYW_DBG_SDIO,
 			    "EROM: core 0x%03x nmp=%u%s\n",
 			    corid, nmp, in_sdiod ? " *** SDIOD ***" : "");
@@ -545,6 +549,9 @@ cyw_sdio_attach(struct cyw_softc *sc)
 
 	/* Find real SDIO device core base via EROM scan */
 	sc->sdio_core_base = cyw_erom_find_sdio_core_base(sc);
+	if (sc->sdio_core_base != 0)
+		device_printf(sc->dev, "SDIO device core rev %u\n",
+		    sc->sdio_core_rev);
 
 	/*
 	 * For ARM CR4 chips, brcmf_chip_get_raminfo() uses brcmf_chip_tcm_ramsize()

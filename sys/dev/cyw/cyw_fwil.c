@@ -100,8 +100,20 @@ cyw_sdpcm_recv_one(struct cyw_softc *sc, uint8_t *buf, uint16_t *out_flen)
 		CYW_UNLOCK(sc);
 		return (EAGAIN);
 	}
-	if (flen > CYW_SDPCM_MAX_FRAME)
-		return (EINVAL);
+	if (flen > CYW_SDPCM_MAX_FRAME) {
+		/*
+		 * Too long for this buffer: a superframe whose descriptor was
+		 * not acted on (see cyw_sdpcm_rxglom()), or a bad header.
+		 * Flush it, as Linux brcmf_sdio_hdparse() does for "HW header
+		 * length too long", rather than leave its tail in the FIFO to
+		 * be read as the next header.
+		 */
+		cyw_rxfail(sc);
+		CYW_LOCK(sc);
+		sc->rx_eagain_count++;
+		CYW_UNLOCK(sc);
+		return (EAGAIN);
+	}
 
 	if (flen > CYW_F2_BLKSIZE) {
 		/*
@@ -123,18 +135,34 @@ cyw_sdpcm_recv_one(struct cyw_softc *sc, uint8_t *buf, uint16_t *out_flen)
 	}
 
 	CYW_LOCK(sc);
+	sc->rx_ok_count++;
+	sc->rx_last_ok_ticks = ticks;
+	CYW_UNLOCK(sc);
+	cyw_sdpcm_update_credit(sc, hdr->credit);
+
+	if (out_flen != NULL)
+		*out_flen = flen;
+	return (0);
+}
+
+/*
+ * cyw_sdpcm_update_credit — take the credit ceiling from a received frame
+ * or superframe header.
+ */
+void
+cyw_sdpcm_update_credit(struct cyw_softc *sc, uint8_t credit)
+{
+	CYW_LOCK(sc);
 	/*
-	 * Credit ceiling.  As Linux brcmf_sdio_hdparse() does, a ceiling more
-	 * than 0x40 ahead of tx_seq is taken as corrupt and replaced by
-	 * tx_seq + 2 rather than believed.
+	 * As Linux brcmf_sdio_hdparse() does, a ceiling more than 0x40 ahead
+	 * of tx_seq is taken as corrupt and replaced by tx_seq + 2 rather
+	 * than believed.
 	 */
-	if ((uint8_t)(hdr->credit - sc->sdpcm_tx_seq) > 0x40) {
+	if ((uint8_t)(credit - sc->sdpcm_tx_seq) > 0x40) {
 		sc->sdpcm_rx_max = sc->sdpcm_tx_seq + 2;
 		sc->rx_credit_clamps++;
 	} else
-		sc->sdpcm_rx_max = hdr->credit;
-	sc->rx_ok_count++;
-	sc->rx_last_ok_ticks = ticks;
+		sc->sdpcm_rx_max = credit;
 	CYW_UNLOCK(sc);
 
 	/*
@@ -144,10 +172,6 @@ cyw_sdpcm_recv_one(struct cyw_softc *sc, uint8_t *buf, uint16_t *out_flen)
 	 */
 	if (sc->tx_queue_head != NULL && cyw_tx_credits_ok(sc))
 		taskqueue_enqueue(sc->rx_tq, &sc->tx_task);
-
-	if (out_flen != NULL)
-		*out_flen = flen;
-	return (0);
 }
 
 /* -------------------------------------------------------------------------

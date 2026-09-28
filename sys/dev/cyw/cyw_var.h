@@ -185,6 +185,8 @@
 #define BCMA_EROM_COREB_NUM_WMP_SHIFT	14
 #define BCMA_EROM_COREB_NUM_WSP_MASK	0x00f80000	/* bits [23:19]: slave wrapper count */
 #define BCMA_EROM_COREB_NUM_WSP_SHIFT	19
+#define BCMA_EROM_COREB_REV_MASK	0xff000000	/* bits [31:24]: core revision */
+#define BCMA_EROM_COREB_REV_SHIFT	24
 
 /* Region descriptor */
 #define BCMA_EROM_REGION_BASE_MASK	0xfffff000	/* bits [31:12]: region base */
@@ -277,6 +279,8 @@ struct cyw_sdpcm_hdr {
 #define CYW_SDPCM_CHAN_CTRL		0	/* IOCTL / IOVAR */
 #define CYW_SDPCM_CHAN_EVENT		1	/* async firmware events */
 #define CYW_SDPCM_CHAN_DATA		2	/* 802.3 Ethernet frames */
+#define CYW_SDPCM_CHAN_GLOM		3	/* superframe, see cyw_sdpcm_rxglom() */
+#define CYW_SDPCM_GLOMDESC		0x80	/* chan_flags: glom descriptor */
 
 /* -------------------------------------------------------------------------
  * BCDC command header (16 bytes, follows SDPCM header on control channel)
@@ -561,8 +565,9 @@ struct cyw_softc {
 	 */
 	struct sx		ioctl_sx;
 
-	/* SDIO device core backplane base (found via EROM scan) */
+	/* SDIO device core backplane base and revision (found via EROM scan) */
 	uint32_t		sdio_core_base;
+	uint8_t			sdio_core_rev;
 
 	/* SDPCM state */
 	uint8_t			sdpcm_tx_seq;
@@ -586,6 +591,9 @@ struct cyw_softc {
 	uint64_t		tx_credit_drops; /* dropped for credits (should be 0) */
 	uint64_t		tx_queue_drops;	/* dropped, tx_queue full */
 	uint64_t		rx_credit_clamps; /* implausible credit headers */
+	uint64_t		rx_glom_frames;	/* superframes received */
+	uint64_t		rx_glom_subframes; /* subframes delivered from them */
+	uint64_t		rx_glom_errors;	/* bad descriptors, dropped superframes */
 	uint64_t		tx_eapol_frames; /* TX subset with EtherType 0x888E */
 	uint64_t		tx_eapol_bytes;	/* TX EAPOL byte total */
 	int			tx_hdr_debug;	/* dump SDPCM/BDC TX hdrs when set */
@@ -757,6 +765,7 @@ void cyw_tx_task(void *arg, int pending);
 /* cyw_fwil.c — IOVAR/IOCTL encoding layer */
 int  cyw_sdpcm_recv_one(struct cyw_softc *, uint8_t *buf, uint16_t *out_flen);
 void cyw_rxfail(struct cyw_softc *);
+void cyw_sdpcm_update_credit(struct cyw_softc *, uint8_t credit);
 void cyw_rx_eio_diag(struct cyw_softc *, size_t rdlen, int err, const char *tag);
 int  cyw_fil_iovar_data_get(struct cyw_softc *, const char *name,
 		void *buf, size_t len);

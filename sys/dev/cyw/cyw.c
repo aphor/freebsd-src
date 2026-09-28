@@ -269,6 +269,18 @@ cyw_attach(device_t dev)
 	    SYSCTL_CHILDREN(sc->sysctl_tree), OID_AUTO,
 	    "rx_credit_clamps", CTLFLAG_RD, &sc->rx_credit_clamps, 0,
 	    "RX headers whose credit ceiling was implausible and clamped");
+	SYSCTL_ADD_U64(&sc->sysctl_ctx,
+	    SYSCTL_CHILDREN(sc->sysctl_tree), OID_AUTO,
+	    "rx_glom_frames", CTLFLAG_RD, &sc->rx_glom_frames, 0,
+	    "RX superframes received");
+	SYSCTL_ADD_U64(&sc->sysctl_ctx,
+	    SYSCTL_CHILDREN(sc->sysctl_tree), OID_AUTO,
+	    "rx_glom_subframes", CTLFLAG_RD, &sc->rx_glom_subframes, 0,
+	    "Event and data frames delivered from RX superframes");
+	SYSCTL_ADD_U64(&sc->sysctl_ctx,
+	    SYSCTL_CHILDREN(sc->sysctl_tree), OID_AUTO,
+	    "rx_glom_errors", CTLFLAG_RD, &sc->rx_glom_errors, 0,
+	    "Bad glom descriptors and dropped RX superframes");
 	SYSCTL_ADD_U8(&sc->sysctl_ctx,
 	    SYSCTL_CHILDREN(sc->sysctl_tree), OID_AUTO,
 	    "tx_seq", CTLFLAG_RD, &sc->sdpcm_tx_seq, 0,
