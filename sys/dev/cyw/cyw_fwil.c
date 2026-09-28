@@ -267,7 +267,8 @@ cyw_fil_txrx(struct cyw_softc *sc, uint32_t cmd, uint32_t bcdc_flags,
 	struct cyw_bcdc_hdr  *bch;
 	size_t namelen  = (name != NULL) ? strlen(name) + 1 : 0;
 	size_t payload  = namelen + buflen;
-	size_t framelen = ALIGN4(CYW_SDPCM_HDR_LEN + CYW_BCDC_HDR_LEN + payload);
+	size_t msglen   = CYW_SDPCM_HDR_LEN + CYW_BCDC_HDR_LEN + payload;
+	size_t framelen = ALIGN4(msglen);
 	uint8_t *frame, *data_start;
 	uint16_t id;
 	int err, i;
@@ -283,9 +284,14 @@ cyw_fil_txrx(struct cyw_softc *sc, uint32_t cmd, uint32_t bcdc_flags,
 	sx_xlock(&sc->ioctl_sx);
 	id = ++sc->ioctl_id;
 
+	/*
+	 * The SDPCM length is the message, not the tail padding, as in
+	 * Linux brcmf_sdio_tx_ctrlframe() (hd_info.len = len - pad) and in
+	 * cyw_tx_data_frame().
+	 */
 	sph = (struct cyw_sdpcm_hdr *)frame;
-	sph->len         = htole16((uint16_t)framelen);
-	sph->len_inv     = htole16(~(uint16_t)framelen);
+	sph->len         = htole16((uint16_t)msglen);
+	sph->len_inv     = htole16((uint16_t)~le16toh(sph->len));
 	sph->chan_flags  = CYW_SDPCM_CHAN_CTRL;
 	sph->data_offset = CYW_SDPCM_HDR_LEN;
 

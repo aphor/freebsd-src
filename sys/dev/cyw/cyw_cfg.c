@@ -39,6 +39,14 @@
 
 #include "cyw_var.h"
 
+/*
+ * The "join" payload must have Linux's natural-alignment layout
+ * (brcmf_ext_join_params_le); the firmware parses it by these offsets.
+ */
+CTASSERT(offsetof(struct cyw_ext_join_params, scan_le) == 36);
+CTASSERT(offsetof(struct cyw_ext_join_params, assoc_le) == 56);
+CTASSERT(offsetof(struct cyw_assoc_params_le, chanspec_list) == 12);
+
 /* -------------------------------------------------------------------------
  * Private VAP structure
  * ------------------------------------------------------------------------- */
@@ -56,8 +64,9 @@ struct cyw_vap {
  *
  * State transitions handled here:
  *   * → INIT:   if link_up, issue WLC_DISASSOC.
- *   * → AUTH:   abort any escan, push wsec/wpa_auth/wsec_pmk, issue
- *               WLC_SET_SSID with the target BSSID.  Firmware drives
+ *   * → AUTH:   abort any escan, push wsec/wpa_auth/wsec_pmk, issue the
+ *               "join" iovar with the target BSSID (WLC_SET_SSID if it
+ *               fails).  Firmware drives
  *               802.11 auth + assoc + 4-way handshake internally and
  *               reports completion via E_LINK (handled by security.c).
  *
@@ -289,6 +298,7 @@ cyw_newstate(struct ieee80211vap *vap, enum ieee80211_state nstate, int arg)
 		 */
 		{
 			struct cyw_ext_join_params join;
+			size_t join_len;
 			uint16_t chanspec;
 			int ieee_chan;
 
@@ -337,32 +347,31 @@ cyw_newstate(struct ieee80211vap *vap, enum ieee80211_state nstate, int arg)
 			}
 
 			/*
-			 * Use bsscfg-scoped iovar: prepends a 4-byte LE
-			 * bsscfg index (= 0, primary BSS) matching Linux
-			 * brcmf_fil_bsscfg_data_set().  Without the prefix,
-			 * firmware interprets the first 4 bytes of
-			 * ext_join_params (SSID_len field) as the bsscfg
-			 * index, looks up a non-existent BSS, and returns
-			 * BCME_NOTUP (-14).
+			 * Length as Linux computes it: everything up to the
+			 * chanspec list, plus one chanspec if there is one.
+			 * On the primary BSS, cyw_fil_bsscfg_data_set() is a
+			 * plain iovar, as brcmf_fil_bsscfg_data_set() is.
+			 *
+			 * This returned -14 on every join until the layout of
+			 * cyw_ext_join_params matched Linux (see cyw_var.h).
+			 * -14 is BCME_BUFTOOSHORT in Linux brcmf_fil_errstr[];
+			 * it had been read as BCME_NOTUP, which is -4.
 			 */
+			join_len =
+			    offsetof(struct cyw_ext_join_params, assoc_le) +
+			    offsetof(struct cyw_assoc_params_le, chanspec_list) +
+			    (chanspec != 0 ? sizeof(uint16_t) : 0);
+
 			err = cyw_fil_bsscfg_data_set(sc, "join",
-			    &join, sizeof(join));
+			    &join, join_len);
 			device_printf(sc->dev,
 			    "AUTH: join chan=%d chanspec=0x%04x returned %d\n",
 			    ieee_chan, chanspec, err);
 
 			/*
-			 * Fallback: WLC_SET_SSID legacy join.
-			 *
-			 * Linux brcmf_cfg80211_connect (cfg80211.c:2587-2601)
-			 * falls back to BRCMF_C_SET_SSID with brcmf_join_params
-			 * when the extended "join" IOVAR fails.  CYW43455
-			 * firmware 7.45.265 appears to selectively reject the
-			 * bsscfg-scoped "join" with a stable BCME_NOTUP even
-			 * with bss enable=1, wpaie, set_pmk, and bsscfg-scoped
-			 * security iovars all confirmed succeeding.  Now that
-			 * those prerequisites are in place, WLC_SET_SSID may
-			 * succeed where it previously returned NO_NETWORKS.
+			 * Fallback: WLC_SET_SSID legacy join, as Linux
+			 * brcmf_cfg80211_connect (cfg80211.c:2587-2601) falls
+			 * back to BRCMF_C_SET_SSID when "join" fails.
 			 *
 			 * Format: brcmf_join_params = ssid_le + assoc_params_le
 			 * (see cyw_join_params in cyw_var.h).  Sent as a
@@ -1200,21 +1209,13 @@ cyw_parent(struct ieee80211com *ic)
 			(void)cyw_fil_iovar_int_set(sc, "bcn_timeout", 4);
 			(void)cyw_fil_iovar_int_set(sc, "assoc_retry_max", 3);
 			(void)cyw_fil_cmd_int_set(sc, WLC_SET_FAKEFRAG, 1);
-			(void)cyw_fil_iovar_int_set(sc, "txbf", 1);
-
 			/*
-			 * QUESTION: Does WLC_SET_PM here conflict with the pm=0
-			 * IOVAR issued during attach (boot-time polling path)?
-			 * WLC_SET_PM (cmd 86) and the "pm" IOVAR (cmd 263) address
-			 * the same firmware power-management knob.  Issuing both may
-			 * be redundant; "pm" IOVAR returns BCME_UNSUPPORTED on this
-			 * firmware, so WLC_SET_PM may be the correct form — but it
-			 * is unclear whether sending it here (post-WLC_UP) is needed
-			 * or whether the attach-time "pm" IOVAR attempt suffices.
+			 * No "txbf": Linux never sets it (it only reads
+			 * txbf_bfe_cap/txbf_bfr_cap to advertise VHT
+			 * beamforming), and 7.45.265 rejects it with
+			 * BCME_UNSUPPORTED.  Power management is set once, at
+			 * attach, with WLC_SET_PM (see cyw_attach()).
 			 */
-#if 0	/* PM off — correct command form unclear; may belong in attach */
-			(void)cyw_fil_cmd_int_set(sc, WLC_SET_PM, 0);
-#endif
 
 			/*
 			 * QUESTION: Are roam parameters needed before escan works?

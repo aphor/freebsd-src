@@ -74,6 +74,7 @@ cyw_probe_fwsup(struct cyw_softc *sc)
  *   hw.cyw.fw_wsec      — wsec     (cipher suite mask; 4 = AES-CCM)
  *   hw.cyw.fw_wpa_auth  — wpa_auth (key-mgmt mask; 0x80 = WPA2-PSK)
  *   hw.cyw.fw_auth      — auth     (0 = open system)
+ *   hw.cyw.fw_pm        — WLC_GET_PM (0 = PM_OFF, 1 = PM_MAX, 2 = PM_FAST)
  * ------------------------------------------------------------------------- */
 static int
 cyw_sysctl_fw_iovar(struct cyw_softc *sc, const char *iovar,
@@ -108,6 +109,22 @@ cyw_sysctl_fw_auth(SYSCTL_HANDLER_ARGS)
 	return (cyw_sysctl_fw_iovar(arg1, "auth", oidp, req));
 }
 
+static int
+cyw_sysctl_fw_pm(SYSCTL_HANDLER_ARGS)
+{
+	struct cyw_softc *sc = arg1;
+	uint32_t v = 0;
+	int err;
+
+	if (!sc->sdpcm_running)
+		return (ENXIO);
+	err = cyw_fil_cmd_data_get(sc, WLC_GET_PM, &v, sizeof(v));
+	if (err != 0)
+		return (err);
+	v = le32toh(v);
+	return (sysctl_handle_int(oidp, &v, 0, req));
+}
+
 /* -------------------------------------------------------------------------
  * Probe
  * ------------------------------------------------------------------------- */
@@ -132,6 +149,7 @@ cyw_attach(device_t dev)
 {
 	struct cyw_softc *sc;
 	device_t parent, *children;
+	uint32_t pm;
 	int i, nchildren, err;
 
 	sc = device_get_softc(dev);
@@ -285,6 +303,10 @@ cyw_attach(device_t dev)
 	    SYSCTL_CHILDREN(sc->sysctl_tree), OID_AUTO, "fw_auth",
 	    CTLTYPE_INT | CTLFLAG_RD | CTLFLAG_MPSAFE, sc, 0,
 	    cyw_sysctl_fw_auth, "I", "firmware auth value (live GET)");
+	SYSCTL_ADD_PROC(&sc->sysctl_ctx,
+	    SYSCTL_CHILDREN(sc->sysctl_tree), OID_AUTO, "fw_pm",
+	    CTLTYPE_INT | CTLFLAG_RD | CTLFLAG_MPSAFE, sc, 0,
+	    cyw_sysctl_fw_pm, "I", "firmware power management mode (live GET)");
 
 	/* SDIO attach: enable F1, enable clock, read chip ID */
 	err = cyw_sdio_attach(sc);
@@ -333,8 +355,19 @@ cyw_attach(device_t dev)
 	 */
 	if (cyw_fil_iovar_int_set(sc, "roam_off", 1) != 0)
 		device_printf(dev, "cyw_attach: roam_off IOVAR failed\n");
-	if (cyw_fil_iovar_int_set(sc, "pm", 0) != 0)
-		device_printf(dev, "cyw_attach: pm IOVAR failed\n");
+	/*
+	 * Power management off.  There is no "pm" iovar (7.45.265 rejects it
+	 * with BCME_UNSUPPORTED); Linux brcmf_config_dongle() uses the
+	 * BRCMF_C_SET_PM command, once, before the interface is up.  The
+	 * mode found is logged because it is the firmware's own default.
+	 */
+	pm = 0xffffffff;
+	(void)cyw_fil_cmd_data_get(sc, WLC_GET_PM, &pm, sizeof(pm));
+	if (cyw_fil_cmd_int_set(sc, WLC_SET_PM, CYW_PM_OFF) != 0)
+		device_printf(dev, "cyw_attach: WLC_SET_PM failed\n");
+	else
+		device_printf(dev, "power management: firmware mode %d, "
+		    "set to %d (off)\n", (int)le32toh(pm), CYW_PM_OFF);
 	if (cyw_fil_iovar_int_set(sc, "btc_mode", 0) != 0)
 		device_printf(dev, "cyw_attach: btc_mode IOVAR failed\n");
 	/* mpc intentionally left at firmware default (1 = enabled).

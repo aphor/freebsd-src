@@ -369,7 +369,9 @@ typedef void (*cyw_event_handler_t)(struct cyw_softc *,
 #define WLC_GET_CHANNEL			29
 #define WLC_SET_CHANNEL			30
 #define WLC_DISASSOC			52	/* deauthenticate */
+#define WLC_GET_PM			85	/* get power management mode */
 #define WLC_SET_PM			86	/* set power management mode */
+#define  CYW_PM_OFF			0	/* Linux PM_OFF (brcm80211 defs.h) */
 #define WLC_SET_ROAM_TRIGGER		55	/* set roam trigger level */
 #define WLC_SET_ROAM_DELTA		57	/* set roam delta */
 #define WLC_SET_SCAN_CHANNEL_TIME	185	/* active dwell time per channel (ms) */
@@ -461,6 +463,12 @@ struct cyw_join_params {
  * Linux brcmf_join_scan_params_le (fwil_types.h:519-532).  Each int32
  * field accepts -1 to mean "use firmware default", which is what we
  * use to keep the wire format identical to Linux's normal operation.
+ *
+ * Naturally aligned, as in Linux: 3 pad bytes follow scan_type, so the
+ * struct is 20 bytes.  It used to be __packed (17 bytes), which moved
+ * assoc_le 3 bytes early.  The firmware then read chanspec_num from the
+ * chanspec itself (e.g. 0x00e32a00) and rejected every "join" with
+ * BCME_BUFTOOSHORT (-14).  cyw_cfg.c asserts the Linux offsets.
  */
 struct cyw_join_scan_params_le {
 	uint8_t		scan_type;	/* 0 = active (default) */
@@ -468,7 +476,7 @@ struct cyw_join_scan_params_le {
 	int32_t		active_time;	/* -1 = default */
 	int32_t		passive_time;	/* -1 = default */
 	int32_t		home_time;	/* -1 = default */
-} __packed;
+};
 
 /*
  * Extended join params — payload for the "join" IOVAR.  Mirrors Linux
@@ -482,7 +490,7 @@ struct cyw_ext_join_params {
 	struct cyw_ssid_le		ssid_le;
 	struct cyw_join_scan_params_le	scan_le;
 	struct cyw_assoc_params_le	assoc_le;
-} __packed;
+};
 
 /* -------------------------------------------------------------------------
  * Softc
