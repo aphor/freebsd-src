@@ -1,0 +1,600 @@
+/*-
+ * SPDX-License-Identifier: ISC
+ *
+ * Copyright (c) 2020 Dr Robert Harvey Crowston <crowston@protonmail.com>
+ * Copyright (c) 2026 FreeBSD Contributors
+ *
+ * Permission to use, copy, modify, and distribute this software for any
+ * purpose with or without fee is hereby granted, provided that the above
+ * copyright notice and this permission notice appear in all copies.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES
+ * WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF
+ * MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR
+ * ANY SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
+ * WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN
+ * ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
+ * OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
+ */
+
+/*
+ * BCM2712 (Raspberry Pi 5) PCI-express host controller.
+ *
+ * A fork of sys/arm/broadcom/bcm2835/bcm2838_pci.c, the BCM2711 (Pi 4)
+ * driver for the same Broadcom STB controller family, kept shaped for a
+ * later merge back into it (rpi5_modules.git doc/M2_PCIE_HOST.md):
+ *
+ *  - Function names, order and flow follow bcm2838_pci.c, with the
+ *    bcm2712_pcib_ prefix in place of bcm_pcib_.
+ *  - Everything that differs by SoC is in struct bcm2712_pcib_cfg, which
+ *    mirrors Linux pcie-brcmstb.c struct pcie_cfg_data.  The BCM2711
+ *    values that bcm2838_pci.c hardcodes are given beside each field.
+ *
+ * Divergences from bcm2838_pci.c, as of phase 1:
+ *
+ *  BCM2712 differs:
+ *   - Only controllers named in the loader tunable hw.bcm2712_pcib.adopt
+ *     (DT unit addresses; default "1000120000", PCIe2) are touched at
+ *     all.  The VPU firmware logs "PCI1 reset" at hand-off (and "PCI2
+ *     reset" unless config.txt sets pciex4_reset=0), yet the bridge resets
+ *     in brcm,brcmstb-reset all read deasserted, so no register tells us
+ *     which controllers are safe to read.  Linux never reads one before
+ *     resetting "rescal".  The list goes away in phase 3.
+ *   - The DT "bridge" reset (via hwreset) is also checked before any
+ *     controller register is read: asserted means unusable.  Necessary,
+ *     not sufficient, as above.
+ *   - UBUS/AXI error replies are suppressed so that failed reads return
+ *     all ones (Linux brcm_pcie_post_setup_bcm2712).  Without this, config
+ *     reads of empty slots return 0xdeaddead, which enumeration would take
+ *     for a device.
+ *   - Downstream config accesses are refused while the link is down, as
+ *     Linux brcm_pcie_map_bus() does; such an access aborts the CPU.
+ *   - MSI is not provided here: the DT's msi-parent is a separate
+ *     brcm,bcm2712-mip controller (phase 4), not this node.
+ *
+ *  Phase 1 only -- adopts a link the firmware already trained:
+ *   - No bridge reset, PHY/PLL set-up, PERST# or link training (phases 3
+ *     and 5); if the link is not up, attach fails.
+ *   - The inbound (DMA) windows are left as found; see "A constraint: DMA
+ *     addresses must be 1:1" in M2_PCIE_HOST.md before changing them.
+ *
+ *  Duplicate, merge as-is: the config-space window, the outbound window
+ *  encoders, the root port class fix-up, the bridge window relocation.
+ */
+
+#include <sys/param.h>
+#include <sys/systm.h>
+#include <sys/endian.h>
+#include <sys/kernel.h>
+#include <sys/module.h>
+#include <sys/bus.h>
+#include <sys/proc.h>
+#include <sys/rman.h>
+#include <sys/intr.h>
+#include <sys/mutex.h>
+#include <sys/sysctl.h>
+
+#include <dev/ofw/openfirm.h>
+#include <dev/ofw/ofw_bus.h>
+#include <dev/ofw/ofw_bus_subr.h>
+
+#include <dev/hwreset/hwreset.h>
+
+#include <dev/pci/pci_host_generic.h>
+#include <dev/pci/pci_host_generic_fdt.h>
+#include <dev/pci/pcivar.h>
+#include <dev/pci/pcireg.h>
+#include <dev/pci/pcib_private.h>
+
+#include <machine/bus.h>
+#include <machine/intr.h>
+
+#include "pcib_if.h"
+
+#define PCI_ID_VAL3		0x43c
+#define CLASS_SHIFT		0x10
+#define SUBCLASS_SHIFT		0x8
+
+#define REG_CONTROLLER_HW_REV			0x406c
+#define REG_BRIDGE_STATE			0x4068
+#define BRIDGE_STATE_PHYLINKUP		0x10
+#define BRIDGE_STATE_DL_ACTIVE		0x20
+#define REG_BRIDGE_LINK_STATE			0x00bc
+#define REG_BUS_WINDOW_LOW			0x400c
+#define REG_BUS_WINDOW_HIGH			0x4010
+#define REG_CPU_WINDOW_LOW			0x4070
+#define REG_CPU_WINDOW_START_HIGH		0x4080
+#define REG_CPU_WINDOW_END_HIGH			0x4084
+
+/* BCM2712 (7712) only; Linux PCIE_MISC_UBUS_CTRL, _AXI_READ_ERROR_DATA. */
+#define REG_UBUS_CTRL				0x40a4
+#define UBUS_CTRL_REPLY_ERR_DIS		(1u << 13)
+#define UBUS_CTRL_REPLY_DECERR_DIS	(1u << 19)
+#define REG_AXI_READ_ERROR_DATA			0x4170
+
+/*
+ * Per-SoC differences, after Linux pcie-brcmstb.c struct pcie_cfg_data.
+ * The BCM2711 value is what bcm2838_pci.c hardcodes.
+ */
+struct bcm2712_pcib_cfg {
+	const char	*desc;
+	bus_size_t	ext_cfg_index;	/* 2711: 0x9000 (REG_EP_CONFIG_CHOICE) */
+	bus_size_t	ext_cfg_data;	/* 2711: 0x8000 (REG_EP_CONFIG_DATA) */
+	bus_size_t	hard_debug;	/* 2711: 0x4204; 2712: 0x4304 */
+	bus_size_t	intr2_cpu_base;	/* 2711: 0x4300; 2712: 0x4400 */
+	u_int		num_inbound_wins; /* 2711: 3; 2712: 10 (UBUS BARs) */
+	bool		ubus_err_suppress; /* 2711: no; 2712: yes */
+};
+
+static const struct bcm2712_pcib_cfg bcm2712_cfg = {
+	.desc			= "BCM2712 PCI-express controller",
+	.ext_cfg_index		= 0x9000,
+	.ext_cfg_data		= 0x8000,
+	.hard_debug		= 0x4304,
+	.intr2_cpu_base		= 0x4400,
+	.num_inbound_wins	= 10,
+	.ubus_err_suppress	= true,
+};
+
+/*
+ * Controllers phase 1 may adopt, by DT unit address, separated by spaces or
+ * commas.  See the comment at the top.
+ */
+static char bcm2712_pcib_adopt[128] = "1000120000";
+static SYSCTL_NODE(_hw, OID_AUTO, bcm2712_pcib, CTLFLAG_RD | CTLFLAG_MPSAFE,
+    NULL, "BCM2712 PCIe host controller");
+SYSCTL_STRING(_hw_bcm2712_pcib, OID_AUTO, adopt, CTLFLAG_RDTUN,
+    bcm2712_pcib_adopt, sizeof(bcm2712_pcib_adopt),
+    "DT unit addresses of the controllers phase 1 may adopt");
+
+struct bcm2712_pcib_softc {
+	struct generic_pcie_fdt_softc	base;
+	device_t			dev;
+	const struct bcm2712_pcib_cfg	*cfg;
+	hwreset_t			bridge_rst;
+	struct mtx			config_mtx;
+};
+
+static struct ofw_compat_data compat_data[] = {
+	{"brcm,bcm2712-pcie",			(uintptr_t)&bcm2712_cfg},
+	{NULL,					0}
+};
+
+static int
+bcm2712_pcib_probe(device_t dev)
+{
+	const struct bcm2712_pcib_cfg *cfg;
+
+	if (!ofw_bus_status_okay(dev))
+		return (ENXIO);
+
+	cfg = (const struct bcm2712_pcib_cfg *)
+	    ofw_bus_search_compatible(dev, compat_data)->ocd_data;
+	if (cfg == NULL)
+		return (ENXIO);
+
+	device_set_desc(dev, cfg->desc);
+	return (BUS_PROBE_DEFAULT);
+}
+
+static void
+bcm2712_pcib_set_reg(struct bcm2712_pcib_softc *sc, uint32_t reg, uint32_t val)
+{
+
+	bus_write_4(sc->base.base.res, reg, htole32(val));
+}
+
+static uint32_t
+bcm2712_pcib_read_reg(struct bcm2712_pcib_softc *sc, uint32_t reg)
+{
+
+	return (le32toh(bus_read_4(sc->base.base.res, reg)));
+}
+
+static bool
+bcm2712_pcib_link_up(struct bcm2712_pcib_softc *sc)
+{
+	uint32_t val;
+
+	val = bcm2712_pcib_read_reg(sc, REG_BRIDGE_STATE);
+	return ((val & (BRIDGE_STATE_PHYLINKUP | BRIDGE_STATE_DL_ACTIVE)) ==
+	    (BRIDGE_STATE_PHYLINKUP | BRIDGE_STATE_DL_ACTIVE));
+}
+
+static int
+bcm2712_pcib_check_ranges(device_t dev)
+{
+	struct bcm2712_pcib_softc *sc;
+	struct pcie_range *ranges;
+	int error = 0, i;
+
+	sc = device_get_softc(dev);
+	ranges = &sc->base.base.ranges[0];
+
+	/* The first range needs to be non-zero. */
+	if (ranges[0].size == 0) {
+		device_printf(dev, "error: first outbound memory range "
+		    "(pci addr: 0x%jx, cpu addr: 0x%jx) has zero size.\n",
+		    ranges[0].pci_base, ranges[0].phys_base);
+		error = ENXIO;
+	}
+
+	/*
+	 * The controller can handle several distinct ranges, but, as in
+	 * bcm2838_pci.c, only the first is implemented.
+	 */
+	for (i = 1; (bootverbose || error) && i < MAX_RANGES_TUPLES; ++i) {
+		if (ranges[i].size > 0)
+			device_printf(dev,
+			    "note: outbound memory range %d (pci addr: 0x%jx, "
+			    "cpu addr: 0x%jx, size: 0x%jx) will be ignored.\n",
+			    i, ranges[i].pci_base, ranges[i].phys_base,
+			    ranges[i].size);
+	}
+
+	return (error);
+}
+
+static const char *
+bcm2712_pcib_link_state_string(uint32_t mode)
+{
+
+	switch(mode & PCIEM_LINK_STA_SPEED) {
+	case 0:
+		return ("not up");
+	case 1:
+		return ("2.5 GT/s");
+	case 2:
+		return ("5.0 GT/s");
+	case 4:
+		return ("8.0 GT/s");
+	default:
+		return ("unknown");
+	}
+}
+
+static bus_addr_t
+bcm2712_get_offset_and_prepare_config(struct bcm2712_pcib_softc *sc,
+    u_int bus, u_int slot, u_int func, u_int reg)
+{
+	/*
+	 * Config for an end point is only available through a narrow window for
+	 * one end point at a time. We first tell the controller which end point
+	 * we want, then access it through the window.
+	 */
+	uint32_t func_index;
+
+	if (bus == 0 && slot == 0 && func == 0)
+		/*
+		 * Special case for root device; its config is always available
+		 * through the zero-offset.
+		 */
+		return (reg);
+
+	/* Tell the controller to show us the config in question. */
+	func_index = PCIE_ADDR_OFFSET(bus, slot, func, 0);
+	bcm2712_pcib_set_reg(sc, sc->cfg->ext_cfg_index, func_index);
+
+	return (sc->cfg->ext_cfg_data + reg);
+}
+
+static bool
+bcm2712_pcib_is_valid_quad(struct bcm2712_pcib_softc *sc, u_int bus,
+    u_int slot, u_int func, u_int reg)
+{
+
+	if ((bus < sc->base.base.bus_start) || (bus > sc->base.base.bus_end))
+		return (false);
+	if ((slot > PCI_SLOTMAX) || (func > PCI_FUNCMAX) || (reg > PCIE_REGMAX))
+		return (false);
+
+	if (bus == 0 && slot == 0 && func == 0)
+		return (true);
+	if (bus == 0)
+		/*
+		 * Probing other slots and funcs on bus 0 will lock up the
+		 * memory controller.
+		 */
+		return (false);
+
+	/* An access below the root port with the link down aborts the CPU. */
+	if (!bcm2712_pcib_link_up(sc))
+		return (false);
+
+	return (true);
+}
+
+static uint32_t
+bcm2712_pcib_read_config(device_t dev, u_int bus, u_int slot, u_int func,
+    u_int reg, int bytes)
+{
+	struct bcm2712_pcib_softc *sc;
+	bus_addr_t offset;
+	uint32_t data;
+
+	sc = device_get_softc(dev);
+	if (!bcm2712_pcib_is_valid_quad(sc, bus, slot, func, reg))
+		return (~0U);
+
+	mtx_lock(&sc->config_mtx);
+	offset = bcm2712_get_offset_and_prepare_config(sc, bus, slot, func, reg);
+
+	switch (bytes) {
+	case 1:
+		data = bus_read_1(sc->base.base.res, offset);
+		break;
+	case 2:
+		data = le16toh(bus_read_2(sc->base.base.res, offset));
+		break;
+	case 4:
+		data = le32toh(bus_read_4(sc->base.base.res, offset));
+		break;
+	default:
+		data = ~0U;
+		break;
+	}
+
+	mtx_unlock(&sc->config_mtx);
+	return (data);
+}
+
+static void
+bcm2712_pcib_write_config(device_t dev, u_int bus, u_int slot,
+    u_int func, u_int reg, uint32_t val, int bytes)
+{
+	struct bcm2712_pcib_softc *sc;
+	uint32_t offset;
+
+	sc = device_get_softc(dev);
+	if (!bcm2712_pcib_is_valid_quad(sc, bus, slot, func, reg))
+		return;
+
+	mtx_lock(&sc->config_mtx);
+	offset = bcm2712_get_offset_and_prepare_config(sc, bus, slot, func, reg);
+
+	switch (bytes) {
+	case 1:
+		bus_write_1(sc->base.base.res, offset, val);
+		break;
+	case 2:
+		bus_write_2(sc->base.base.res, offset, htole16(val));
+		break;
+	case 4:
+		bus_write_4(sc->base.base.res, offset, htole32(val));
+		break;
+	default:
+		break;
+	}
+
+	mtx_unlock(&sc->config_mtx);
+}
+
+static void
+bcm2712_pcib_relocate_bridge_window(device_t dev)
+{
+	/*
+	 * As in bcm2838_pci.c: move the root port's memory window to the
+	 * start of the outbound range, where pcib_probe_windows() will find it,
+	 * rather than leave one that allocation would reject.
+	 */
+
+	struct bcm2712_pcib_softc *sc;
+	pci_addr_t base, size, new_base, new_limit;
+	uint16_t val;
+
+	sc = device_get_softc(dev);
+
+	val = bcm2712_pcib_read_config(dev, 0, 0, 0, PCIR_MEMBASE_1, 2);
+	base = PCI_PPBMEMBASE(0, val);
+
+	val = bcm2712_pcib_read_config(dev, 0, 0, 0, PCIR_MEMLIMIT_1, 2);
+	size = PCI_PPBMEMLIMIT(0, val) - base;
+
+	new_base = sc->base.base.ranges[0].pci_base;
+	val = (uint16_t) (new_base >> 16);
+	bcm2712_pcib_write_config(dev, 0, 0, 0, PCIR_MEMBASE_1, val, 2);
+
+	new_limit = new_base + size;
+	val = (uint16_t) (new_limit >> 16);
+	bcm2712_pcib_write_config(dev, 0, 0, 0, PCIR_MEMLIMIT_1, val, 2);
+}
+
+static uint32_t
+encode_cpu_window_low(pci_addr_t phys_base, bus_size_t size)
+{
+
+	return (((phys_base >> 0x10) & 0xfff0) |
+	    ((phys_base + size - 1) & 0xfff00000));
+}
+
+static uint32_t
+encode_cpu_window_start_high(pci_addr_t phys_base)
+{
+
+	return ((phys_base >> 0x20) & 0xff);
+}
+
+static uint32_t
+encode_cpu_window_end_high(pci_addr_t phys_base, bus_size_t size)
+{
+
+	return (((phys_base + size - 1) >> 0x20) & 0xff);
+}
+
+/* Is this controller's DT unit address in hw.bcm2712_pcib.adopt? */
+static bool
+bcm2712_pcib_adopt_listed(device_t dev)
+{
+	const char *name, *ua, *p;
+	size_t len, n;
+
+	name = ofw_bus_get_name(dev);
+	if (name == NULL || (ua = strchr(name, '@')) == NULL)
+		return (false);
+	ua++;
+	len = strlen(ua);
+	for (p = bcm2712_pcib_adopt; *p != '\0'; p += n) {
+		if (*p == ' ' || *p == ',') {
+			n = 1;
+			continue;
+		}
+		for (n = 0; p[n] != '\0' && p[n] != ' ' && p[n] != ','; n++)
+			;
+		if (n == len && strncmp(p, ua, len) == 0)
+			return (true);
+	}
+	return (false);
+}
+
+/*
+ * Check the DT "bridge" reset before any controller register is read.  A
+ * controller held in reset raises an SError on access, and bringing one out
+ * of reset is phases 3 and 5 of M2_PCIE_HOST.md.
+ */
+static int
+bcm2712_pcib_check_reset(device_t dev)
+{
+	struct bcm2712_pcib_softc *sc;
+	bool asserted;
+	int error;
+
+	sc = device_get_softc(dev);
+	error = hwreset_get_by_ofw_name(dev, 0, "bridge", &sc->bridge_rst);
+	if (error != 0) {
+		device_printf(dev, "no \"bridge\" reset in the DT (%d); "
+		    "not touching the controller\n", error);
+		return (ENXIO);
+	}
+	error = hwreset_is_asserted(sc->bridge_rst, &asserted);
+	if (error != 0 || asserted) {
+		if (error != 0)
+			device_printf(dev, "cannot read the bridge reset (%d)\n",
+			    error);
+		else
+			device_printf(dev, "held in reset by the firmware; "
+			    "bringing it out of reset is not implemented yet\n");
+		hwreset_release(sc->bridge_rst);
+		return (ENXIO);
+	}
+	return (0);
+}
+
+static int
+bcm2712_pcib_attach(device_t dev)
+{
+	struct bcm2712_pcib_softc *sc;
+	pci_addr_t phys_base, pci_base;
+	bus_size_t size;
+	uint32_t hardware_rev, link_state, tmp;
+	int error;
+
+	sc = device_get_softc(dev);
+	sc->dev = dev;
+	sc->cfg = (const struct bcm2712_pcib_cfg *)
+	    ofw_bus_search_compatible(dev, compat_data)->ocd_data;
+
+	if (!bcm2712_pcib_adopt_listed(dev)) {
+		device_printf(dev, "not in hw.bcm2712_pcib.adopt (\"%s\"); "
+		    "left untouched\n", bcm2712_pcib_adopt);
+		return (ENXIO);
+	}
+
+	error = bcm2712_pcib_check_reset(dev);
+	if (error != 0)
+		return (error);
+
+	error = pci_host_generic_setup_fdt(dev);
+	if (error != 0)
+		return (error);
+
+	error = bcm2712_pcib_check_ranges(dev);
+	if (error != 0)
+		goto failed;
+
+	hardware_rev = bcm2712_pcib_read_reg(sc, REG_CONTROLLER_HW_REV) & 0xffff;
+	device_printf(dev, "hardware identifies as revision 0x%x.\n",
+	    hardware_rev);
+
+	/*
+	 * Phase 1 adopts the link the firmware trained (pciex4_reset=0 for
+	 * PCIe2); it does not reset, set up the PHY or train one itself.
+	 */
+	if (!bcm2712_pcib_link_up(sc)) {
+		device_printf(dev, "error: link is not up (status 0x%08x); "
+		    "link training is not implemented yet.\n",
+		    bcm2712_pcib_read_reg(sc, REG_BRIDGE_STATE));
+		error = ENXIO;
+		goto failed;
+	}
+
+	mtx_init(&sc->config_mtx, "bcm2712_pcib: config_mtx", NULL, MTX_DEF);
+
+	link_state = bcm2712_pcib_read_reg(sc, REG_BRIDGE_LINK_STATE) >> 0x10;
+	device_printf(dev, "link up at %s (adopted from the firmware).\n",
+	    bcm2712_pcib_link_state_string(link_state));
+
+	/* Failed reads return all ones, not 0xdeaddead, and do not abort. */
+	if (sc->cfg->ubus_err_suppress) {
+		tmp = bcm2712_pcib_read_reg(sc, REG_UBUS_CTRL);
+		tmp |= UBUS_CTRL_REPLY_ERR_DIS | UBUS_CTRL_REPLY_DECERR_DIS;
+		bcm2712_pcib_set_reg(sc, REG_UBUS_CTRL, tmp);
+		bcm2712_pcib_set_reg(sc, REG_AXI_READ_ERROR_DATA, 0xffffffff);
+	}
+
+	/*
+	 * Set the CPU->PCI memory window. The map in this direction is not 1:1.
+	 * Addresses seen by the CPU need to be adjusted to make sense to the
+	 * controller as they pass through the window.
+	 */
+	pci_base  = sc->base.base.ranges[0].pci_base;
+	phys_base = sc->base.base.ranges[0].phys_base;
+	size      = sc->base.base.ranges[0].size;
+
+	bcm2712_pcib_set_reg(sc, REG_BUS_WINDOW_LOW, pci_base & 0xffffffff);
+	bcm2712_pcib_set_reg(sc, REG_BUS_WINDOW_HIGH, pci_base >> 32);
+
+	bcm2712_pcib_set_reg(sc, REG_CPU_WINDOW_LOW,
+	    encode_cpu_window_low(phys_base, size));
+	bcm2712_pcib_set_reg(sc, REG_CPU_WINDOW_START_HIGH,
+	    encode_cpu_window_start_high(phys_base));
+	bcm2712_pcib_set_reg(sc, REG_CPU_WINDOW_END_HIGH,
+	    encode_cpu_window_end_high(phys_base, size));
+
+	/*
+	 * The controller starts up declaring itself an endpoint; readvertise it
+	 * as a bridge.
+	 */
+	bcm2712_pcib_set_reg(sc, PCI_ID_VAL3,
+	    PCIC_BRIDGE << CLASS_SHIFT | PCIS_BRIDGE_PCI << SUBCLASS_SHIFT);
+
+	bcm2712_pcib_relocate_bridge_window(dev);
+
+	/* Done. */
+	device_add_child(dev, "pci", DEVICE_UNIT_ANY);
+	bus_attach_children(dev);
+	return (0);
+failed:
+	pci_host_generic_destroy_fdt(dev);
+	hwreset_release(sc->bridge_rst);
+	return (error);
+}
+
+/*
+ * Device method table.
+ */
+static device_method_t bcm2712_pcib_methods[] = {
+	/* Device interface. */
+	DEVMETHOD(device_probe,			bcm2712_pcib_probe),
+	DEVMETHOD(device_attach,		bcm2712_pcib_attach),
+
+	/* PCIB interface. */
+	DEVMETHOD(pcib_read_config,		bcm2712_pcib_read_config),
+	DEVMETHOD(pcib_write_config,		bcm2712_pcib_write_config),
+
+	DEVMETHOD_END
+};
+
+DEFINE_CLASS_1(pcib, bcm2712_pcib_driver, bcm2712_pcib_methods,
+    sizeof(struct bcm2712_pcib_softc), generic_pcie_fdt_driver);
+
+DRIVER_MODULE(bcm2712_pcib, simplebus, bcm2712_pcib_driver, 0, 0);

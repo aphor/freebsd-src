@@ -55,6 +55,8 @@ device		rpi5_fan		# Pi 5 cooling fan thermal control
 device		rpi_fw			# VPU firmware mailbox, TryBoot
 device		brcmstb_gpio		# SoC-native GPIO (WL_ON, SD power)
 device		bcm2712_pinctrl		# SoC pin mux (SDIO2 for WiFi)
+device		brcmstb_reset		# SW_INIT reset controller (PCIe bridge resets)
+device		bcm2712_pcib		# PCIe host controller (M2 phase 1: adopts a trained link)
 
 # RP1 southbridge
 device		rp1_gpio		# GPIO + pinctrl
