@@ -105,6 +105,7 @@
 
 #define	TAG_GET_FIRMWARE_REVISION	0x00000001U
 #define	TAG_GET_TEMPERATURE		0x00030006U
+#define	TAG_GET_THROTTLED		0x00030046U
 #define	TAG_NOTIFY_REBOOT		0x00030048U
 #define	TAG_GET_REBOOT_FLAGS		0x00030064U
 #define	TAG_SET_REBOOT_FLAGS		0x00038064U
@@ -306,6 +307,24 @@ rpi_fw_sysctl_revision(SYSCTL_HANDLER_ARGS)
 }
 
 /* The firmware's own reading of the SoC sensor, in millidegrees C. */
+/*
+ * Throttling and under-voltage flags, the value `vcgencmd get_throttled`
+ * prints.  Linux raspberrypi-hwmon asks with 0xffff, which also clears the
+ * sticky "has occurred" bits (16 and up, bit 16 being under-voltage); this
+ * asks with 0 so that reading does not erase the history.
+ */
+static int
+rpi_fw_sysctl_throttled(SYSCTL_HANDLER_ARGS)
+{
+	struct rpi_fw_softc *sc = arg1;
+	uint32_t v = 0;
+	int error;
+
+	if ((error = rpi_fw_tag(sc, TAG_GET_THROTTLED, &v, 4, 4)) != 0)
+		return (error);
+	return (sysctl_handle_32(oidp, &v, 0, req));
+}
+
 static int
 rpi_fw_sysctl_temperature(SYSCTL_HANDLER_ARGS)
 {
@@ -459,6 +478,11 @@ rpi_fw_attach(device_t dev)
 	    CTLTYPE_INT | CTLFLAG_RD | CTLFLAG_MPSAFE, sc, 0,
 	    rpi_fw_sysctl_temperature, "I",
 	    "SoC temperature as the firmware reads it, millidegrees C");
+	SYSCTL_ADD_PROC(ctx, SYSCTL_CHILDREN(tree), OID_AUTO, "throttled",
+	    CTLTYPE_U32 | CTLFLAG_RD | CTLFLAG_MPSAFE, sc, 0,
+	    rpi_fw_sysctl_throttled, "IU",
+	    "Throttling flags as vcgencmd get_throttled reports them "
+	    "(bit 16: under-voltage has occurred)");
 
 	sc->sc_shutdown_tag = EVENTHANDLER_REGISTER(shutdown_final,
 	    rpi_fw_shutdown_final, sc, SHUTDOWN_PRI_FIRST);
