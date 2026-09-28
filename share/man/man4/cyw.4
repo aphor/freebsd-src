@@ -114,6 +114,15 @@ per-deployment without rebuilding the driver.
 Replace
 .Pa brcmfmac43455-sdio.clm_blob
 with a jurisdiction-appropriate blob and reload the module.
+.Sh LOADER TUNABLES
+.Bl -tag -width "hw.sdiob.bus_setup"
+.It Va hw.sdiob.bus_setup
+Set to 1 so that the SDIO bus bridge switches the card to high speed and a
+4-bit bus when it attaches.
+Otherwise the bus stays at 1 bit and 400 kHz, which limits throughput to
+about 40 KB/s.
+On the Raspberry Pi 5 the bus then runs at 4 bits and 50 MHz.
+.El
 .Sh SYSCTLS
 The following
 .Xr sysctl 8
@@ -230,7 +239,5 @@ driver was written for FreeBSD/arm64 on the Raspberry Pi 5.
 .Sh BUGS
 Bluetooth is not yet supported.
 The driver uses polling rather than interrupt-driven SDIO I/O.
-On the Raspberry Pi 5 the SDIO bus is left at 400 kHz and 1 bit wide,
-which limits throughput to about 40 KB/s.
 WPA/WPA2 association is implemented but 802.11r fast BSS transition and
 802.11w management frame protection are not.
