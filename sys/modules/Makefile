@@ -364,6 +364,7 @@ SUBDIR=	\
 	rge \
 	rl \
 	${_rockchip} \
+	${_rp1} \
 	${_rp1_eth} \
 	${_rp1_gpio} \
 	${_rp1_pcie2_recon} \
@@ -756,6 +757,7 @@ _bcm2712_pinctrl=	bcm2712_pinctrl
 _brcmstb_gpio=	brcmstb_gpio
 _bcm2712_sdhci=	bcm2712_sdhci
 _cyw=		cyw
+_rp1=		rp1
 _rp1_eth=	rp1_eth
 _rp1_gpio=	rp1_gpio
 _rp1_pcie2_recon=	rp1_pcie2_recon

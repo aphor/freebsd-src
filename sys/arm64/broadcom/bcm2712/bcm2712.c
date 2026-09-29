@@ -23,6 +23,7 @@
 #include <vm/vm.h>
 #include <vm/pmap.h>
 #include <machine/bus.h>
+#include <machine/machdep.h>
 
 
 #include "bcm2712_fdt.h"
@@ -271,6 +272,108 @@ bcm2712_get_softc(void)
 	return (bcm2712_sc);
 }
 
+/*
+ * RP1's peripheral window, published by the rp1 PCI driver on the FDT lane;
+ * see bcm2712_var.h.  Drivers that need RP1 before then queue a function to
+ * run when it is published.
+ */
+#define	BCM2712_RP1_DEFER_MAX	8
+
+struct bcm2712_rp1_deferred {
+	void	(*fn)(void *);
+	void	*arg;
+};
+
+static struct mtx bcm2712_rp1_mtx;
+MTX_SYSINIT(bcm2712_rp1, &bcm2712_rp1_mtx, "bcm2712 rp1", MTX_DEF);
+static bool bcm2712_rp1_published;
+static bus_addr_t bcm2712_rp1_pa;
+static bus_size_t bcm2712_rp1_size;
+static struct bcm2712_rp1_deferred bcm2712_rp1_queue[BCM2712_RP1_DEFER_MAX];
+static int bcm2712_rp1_nqueued;
+
+/* Does RP1 have to wait for PCI?  Only on an FDT boot. */
+bool
+bcm2712_rp1_needs_pci(void)
+{
+
+	return (arm64_bus_method == ARM64_BUS_FDT);
+}
+
+void
+bcm2712_rp1_publish(bus_addr_t pa, bus_size_t size)
+{
+	struct bcm2712_rp1_deferred run[BCM2712_RP1_DEFER_MAX];
+	int i, n;
+
+	mtx_lock(&bcm2712_rp1_mtx);
+	bcm2712_rp1_pa = pa;
+	bcm2712_rp1_size = size;
+	bcm2712_rp1_published = true;
+	n = bcm2712_rp1_nqueued;
+	memcpy(run, bcm2712_rp1_queue, n * sizeof(run[0]));
+	bcm2712_rp1_nqueued = 0;
+	mtx_unlock(&bcm2712_rp1_mtx);
+
+	for (i = 0; i < n; i++)
+		run[i].fn(run[i].arg);
+}
+
+bool
+bcm2712_rp1_bar(bus_addr_t *pa, bus_size_t *size)
+{
+	bool published;
+
+	mtx_lock(&bcm2712_rp1_mtx);
+	published = bcm2712_rp1_published;
+	if (published) {
+		*pa = bcm2712_rp1_pa;
+		if (size != NULL)
+			*size = bcm2712_rp1_size;
+	}
+	mtx_unlock(&bcm2712_rp1_mtx);
+	return (published);
+}
+
+/* Run fn(arg) once RP1 is published: now, if it already is. */
+int
+bcm2712_rp1_defer(void (*fn)(void *), void *arg)
+{
+
+	mtx_lock(&bcm2712_rp1_mtx);
+	if (bcm2712_rp1_published) {
+		mtx_unlock(&bcm2712_rp1_mtx);
+		fn(arg);
+		return (0);
+	}
+	if (bcm2712_rp1_nqueued == BCM2712_RP1_DEFER_MAX) {
+		mtx_unlock(&bcm2712_rp1_mtx);
+		return (ENOSPC);
+	}
+	bcm2712_rp1_queue[bcm2712_rp1_nqueued].fn = fn;
+	bcm2712_rp1_queue[bcm2712_rp1_nqueued].arg = arg;
+	bcm2712_rp1_nqueued++;
+	mtx_unlock(&bcm2712_rp1_mtx);
+	return (0);
+}
+
+/* Forget a deferred fn(arg) that has not run, for a driver going away. */
+void
+bcm2712_rp1_undefer(void (*fn)(void *), void *arg)
+{
+	int i, j;
+
+	mtx_lock(&bcm2712_rp1_mtx);
+	for (i = j = 0; i < bcm2712_rp1_nqueued; i++) {
+		if (bcm2712_rp1_queue[i].fn == fn &&
+		    bcm2712_rp1_queue[i].arg == arg)
+			continue;
+		bcm2712_rp1_queue[j++] = bcm2712_rp1_queue[i];
+	}
+	bcm2712_rp1_nqueued = j;
+	mtx_unlock(&bcm2712_rp1_mtx);
+}
+
 /* Configure PWM channel period and duty cycle (values in nanoseconds). */
 int
 bcm2712_pwm_set_config(u_int channel, u_int period_ns, u_int duty_ns)
@@ -416,14 +519,159 @@ bcm2712_read_fan_rpm(void)
 	return (rpm);
 }
 
+/*
+ * The RP1 half of the set-up: map PWM1, enable its clock, and mux GPIO45 to
+ * it.  Called from MOD_LOAD under ACPI, and from bcm2712_rp1_publish() on
+ * an FDT boot, once the rp1 PCI driver has found RP1.
+ */
+static void
+bcm2712_rp1_setup(void *arg)
+{
+	struct bcm2712_softc *sc = arg;
+	void *pwm_vaddr;
+	bus_addr_t pwm_phys;
+	bool pwm_from_fdt;
+
+	/*
+	 * Map RP1 PWM1, via the pcie2 outbound window.  RP1 has two
+	 * PWM blocks and the unit address is what tells them apart:
+	 * pwm@9c000 is PWM1, which drives the fan, and is the one the
+	 * Pi 5 device tree marks status = "okay"; pwm@98000 (PWM0) is
+	 * disabled.  Hence located by path, with compatible as a guard.
+	 */
+	pwm_phys = RP1_PWM1_BASE_PHYS;
+	pwm_from_fdt = bcm2712_fdt_rp1(pwm1_fdt_paths,
+	    "raspberrypi,rp1-pwm", 0, &pwm_phys, NULL);
+
+	pwm_vaddr = pmap_mapdev_attr(pwm_phys, RP1_PWM_MAP_SIZE,
+	    VM_MEMATTR_DEVICE);
+
+	if (pwm_vaddr == NULL) {
+		printf("bcm2712: Cannot map PWM memory at 0x%lx; the "
+		    "fan will not be driven\n", (unsigned long)pwm_phys);
+		return;
+	}
+	printf("bcm2712: RP1 PWM1 controller mapped at 0x%lx (%s)\n",
+	    (unsigned long)pwm_phys,
+	    pwm_from_fdt ? "from FDT" : "hardcoded, no FDT node");
+
+	/*
+	 * Enable RP1 PWM1 clock (clock index 18).
+	 *
+	 * The RP1 PWM clocks are *disabled* at reset; without enabling
+	 * them all register writes to the PWM peripheral appear to
+	 * succeed but the channel output never changes — the fan
+	 * free-runs at boot default (~100% speed from its pull-up).
+	 *
+	 * Configuration: 50 MHz xosc → ÷8.138 → 6.144 MHz PWM clock.
+	 * The Linux DTB specifies assigned-clock-rates = <6144000> for
+	 * this peripheral; it yields range=255 ticks at 24 kHz so the
+	 * speed register (0-255) maps directly to duty ticks.
+	 *
+	 * Sequence per clk-rp1.c: set source first (no ENABLE), load
+	 * divisors, then set ENABLE.
+	 */
+	{
+		void *clk_map;
+		volatile uint32_t *clk;
+		bus_addr_t clk_phys = RP1_CLK_BASE_PHYS;
+		bool clk_from_fdt;
+
+		clk_from_fdt = bcm2712_fdt_rp1(rp1_clk_fdt_paths,
+		    "raspberrypi,rp1-clocks", 0, &clk_phys, NULL);
+
+		clk_map = pmap_mapdev_attr(clk_phys,
+		    RP1_CLK_MAP_SIZE, VM_MEMATTR_DEVICE);
+		if (clk_map != NULL) {
+			clk = (volatile uint32_t *)clk_map;
+			/* 1. Select source (aux/xosc), disable first */
+			clk[RP1_CLK_PWM1_CTRL / 4] =
+			    RP1_CLK_PWM1_CTRL_SRC;
+			/* 2. Integer divisor */
+			clk[RP1_CLK_PWM1_DIV_INT / 4] =
+			    RP1_CLK_PWM1_DIV_INT_VAL;
+			/* 3. Fractional divisor */
+			clk[RP1_CLK_PWM1_DIV_FRAC / 4] =
+			    RP1_CLK_PWM1_DIV_FRAC_VAL;
+			/* 4. Enable */
+			clk[RP1_CLK_PWM1_CTRL / 4] =
+			    RP1_CLK_PWM1_CTRL_ENA;
+			printf("bcm2712: RP1 PWM1 clock enabled "
+			    "(CTRL=0x%08x DIV_INT=%u) at 0x%lx (%s)\n",
+			    clk[RP1_CLK_PWM1_CTRL / 4],
+			    clk[RP1_CLK_PWM1_DIV_INT / 4],
+			    (unsigned long)clk_phys,
+			    clk_from_fdt ? "from FDT" :
+			    "hardcoded, no FDT node");
+			pmap_unmapdev(clk_map, RP1_CLK_MAP_SIZE);
+		} else {
+			printf("bcm2712: WARNING: cannot map RP1 "
+			    "clock controller at 0x%lx\n",
+			    (unsigned long)clk_phys);
+		}
+	}
+
+	/*
+	 * Mux GPIO45 to PWM1 function (ALT0) so the PWM signal
+	 * reaches the fan connector.  FreeBSD has no RP1 pinctrl
+	 * driver, so we set FUNCSEL directly.  Map, write, unmap.
+	 */
+	{
+		void *gpio_map;
+		volatile uint32_t *ctrl_reg;
+		uint32_t ctrl_val;
+		bus_addr_t gpio_phys = RP1_GPIO_BASE_PHYS;
+		bool gpio_from_fdt;
+
+		/*
+		 * reg[0] of gpio@d0000 is IO_BANK, which carries the
+		 * CTRL registers this uses; reg[1] is SYS_RIO and
+		 * reg[2] PADS_BANK (rp1_gpio maps all three).
+		 */
+		gpio_from_fdt = bcm2712_fdt_rp1(rp1_gpio_fdt_paths,
+		    "raspberrypi,rp1-gpio", 0, &gpio_phys, NULL);
+
+		gpio_map = pmap_mapdev_attr(gpio_phys,
+		    RP1_GPIO_MAP_SIZE, VM_MEMATTR_DEVICE);
+		if (gpio_map != NULL) {
+			ctrl_reg = (volatile uint32_t *)
+			    ((uintptr_t)gpio_map +
+			    RP1_GPIO_CTRL_OFFSET(RP1_GPIO_FAN_PIN));
+			ctrl_val = *ctrl_reg;
+			printf("bcm2712: GPIO%d CTRL before=0x%x "
+			    "(FUNCSEL=%u) via 0x%lx (%s)\n",
+			    RP1_GPIO_FAN_PIN, ctrl_val,
+			    ctrl_val & RP1_GPIO_FUNCSEL_MASK,
+			    (unsigned long)gpio_phys,
+			    gpio_from_fdt ? "from FDT" :
+			    "hardcoded, no FDT node");
+			ctrl_val &= ~RP1_GPIO_FUNCSEL_MASK;
+			ctrl_val |= RP1_GPIO_FSEL_ALT0;
+			*ctrl_reg = ctrl_val;
+			printf("bcm2712: GPIO%d CTRL after=0x%x "
+			    "(FUNCSEL=%u, pwm1)\n", RP1_GPIO_FAN_PIN,
+			    ctrl_val, ctrl_val & RP1_GPIO_FUNCSEL_MASK);
+			pmap_unmapdev(gpio_map, RP1_GPIO_MAP_SIZE);
+		} else {
+			printf("bcm2712: Cannot map GPIO registers\n");
+		}
+	}
+
+	/* Only now may bcm2712_pwm_*() use the window. */
+	mtx_lock(&sc->mtx);
+	sc->pwm_vaddr = pwm_vaddr;
+	sc->pwm_mapped = 1;
+	mtx_unlock(&sc->mtx);
+}
+
 /* Module event handler for bcm2712 initialization */
 static int
 bcm2712_modevent(module_t mod __unused, int event, void *arg __unused)
 {
 	struct bcm2712_softc *sc;
 	struct sysctl_oid *tree, *thermal_tree;
-	bus_addr_t avs_phys, pwm_phys;
-	bool avs_from_fdt, pwm_from_fdt;
+	bus_addr_t avs_phys;
+	bool avs_from_fdt;
 	int error = 0;
 
 	switch (event) {
@@ -478,137 +726,20 @@ bcm2712_modevent(module_t mod __unused, int event, void *arg __unused)
 		    avs_from_fdt ? "from FDT" : "hardcoded, no FDT node");
 
 		/*
-		 * Map RP1 PWM1, via the pcie2 outbound window.  RP1 has two
-		 * PWM blocks and the unit address is what tells them apart:
-		 * pwm@9c000 is PWM1, which drives the fan, and is the one the
-		 * Pi 5 device tree marks status = "okay"; pwm@98000 (PWM0) is
-		 * disabled.  Hence located by path, with compatible as a guard.
+		 * The RP1 half -- PWM1, its clock, GPIO45 -- needs RP1 to be
+		 * reachable.  Under ACPI, EDK2 has already placed it.  On an FDT
+		 * boot, RP1 is a PCI device, so this waits until the rp1 PCI
+		 * driver has attached and published its BAR (M2 phase 2).
 		 */
-		pwm_phys = RP1_PWM1_BASE_PHYS;
-		pwm_from_fdt = bcm2712_fdt_rp1(pwm1_fdt_paths,
-		    "raspberrypi,rp1-pwm", 0, &pwm_phys, NULL);
-
-		sc->pwm_vaddr = pmap_mapdev_attr(pwm_phys, RP1_PWM_MAP_SIZE,
-		    VM_MEMATTR_DEVICE);
-
-		if (sc->pwm_vaddr == NULL) {
-			printf("bcm2712: Cannot map PWM memory at 0x%lx\n",
-			    (unsigned long)pwm_phys);
-			pmap_unmapdev(sc->avs_vaddr, 0x1000);
-			sc->avs_vaddr = NULL;
-			sc->avs_mapped = 0;
-			mtx_destroy(&sc->thermal_mtx);
-			mtx_destroy(&sc->mtx);
-			free(sc, M_BCM2712);
-			return (ENXIO);
-		}
-
-		sc->pwm_mapped = 1;
-		printf("bcm2712: RP1 PWM1 controller mapped at 0x%lx (%s)\n",
-		    (unsigned long)pwm_phys,
-		    pwm_from_fdt ? "from FDT" : "hardcoded, no FDT node");
-
-		/*
-		 * Enable RP1 PWM1 clock (clock index 18).
-		 *
-		 * The RP1 PWM clocks are *disabled* at reset; without enabling
-		 * them all register writes to the PWM peripheral appear to
-		 * succeed but the channel output never changes — the fan
-		 * free-runs at boot default (~100% speed from its pull-up).
-		 *
-		 * Configuration: 50 MHz xosc → ÷8.138 → 6.144 MHz PWM clock.
-		 * The Linux DTB specifies assigned-clock-rates = <6144000> for
-		 * this peripheral; it yields range=255 ticks at 24 kHz so the
-		 * speed register (0-255) maps directly to duty ticks.
-		 *
-		 * Sequence per clk-rp1.c: set source first (no ENABLE), load
-		 * divisors, then set ENABLE.
-		 */
-		{
-			void *clk_map;
-			volatile uint32_t *clk;
-			bus_addr_t clk_phys = RP1_CLK_BASE_PHYS;
-			bool clk_from_fdt;
-
-			clk_from_fdt = bcm2712_fdt_rp1(rp1_clk_fdt_paths,
-			    "raspberrypi,rp1-clocks", 0, &clk_phys, NULL);
-
-			clk_map = pmap_mapdev_attr(clk_phys,
-			    RP1_CLK_MAP_SIZE, VM_MEMATTR_DEVICE);
-			if (clk_map != NULL) {
-				clk = (volatile uint32_t *)clk_map;
-				/* 1. Select source (aux/xosc), disable first */
-				clk[RP1_CLK_PWM1_CTRL / 4] =
-				    RP1_CLK_PWM1_CTRL_SRC;
-				/* 2. Integer divisor */
-				clk[RP1_CLK_PWM1_DIV_INT / 4] =
-				    RP1_CLK_PWM1_DIV_INT_VAL;
-				/* 3. Fractional divisor */
-				clk[RP1_CLK_PWM1_DIV_FRAC / 4] =
-				    RP1_CLK_PWM1_DIV_FRAC_VAL;
-				/* 4. Enable */
-				clk[RP1_CLK_PWM1_CTRL / 4] =
-				    RP1_CLK_PWM1_CTRL_ENA;
-				printf("bcm2712: RP1 PWM1 clock enabled "
-				    "(CTRL=0x%08x DIV_INT=%u) at 0x%lx (%s)\n",
-				    clk[RP1_CLK_PWM1_CTRL / 4],
-				    clk[RP1_CLK_PWM1_DIV_INT / 4],
-				    (unsigned long)clk_phys,
-				    clk_from_fdt ? "from FDT" :
-				    "hardcoded, no FDT node");
-				pmap_unmapdev(clk_map, RP1_CLK_MAP_SIZE);
-			} else {
-				printf("bcm2712: WARNING: cannot map RP1 "
-				    "clock controller at 0x%lx\n",
-				    (unsigned long)clk_phys);
-			}
-		}
-
-		/*
-		 * Mux GPIO45 to PWM1 function (ALT0) so the PWM signal
-		 * reaches the fan connector.  FreeBSD has no RP1 pinctrl
-		 * driver, so we set FUNCSEL directly.  Map, write, unmap.
-		 */
-		{
-			void *gpio_map;
-			volatile uint32_t *ctrl_reg;
-			uint32_t ctrl_val;
-			bus_addr_t gpio_phys = RP1_GPIO_BASE_PHYS;
-			bool gpio_from_fdt;
-
-			/*
-			 * reg[0] of gpio@d0000 is IO_BANK, which carries the
-			 * CTRL registers this uses; reg[1] is SYS_RIO and
-			 * reg[2] PADS_BANK (rp1_gpio maps all three).
-			 */
-			gpio_from_fdt = bcm2712_fdt_rp1(rp1_gpio_fdt_paths,
-			    "raspberrypi,rp1-gpio", 0, &gpio_phys, NULL);
-
-			gpio_map = pmap_mapdev_attr(gpio_phys,
-			    RP1_GPIO_MAP_SIZE, VM_MEMATTR_DEVICE);
-			if (gpio_map != NULL) {
-				ctrl_reg = (volatile uint32_t *)
-				    ((uintptr_t)gpio_map +
-				    RP1_GPIO_CTRL_OFFSET(RP1_GPIO_FAN_PIN));
-				ctrl_val = *ctrl_reg;
-				printf("bcm2712: GPIO%d CTRL before=0x%x "
-				    "(FUNCSEL=%u) via 0x%lx (%s)\n",
-				    RP1_GPIO_FAN_PIN, ctrl_val,
-				    ctrl_val & RP1_GPIO_FUNCSEL_MASK,
-				    (unsigned long)gpio_phys,
-				    gpio_from_fdt ? "from FDT" :
-				    "hardcoded, no FDT node");
-				ctrl_val &= ~RP1_GPIO_FUNCSEL_MASK;
-				ctrl_val |= RP1_GPIO_FSEL_ALT0;
-				*ctrl_reg = ctrl_val;
-				printf("bcm2712: GPIO%d CTRL after=0x%x "
-				    "(FUNCSEL=%u, pwm1)\n", RP1_GPIO_FAN_PIN,
-				    ctrl_val, ctrl_val & RP1_GPIO_FUNCSEL_MASK);
-				pmap_unmapdev(gpio_map, RP1_GPIO_MAP_SIZE);
-			} else {
-				printf("bcm2712: Cannot map GPIO registers\n");
-			}
-		}
+		if (bcm2712_rp1_needs_pci()) {
+			if (bcm2712_rp1_defer(bcm2712_rp1_setup, sc) != 0)
+				printf("bcm2712: WARNING: cannot defer the RP1 "
+				    "PWM set-up; the fan will not be driven\n");
+			else if (!sc->pwm_mapped)
+				printf("bcm2712: RP1 PWM, clock and GPIO45 set-up "
+				    "deferred until the rp1 PCI driver attaches\n");
+		} else
+			bcm2712_rp1_setup(sc);
 
 		/* Initialize PWM channels */
 		for (int i = 0; i < BCM2712_PWM_NCHANNELS; i++) {
@@ -709,6 +840,7 @@ bcm2712_modevent(module_t mod __unused, int event, void *arg __unused)
 			break;
 
 		bcm2712_sc = NULL;
+		bcm2712_rp1_undefer(bcm2712_rp1_setup, sc);
 
 		/* Stop periodic updates */
 		mtx_lock(&sc->thermal_mtx);

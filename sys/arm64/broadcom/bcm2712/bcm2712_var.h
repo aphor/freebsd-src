@@ -186,4 +186,19 @@ int bcm2712_pwm_set_config(u_int channel, u_int period, u_int duty);
 int bcm2712_pwm_enable(u_int channel, bool enable);
 uint32_t bcm2712_read_fan_rpm(void);
 
+/*
+ * RP1's peripheral window.
+ *
+ * On the ACPI lane EDK2 places RP1 where the device tree's RP1 addresses
+ * say, and nothing below is used.  On the FDT lane RP1 is a PCI device
+ * enumerated by bcm2712_pcib, its BAR1 lands wherever PCI puts it, and RP1
+ * registers cannot be touched until then.  The rp1 PCI driver publishes
+ * BAR1 when it attaches; drivers that need RP1 defer to that.
+ */
+void bcm2712_rp1_publish(bus_addr_t pa, bus_size_t size);
+bool bcm2712_rp1_bar(bus_addr_t *pa, bus_size_t *size);
+int bcm2712_rp1_defer(void (*fn)(void *), void *arg);
+void bcm2712_rp1_undefer(void (*fn)(void *), void *arg);
+bool bcm2712_rp1_needs_pci(void);
+
 #endif /* _BCM2712_VAR_H_ */

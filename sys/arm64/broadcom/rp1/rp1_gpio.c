@@ -551,3 +551,4 @@ extern driver_t gpiobus_driver;
 DRIVER_MODULE(gpiobus, rp1_gpio, gpiobus_driver, 0, 0);
 MODULE_VERSION(rp1_gpio, 1);
 MODULE_DEPEND(rp1_gpio, gpiobus, 1, 1, 1);
+MODULE_DEPEND(rp1_gpio, bcm2712, 1, 1, 1);	/* bcm2712_fdt.h */

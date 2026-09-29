@@ -52,19 +52,19 @@
 include		"RPI5-FDT"
 ident		RPI5-FDT-NORP1
 
-# Everything below is behind PCIe, which is not enumerated on this lane.
-# Each of these maps a hardcoded RP1 physical address and reads it without
-# first checking that the bus answers, so against a dead fabric they return
-# 0xdeaddead and eventually raise an SError.
-nodevice	bcm2712			# RP1 PWM at 0x1f0009c000, GPIO, clocks
-nodevice	rpi5_fan		# depends on bcm2712 for PWM and thermal
+# Everything below is behind PCIe.  Each of these maps an RP1 address at
+# load time, before bcm2712_pcib and rp1 have attached, so against an
+# unprogrammed window they return 0xdeaddead and eventually raise an SError.
+#
+# M2 phase 2 (2026-09-28): bcm2712 and rpi5_fan are back.  bcm2712 maps the
+# SoC's AVS thermal sensor at load and defers its RP1 half (PWM1, its clock,
+# GPIO45) until the rp1 PCI driver publishes BAR1.  The drivers below follow
+# as they are converted the same way.
 nodevice	bcm2712_pcie		# RP1 GEM interrupt router, 0x1f00100000
 nodevice	rp1_gpio		# RP1 IO_BANK/RIO/PADS at 0x1f000d0000
 nodevice	rp1_eth			# RP1 Cadence GEM at 0x1f00100000
 nodevice	rp1_pcie2_recon		# PCIe2 host bridge at 0x1000120000
 
-# NOTE: the AVS thermal sensor at 0x107d542000 is native and worked fine in
-# the failing boot, but it is reached through bcm2712 which has to go.  So
-# this kernel has no temperature reading and no fan control, and the firmware
-# left the fan at RPM 194 of 208 on the boot that panicked.  Do not leave a
-# board running this configuration unattended.
+# NOTE: until 2026-09-28 bcm2712 was removed here too, so this kernel had no
+# temperature reading and no fan control.  It needs the freebsd-pcie2 overlay
+# (rpi5_modules.git doc/DT_OVERLAYS.md) for the fan to be driven.

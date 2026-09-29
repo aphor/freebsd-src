@@ -631,6 +631,7 @@ arm64/broadcom/bcm2712/rpi_fw.c			optional rpi_fw fdt
 arm64/broadcom/bcm2712/bcm2712_pcib.c			optional bcm2712_pcib fdt pci
 arm64/broadcom/bcm2712/brcmstb_reset.c			optional brcmstb_reset fdt hwreset
 arm64/broadcom/bcm2712/brcmstb_gpio.c			optional brcmstb_gpio gpio fdt
+arm64/broadcom/rp1/rp1.c				optional rp1 bcm2712 fdt pci
 arm64/broadcom/rp1/rp1_eth.c				optional rp1_eth fdt
 arm64/broadcom/rp1/rp1_eth_cfg.c			optional rp1_eth fdt
 arm64/broadcom/rp1/rp1_gpio.c				optional rp1_gpio gpio fdt

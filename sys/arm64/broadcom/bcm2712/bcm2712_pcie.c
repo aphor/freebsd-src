@@ -585,3 +585,4 @@ MODULE_DEPEND(bcm2712_pcie, acpi, 1, 1, 1);
 DRIVER_MODULE(bcm2712_pcie, nexus, bcm2712_pcie_driver, NULL, NULL);
 #endif
 MODULE_VERSION(bcm2712_pcie, 1);
+MODULE_DEPEND(bcm2712_pcie, bcm2712, 1, 1, 1);	/* bcm2712_fdt.h */

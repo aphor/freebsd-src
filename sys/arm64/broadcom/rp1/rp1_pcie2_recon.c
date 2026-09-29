@@ -461,3 +461,4 @@ static moduledata_t rp1_pcie2_recon_mdata = {
 DECLARE_MODULE(rp1_pcie2_recon, rp1_pcie2_recon_mdata,
     SI_SUB_DRIVERS, SI_ORDER_ANY);
 MODULE_VERSION(rp1_pcie2_recon, 1);
+MODULE_DEPEND(rp1_pcie2_recon, bcm2712, 1, 1, 1);	/* bcm2712_fdt.h */

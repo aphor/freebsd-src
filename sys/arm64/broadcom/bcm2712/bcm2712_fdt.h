@@ -55,6 +55,11 @@
  *
  * Callers pass the fallback they already had and ignore a failure, so a board
  * whose device tree does not describe a block keeps working exactly as before.
+ *
+ * On the FDT lane (M2 phase 2), RP1 is a PCI device and BAR1 lands wherever
+ * PCI puts it, not where rp1's ranges assume.  Once the rp1 PCI driver has
+ * published BAR1 (bcm2712_rp1_bar()), hop 2 is replaced: the address is
+ * BAR1's CPU address plus the offset into BAR1 that hop 1 gives.
  */
 
 #ifndef _BCM2712_FDT_H_
@@ -182,6 +187,8 @@ bcm2712_fdt_reg_cells(phandle_t node, int regno, uint64_t *addr, uint64_t *size)
  * applied.  ToDo: if a board ever appears whose /axi ranges are not identity
  * over the RP1 window, this needs a third hop.
  */
+bool bcm2712_rp1_bar(bus_addr_t *pa, bus_size_t *size);	/* bcm2712.c */
+
 static inline bool
 bcm2712_fdt_rp1_reg(phandle_t node, int regno, bus_addr_t *pa,
     bus_size_t *size)
@@ -189,7 +196,9 @@ bcm2712_fdt_rp1_reg(phandle_t node, int regno, bus_addr_t *pa,
 	phandle_t rp1, rc;
 	pcell_t r[64];
 	uint32_t na_rp1, ns_rp1, na_rc, ns_rc, na_par;
-	uint64_t addr, sz, cbase, pbase, psize, pci_addr, cpu;
+	uint64_t addr, sz, cbase, pbase, psize, pci_addr, pci_base0, cpu;
+	bus_addr_t bar_pa;
+	bus_size_t bar_size;
 	uint32_t space;
 	int len, n, i, e, c;
 	bool hop1 = false;
@@ -212,6 +221,7 @@ bcm2712_fdt_rp1_reg(phandle_t node, int regno, bus_addr_t *pa,
 	len = OF_getencprop(rp1, "ranges", r, sizeof(r));
 	n = (len > 0) ? len / (int)sizeof(r[0]) : 0;
 	e = (int)(na_rp1 + na_rc + ns_rp1);
+	pci_base0 = 0;
 	for (i = 0; e > 0 && i + e <= n; i += e) {
 		c = i;
 		cbase = 0;
@@ -221,6 +231,8 @@ bcm2712_fdt_rp1_reg(phandle_t node, int regno, bus_addr_t *pa,
 		pci_addr = 0;
 		for (unsigned k = 1; k < na_rc; k++)
 			pci_addr = (pci_addr << 32) | r[c + k];
+		if (i == 0)
+			pci_base0 = pci_addr;	/* where the DT puts BAR1 */
 		c += na_rc;
 		psize = 0;
 		for (unsigned k = 0; k < ns_rp1; k++)
@@ -233,6 +245,16 @@ bcm2712_fdt_rp1_reg(phandle_t node, int regno, bus_addr_t *pa,
 	}
 	if (!hop1)
 		return (false);
+
+	/* FDT lane: BAR1 is where PCI put it, as the rp1 driver found it. */
+	if (bcm2712_rp1_bar(&bar_pa, &bar_size)) {
+		if (pci_addr < pci_base0 || pci_addr - pci_base0 >= bar_size)
+			return (false);
+		*pa = bar_pa + (pci_addr - pci_base0);
+		if (size != NULL)
+			*size = sz;
+		return (true);
+	}
 
 	/* Hop 2: root complex ranges, child (PCI, 3 cells) -> parent (axi). */
 	get_addr_props_compat(OF_parent(rc), &na_par, NULL);
