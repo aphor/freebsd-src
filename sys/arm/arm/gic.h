@@ -44,6 +44,24 @@
 #define	GIC_MAXCPU	MAXCPU
 #endif
 
+/*
+ * Public so that MSI controllers outside gic.c, which allocate from a range
+ * of SPIs with GIC_ALLOC_MSI()/GIC_ALLOC_MSIX(), can tell which interrupt
+ * they were given.
+ */
+struct gic_irqsrc {
+	struct intr_irqsrc	gi_isrc;
+	uint32_t		gi_irq;
+	enum intr_polarity	gi_pol;
+	enum intr_trigger	gi_trig;
+#define GI_FLAG_EARLY_EOI	(1 << 0)
+#define GI_FLAG_MSI		(1 << 1) /* This interrupt source should only */
+					 /* be used for MSI/MSI-X interrupts */
+#define GI_FLAG_MSI_USED	(1 << 2) /* This irq is already allocated */
+					 /* for a MSI/MSI-X interrupt */
+	u_int			gi_flags;
+};
+
 struct arm_gic_softc {
 	device_t		gic_dev;
 	void *			gic_intrhand;
