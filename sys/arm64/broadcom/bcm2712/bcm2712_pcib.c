@@ -30,14 +30,14 @@
  *    mirrors Linux pcie-brcmstb.c struct pcie_cfg_data.  The BCM2711
  *    values that bcm2838_pci.c hardcodes are given beside each field.
  *
- * Divergences from bcm2838_pci.c, as of phase 3:
+ * Divergences from bcm2838_pci.c, as of phase 5:
  *
  *  BCM2712 differs:
- *   - Each controller is either adopted with the link the firmware trained
- *     (phase 1; loader tunable hw.bcm2712_pcib.adopt, DT unit addresses,
- *     default "1000120000", PCIe2), or brought up from reset as Linux does
- *     (phase 3; hw.bcm2712_pcib.reset, default "1000110000", PCIe1), or
- *     left untouched.  The VPU firmware logs "PCI1 reset" at hand-off (and
+ *   - Each controller is brought up from reset as Linux does (phases 3
+ *     and 5; loader tunable hw.bcm2712_pcib.reset, DT unit addresses,
+ *     default both, "1000110000 1000120000"), or adopted with the link the
+ *     firmware trained (phase 1; hw.bcm2712_pcib.adopt, default empty; it
+ *     takes precedence), or left untouched.  The VPU firmware logs "PCI1 reset" at hand-off (and
  *     "PCI2 reset" unless config.txt sets pciex4_reset=0), yet the bridge
  *     resets in brcm,brcmstb-reset all read deasserted, so no register
  *     tells us which controllers are safe to read without a reset.
@@ -47,9 +47,11 @@
  *   - From reset: the bridge reset, the 54 MHz refclk PLL set-up over MDIO,
  *     PERST# and link training follow Linux pcie-brcmstb.c for
  *     bcm2712_cfg (see "Phase 3" below).  The shared "rescal" calibration
- *     is run only if hw.bcm2712_pcib.rescal is set, because the adopted
- *     PCIe2 shares it.  PERST# is not released unless RAM is mapped 1:1
- *     for DMA.
+ *     is run only if hw.bcm2712_pcib.rescal is set: both links train on the
+ *     firmware's calibration.  PERST# is not released unless RAM is mapped
+ *     1:1 for DMA.  For PCIe2 the VDM QoS map (brcm,vdm-qos-map) is set up
+ *     too.  RP1 keeps its firmware and PLLs through PERST# (M2 phase 5),
+ *     so config.txt need not keep PCIe2's link (pciex4_reset=0).
  *   - UBUS/AXI error replies are suppressed so that failed reads return
  *     all ones (Linux brcm_pcie_post_setup_bcm2712).  Without this, config
  *     reads of empty slots return 0xdeaddead, which enumeration would take
@@ -73,9 +75,10 @@
  *     the tag keeps DMA out of the shadowed RAM, by bouncing
  *     (bcm2838_pci.c limits DMA with its tag too, for another reason).
  *
- *  Adopted controllers only -- a link the firmware already trained:
- *   - No bridge reset, PHY/PLL set-up, PERST# or link training (phase 5
- *     does that for PCIe2); if the link is not up, attach fails.
+ *  Adopted controllers only -- a link the firmware already trained
+ *  (pciex4_reset=0; not used by default since phase 5):
+ *   - No bridge reset, PHY/PLL set-up, PERST# or link training; if the
+ *     link is not up, attach fails.
  *
  *  Duplicate, merge as-is: the config-space window, the outbound window
  *  encoders, the root port class fix-up, the bridge window relocation.
@@ -196,6 +199,13 @@
 #define MISC_CTRL_1_EN_VDM_QOS_CONTROL		(1u << 5)
 #define REG_UBUS_TIMEOUT			0x40a8
 #define REG_TC_QUEUE_TO_QOS_MAP(x)		(0x4160 - (x) * 4)
+#define REG_VDM_PRIORITY_TO_QOS_MAP_HI		0x4164	/* VDM priorities 8-15 */
+#define REG_VDM_PRIORITY_TO_QOS_MAP_LO		0x4168	/* VDM priorities 0-7 */
+#define REG_RC_TL_VDM_CTL0			0x0a20
+#define RC_TL_VDM_CTL0_VDM_ENABLED		(1u << 16)
+#define RC_TL_VDM_CTL0_VDM_IGNORETAG		(1u << 17)
+#define RC_TL_VDM_CTL0_VDM_IGNOREVNDRID		(1u << 18)
+#define REG_RC_TL_VDM_CTL1			0x0a0c
 #define REG_AXI_INTF_CTRL			0x416c
 #define AXI_EN_RCLK_QOS_ARRAY_FIX		(1u << 13)
 #define AXI_EN_QOS_UPDATE_TIMING_FIX		(1u << 12)
@@ -245,9 +255,11 @@ static const struct bcm2712_pcib_cfg bcm2712_cfg = {
 
 /*
  * Controllers phase 1 may adopt, by DT unit address, separated by spaces or
- * commas.  See the comment at the top.
+ * commas; a controller listed here is adopted even if .reset lists it too.
+ * Empty by default since phase 5 (PCIe2 until then, with pciex4_reset=0).
+ * See the comment at the top.
  */
-static char bcm2712_pcib_adopt[128] = "1000120000";
+static char bcm2712_pcib_adopt[128] = "";
 static SYSCTL_NODE(_hw, OID_AUTO, bcm2712_pcib, CTLFLAG_RD | CTLFLAG_MPSAFE,
     NULL, "BCM2712 PCIe host controller");
 SYSCTL_STRING(_hw_bcm2712_pcib, OID_AUTO, adopt, CTLFLAG_RDTUN,
@@ -255,23 +267,26 @@ SYSCTL_STRING(_hw_bcm2712_pcib, OID_AUTO, adopt, CTLFLAG_RDTUN,
     "DT unit addresses of the controllers phase 1 may adopt");
 
 /*
- * Controllers phase 3 brings up from reset, in the same form.  PCIe1, the
- * NVMe slot, by default.  It needs the freebsd-pcie1 overlay: without a
- * 1:1 RAM mapping, attach leaves the device in PERST#.  To leave PCIe1
- * untouched, set it at the loader to a value that names no controller, e.g.
- * "none".  (Its multi-page NVMe reads were wrong
- * until nvme(4) kept bounced page offsets and the overlays reserved the RAM
- * the windows shadow: rpi5_modules.git doc/M2_PCIE_HOST.md, phase 3.)
+ * Controllers brought up from reset, in the same form: both by default,
+ * PCIe1 (the NVMe slot, phase 3) and PCIe2 (RP1, phase 5).  Each needs its
+ * freebsd-pcieN overlay: without a 1:1 RAM mapping, attach leaves the device
+ * in PERST#.  To leave one untouched, drop it from the list at the loader;
+ * "1000110000" alone gives a boot without RP1 (no fan PWM, Ethernet, USB or
+ * RP1 GPIO), the way back if PCIe2's bring-up fails.  (PCIe1's multi-page
+ * NVMe reads were wrong until nvme(4) kept bounced page offsets and the
+ * overlays reserved the RAM the windows shadow: rpi5_modules.git
+ * doc/M2_PCIE_HOST.md, phase 3.)
  */
-static char bcm2712_pcib_reset[128] = "1000110000";
+static char bcm2712_pcib_reset[128] = "1000110000 1000120000";
 SYSCTL_STRING(_hw_bcm2712_pcib, OID_AUTO, reset, CTLFLAG_RDTUN,
     bcm2712_pcib_reset, sizeof(bcm2712_pcib_reset),
-    "DT unit addresses of the controllers phase 3 brings up from reset");
+    "DT unit addresses of the controllers brought up from reset");
 
 /*
  * Run the shared SATA/PCIe resistor calibration before a bring-up from
- * reset, as Linux does.  Off by default: it is shared with the adopted
- * PCIe2, whose link the firmware trained after its own calibration.
+ * reset, as Linux does.  Off by default: the firmware calibrates at boot
+ * (as found: CTRL 0x800, STATUS 0), both links train on that, and it is
+ * shared, so rerunning it for one controller would disturb the other.
  */
 static int bcm2712_pcib_rescal;
 SYSCTL_INT(_hw_bcm2712_pcib, OID_AUTO, rescal, CTLFLAG_RDTUN,
@@ -1058,7 +1073,7 @@ bcm2712_pcib_post_setup(struct bcm2712_pcib_softc *sc)
 	static const uint8_t regs[] =
 	    { 0x16, 0x17, 0x18, 0x19, 0x1b, 0x1c, 0x1e };
 	phandle_t node;
-	uint8_t qos_map[4];
+	uint8_t qos_map[8];
 	uint32_t tmp;
 	int error, i;
 
@@ -1118,21 +1133,43 @@ bcm2712_pcib_post_setup(struct bcm2712_pcib_softc *sc)
 	bcm2712_pcib_set_reg(sc, REG_MISC_CTRL_1, tmp);
 
 	/*
-	 * brcm,fifo-qos-map: a QoS for each quartile of FIFO level, the same
-	 * for every TC.  Linux's alternative, brcm,vdm-qos-map, is not
-	 * implemented; it is only reported.
+	 * brcm,fifo-qos-map (PCIe1): a QoS for each quartile of FIFO level,
+	 * the same for every TC.  brcm,vdm-qos-map (PCIe2, RP1): the device
+	 * sends vendor-defined messages naming a priority 0-7, mapped here to
+	 * an AXI QoS; the same map for 8-15, since Linux notes that
+	 * forwarding panic priorities separately is broken.  As Linux
+	 * brcm_pcie_post_setup_bcm2712().  The firmware sets the latter up
+	 * when it trains PCIe2 (MISC_CTRL_1 had EN_VDM_QOS_CONTROL, adopted);
+	 * from reset it is ours to do (phase 5).
 	 */
 	node = ofw_bus_get_node(sc->dev);
-	if (OF_getprop(node, "brcm,fifo-qos-map", qos_map,
-	    sizeof(qos_map)) == sizeof(qos_map)) {
+	if (OF_getprop(node, "brcm,fifo-qos-map", qos_map, 4) == 4) {
 		tmp = 0;
 		for (i = 0; i < 4; i++)
 			tmp |= (uint32_t)(qos_map[i] & 0x0f) << (i * 4);
 		for (i = 0; i < 8; i++)
 			bcm2712_pcib_set_reg(sc, REG_TC_QUEUE_TO_QOS_MAP(i), tmp);
-	} else if (OF_hasprop(node, "brcm,vdm-qos-map"))
-		device_printf(sc->dev, "brcm,vdm-qos-map is not implemented; "
-		    "ignored\n");
+	} else if (OF_getprop(node, "brcm,vdm-qos-map", qos_map, 8) == 8) {
+		tmp = bcm2712_pcib_read_reg(sc, REG_MISC_CTRL_1);
+		tmp |= MISC_CTRL_1_EN_VDM_QOS_CONTROL;
+		bcm2712_pcib_set_reg(sc, REG_MISC_CTRL_1, tmp);
+
+		tmp = 0;
+		for (i = 0; i < 8; i++)
+			tmp |= (uint32_t)(qos_map[i] & 0x0f) << (i * 4);
+		bcm2712_pcib_set_reg(sc, REG_VDM_PRIORITY_TO_QOS_MAP_LO, tmp);
+		bcm2712_pcib_set_reg(sc, REG_VDM_PRIORITY_TO_QOS_MAP_HI, tmp);
+
+		/* Match vendor ID 0, and count VDMs even if not matched. */
+		bcm2712_pcib_set_reg(sc, REG_RC_TL_VDM_CTL1, 0);
+		tmp = bcm2712_pcib_read_reg(sc, REG_RC_TL_VDM_CTL0);
+		tmp |= RC_TL_VDM_CTL0_VDM_ENABLED |
+		    RC_TL_VDM_CTL0_VDM_IGNORETAG |
+		    RC_TL_VDM_CTL0_VDM_IGNOREVNDRID;
+		bcm2712_pcib_set_reg(sc, REG_RC_TL_VDM_CTL0, tmp);
+		device_printf(sc->dev, "VDM QoS map 0x%08x\n",
+		    bcm2712_pcib_read_reg(sc, REG_VDM_PRIORITY_TO_QOS_MAP_LO));
+	}
 
 	return (0);
 }

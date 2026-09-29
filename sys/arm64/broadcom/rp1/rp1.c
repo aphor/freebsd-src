@@ -88,6 +88,7 @@
  * RP1's PCIe endpoint block in BAR1 (Linux rp1.c RP1_PCIE_APBS_BASE), with
  * the usual RP1 atomic aliases: +0x800 sets bits, +0xc00 clears them.
  */
+#define	RP1_CLOCKS		0x018000	/* clocks@18000 */
 #define	RP1_PCIE_APBS		0x108000
 #define	RP1_REG_SET		0x800
 #define	RP1_REG_CLR		0xc00
@@ -590,6 +591,26 @@ rp1_attach(device_t dev)
 
 	/* RP1's GEM, xHCI and DMA controllers master the bus. */
 	pci_enable_busmaster(dev);
+
+	/*
+	 * RP1's system PLL and clock, as found (Linux clk-rp1.c offsets).
+	 * Our RP1 drivers assume what the firmware set up (sys 200 MHz);
+	 * Linux reprograms it from the DT.  Logged to compare an adopted
+	 * link with one brought up from reset (M2 phase 5).
+	 */
+	device_printf(dev, "clocks as found: PLL_SYS CS=%#x PWR=%#x "
+	    "FBDIV=%u.%#x PRIM=%#x SEC=%#x; CLK_SYS CTRL=%#x DIV=%#x "
+	    "SEL=%#x; CLK_ETH CTRL=%#x\n",
+	    bus_read_4(sc->bar1, RP1_CLOCKS + 0x08000),
+	    bus_read_4(sc->bar1, RP1_CLOCKS + 0x08004),
+	    bus_read_4(sc->bar1, RP1_CLOCKS + 0x08008),
+	    bus_read_4(sc->bar1, RP1_CLOCKS + 0x0800c),
+	    bus_read_4(sc->bar1, RP1_CLOCKS + 0x08010),
+	    bus_read_4(sc->bar1, RP1_CLOCKS + 0x08014),
+	    bus_read_4(sc->bar1, RP1_CLOCKS + 0x00014),
+	    bus_read_4(sc->bar1, RP1_CLOCKS + 0x00018),
+	    bus_read_4(sc->bar1, RP1_CLOCKS + 0x00020),
+	    bus_read_4(sc->bar1, RP1_CLOCKS + 0x00064));
 
 	device_printf(dev, "BAR1 (peripherals): PCIe 0x%jx -> CPU 0x%jx, "
 	    "%ju KB\n", (uintmax_t)rman_get_start(sc->bar1), (uintmax_t)pa,
