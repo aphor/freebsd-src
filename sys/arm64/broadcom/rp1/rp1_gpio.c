@@ -119,12 +119,21 @@ rp1_gpio_parse_pin_names(struct rp1_gpio_softc *sc, phandle_t node)
 static int rp1_gpio_detach(device_t dev);	/* forward declaration */
 
 /*
- * identify: called by nexus bus_generic_probe.  Creates a device_t if the
- * gpio@d0000 FDT node is present and no instance already exists.
+ * identify: called by nexus, and on the FDT lane by rp1pci, the RP1 PCI
+ * driver.  Creates a device_t if the gpio@d0000 FDT node is present and no
+ * instance already exists.  Under ACPI, EDK2 has placed RP1 and this
+ * attaches to nexus as it always has; on an FDT boot RP1's registers
+ * cannot be found until rp1pci has published BAR1, so it attaches below
+ * rp1pci instead (M2 phase 2, rpi5_modules.git doc/M2_PCIE_HOST.md).
  */
 static void
 rp1_gpio_identify(driver_t *driver, device_t parent)
 {
+	bool under_rp1pci;
+
+	under_rp1pci = strcmp(device_get_name(parent), "rp1pci") == 0;
+	if (under_rp1pci != bcm2712_rp1_needs_pci())
+		return;
 	if (rp1_gpio_find_node() == -1)
 		return;
 	if (device_find_child(parent, "rp1_gpio", -1) != NULL)
@@ -546,6 +555,7 @@ static driver_t rp1_gpio_driver = {
 };
 
 DRIVER_MODULE(rp1_gpio, nexus, rp1_gpio_driver, 0, 0);
+DRIVER_MODULE(rp1_gpio, rp1pci, rp1_gpio_driver, 0, 0);
 /* Register gpiobus as a child driver so device_probe_and_attach succeeds. */
 extern driver_t gpiobus_driver;
 DRIVER_MODULE(gpiobus, rp1_gpio, gpiobus_driver, 0, 0);

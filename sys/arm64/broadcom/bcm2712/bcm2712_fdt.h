@@ -187,7 +187,9 @@ bcm2712_fdt_reg_cells(phandle_t node, int regno, uint64_t *addr, uint64_t *size)
  * applied.  ToDo: if a board ever appears whose /axi ranges are not identity
  * over the RP1 window, this needs a third hop.
  */
-bool bcm2712_rp1_bar(bus_addr_t *pa, bus_size_t *size);	/* bcm2712.c */
+/* bcm2712.c; see bcm2712_var.h */
+bool bcm2712_rp1_bar(bus_addr_t *pa, bus_size_t *size);
+bool bcm2712_rp1_needs_pci(void);
 
 static inline bool
 bcm2712_fdt_rp1_reg(phandle_t node, int regno, bus_addr_t *pa,

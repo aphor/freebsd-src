@@ -14,8 +14,10 @@
  * run then (rpi5_modules.git doc/M2_PCIE_HOST.md, phase 2).
  *
  * Linux drivers/mfd/rp1.c also maps BAR1 (pci_resource_start(pdev, 1)) and
- * is the parent of RP1's functions.  Here they remain separate drivers that
- * find their registers through bcm2712_fdt.h.
+ * is the parent of RP1's functions.  Here the function drivers still find
+ * their registers through bcm2712_fdt.h, but those that are newbus drivers
+ * attach below rp1pci on the FDT lane (their identify methods pick nexus
+ * or rp1pci by lane), so that they come up after BAR1 is published.
  *
  * On the ACPI lane EDK2 does not expose RP1 as a PCI device, so this
  * driver never attaches there.
@@ -97,6 +99,10 @@ rp1_attach(device_t dev)
 	    (uintmax_t)size / 1024);
 
 	bcm2712_rp1_publish(pa, size);
+
+	/* RP1's function drivers, now that their registers can be found. */
+	bus_identify_children(dev);
+	bus_attach_children(dev);
 	return (0);
 }
 
@@ -112,6 +118,17 @@ static device_method_t rp1_methods[] = {
 	DEVMETHOD(device_probe,		rp1_probe),
 	DEVMETHOD(device_attach,	rp1_attach),
 	DEVMETHOD(device_detach,	rp1_detach),
+
+	/* Bus interface, for RP1's function drivers. */
+	DEVMETHOD(bus_add_child,	bus_generic_add_child),
+	DEVMETHOD(bus_print_child,	bus_generic_print_child),
+	DEVMETHOD(bus_alloc_resource,	bus_generic_alloc_resource),
+	DEVMETHOD(bus_release_resource,	bus_generic_release_resource),
+	DEVMETHOD(bus_activate_resource, bus_generic_activate_resource),
+	DEVMETHOD(bus_deactivate_resource, bus_generic_deactivate_resource),
+	DEVMETHOD(bus_setup_intr,	bus_generic_setup_intr),
+	DEVMETHOD(bus_teardown_intr,	bus_generic_teardown_intr),
+	DEVMETHOD(bus_get_dma_tag,	bus_generic_get_dma_tag),
 
 	DEVMETHOD_END
 };

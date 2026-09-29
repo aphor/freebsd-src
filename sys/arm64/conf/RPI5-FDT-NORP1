@@ -58,10 +58,10 @@ ident		RPI5-FDT-NORP1
 #
 # M2 phase 2 (2026-09-28): bcm2712 and rpi5_fan are back.  bcm2712 maps the
 # SoC's AVS thermal sensor at load and defers its RP1 half (PWM1, its clock,
-# GPIO45) until the rp1 PCI driver publishes BAR1.  The drivers below follow
-# as they are converted the same way.
+# GPIO45) until the rp1 PCI driver publishes BAR1.  rp1_gpio is back too: on
+# an FDT boot it attaches below rp1pci.  The drivers below follow as they
+# are converted the same way.
 nodevice	bcm2712_pcie		# RP1 GEM interrupt router, 0x1f00100000
-nodevice	rp1_gpio		# RP1 IO_BANK/RIO/PADS at 0x1f000d0000
 nodevice	rp1_eth			# RP1 Cadence GEM at 0x1f00100000
 nodevice	rp1_pcie2_recon		# PCIe2 host bridge at 0x1000120000
 
