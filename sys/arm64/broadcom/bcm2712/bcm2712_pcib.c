@@ -178,6 +178,8 @@
 #define MISC_CTRL_CFG_READ_UR_MODE		0x2000
 #define MISC_CTRL_MAX_BURST_SIZE_SHIFT		20
 #define MISC_CTRL_MAX_BURST_SIZE_MASK		0x300000
+#define MISC_CTRL_SCB0_SIZE_SHIFT		27
+#define MISC_CTRL_SCB0_SIZE_MASK		0xf8000000
 #define MAX_BURST_SIZE_512			0x2	/* not 2711, 7278 or BMIPS */
 #define REG_RC_CONFIG_RETRY_TIMEOUT		0x405c
 #define REG_PCIE_CTRL				0x4064
@@ -265,6 +267,23 @@ static int bcm2712_pcib_rescal;
 SYSCTL_INT(_hw_bcm2712_pcib, OID_AUTO, rescal, CTLFLAG_RDTUN,
     &bcm2712_pcib_rescal, 0,
     "Run rescal before bringing a controller up from reset");
+
+/*
+ * MISC_CTRL fields a bring-up from reset writes, where Linux and EDK2 differ
+ * (rpi5_modules.git doc/M2_PCIE_HOST.md, phase 3).  The defaults are Linux's
+ * for 7712; EDK2's effective values are burst 0, rcb64 0, scb0_size 0x15.
+ * -1 leaves a field as the bridge reset left it.  For finding which of them
+ * breaks multi-page NVMe reads; not a permanent interface.
+ */
+static int bcm2712_pcib_burst = MAX_BURST_SIZE_512;
+SYSCTL_INT(_hw_bcm2712_pcib, OID_AUTO, burst, CTLFLAG_RDTUN,
+    &bcm2712_pcib_burst, 0, "MISC_CTRL MAX_BURST_SIZE field from reset");
+static int bcm2712_pcib_rcb64 = 1;
+SYSCTL_INT(_hw_bcm2712_pcib, OID_AUTO, rcb64, CTLFLAG_RDTUN,
+    &bcm2712_pcib_rcb64, 0, "MISC_CTRL RCB_64B_MODE from reset");
+static int bcm2712_pcib_scb0_size = -1;
+SYSCTL_INT(_hw_bcm2712_pcib, OID_AUTO, scb0_size, CTLFLAG_RDTUN,
+    &bcm2712_pcib_scb0_size, 0, "MISC_CTRL SCB0_SIZE field from reset");
 
 struct bcm2712_pcib_softc {
 	struct generic_pcie_fdt_softc	base;
@@ -940,10 +959,25 @@ bcm2712_pcib_setup(struct bcm2712_pcib_softc *sc)
 
 	tmp = bcm2712_pcib_read_reg(sc, REG_MISC_CTRL);
 	tmp |= MISC_CTRL_SCB_ACCESS_EN | MISC_CTRL_CFG_READ_UR_MODE |
-	    MISC_CTRL_RCB_MPS_MODE | MISC_CTRL_RCB_64B_MODE;
-	tmp &= ~MISC_CTRL_MAX_BURST_SIZE_MASK;
-	tmp |= MAX_BURST_SIZE_512 << MISC_CTRL_MAX_BURST_SIZE_SHIFT;
+	    MISC_CTRL_RCB_MPS_MODE;
+	if (bcm2712_pcib_rcb64 == 0)
+		tmp &= ~MISC_CTRL_RCB_64B_MODE;
+	else if (bcm2712_pcib_rcb64 > 0)
+		tmp |= MISC_CTRL_RCB_64B_MODE;
+	if (bcm2712_pcib_burst >= 0) {
+		tmp &= ~MISC_CTRL_MAX_BURST_SIZE_MASK;
+		tmp |= (bcm2712_pcib_burst << MISC_CTRL_MAX_BURST_SIZE_SHIFT) &
+		    MISC_CTRL_MAX_BURST_SIZE_MASK;
+	}
+	if (bcm2712_pcib_scb0_size >= 0) {
+		tmp &= ~MISC_CTRL_SCB0_SIZE_MASK;
+		tmp |= (bcm2712_pcib_scb0_size << MISC_CTRL_SCB0_SIZE_SHIFT) &
+		    MISC_CTRL_SCB0_SIZE_MASK;
+	}
 	bcm2712_pcib_set_reg(sc, REG_MISC_CTRL, tmp);
+	device_printf(sc->dev, "MISC_CTRL now 0x%08x (burst %d, rcb64 %d, "
+	    "scb0_size %d; -1 = as the reset left it)\n", tmp,
+	    bcm2712_pcib_burst, bcm2712_pcib_rcb64, bcm2712_pcib_scb0_size);
 
 	if ((bcm2712_pcib_read_reg(sc, REG_BRIDGE_STATE) &
 	    BRIDGE_STATE_PORT) == 0) {
@@ -1194,6 +1228,70 @@ bcm2712_pcib_start_link(struct bcm2712_pcib_softc *sc)
 }
 
 /*
+ * The controller's own registers that bear on DMA, where Linux, EDK2 and the
+ * firmware differ (rpi5_modules.git doc/M2_PCIE_HOST.md, phase 3): logged as
+ * found at attach, and readable later under dev.pcib.N.regs.
+ */
+static const struct {
+	const char	*name;
+	bus_size_t	reg;	/* 0: cfg->hard_debug */
+} bcm2712_pcib_regs[] = {
+	{ "misc_ctrl",		REG_MISC_CTRL },
+	{ "hard_debug",		0 },
+	{ "axi_intf_ctrl",	REG_AXI_INTF_CTRL },
+	{ "misc_ctrl_1",	REG_MISC_CTRL_1 },
+	{ "ubus_ctrl",		REG_UBUS_CTRL },
+	{ "ubus_timeout",	REG_UBUS_TIMEOUT },
+	{ "rc_config_retry_timeout", REG_RC_CONFIG_RETRY_TIMEOUT },
+	{ "pcie_ctrl",		REG_PCIE_CTRL },
+	{ "pl_phy_ctl_15",	REG_PL_PHY_CTL_15 },
+	{ "vendor_specific_reg1", REG_VENDOR_SPECIFIC_REG1 },
+};
+
+static bus_size_t
+bcm2712_pcib_regs_offset(struct bcm2712_pcib_softc *sc, u_int i)
+{
+
+	return (bcm2712_pcib_regs[i].reg != 0 ? bcm2712_pcib_regs[i].reg :
+	    sc->cfg->hard_debug);
+}
+
+static int
+bcm2712_pcib_reg_sysctl(SYSCTL_HANDLER_ARGS)
+{
+	struct bcm2712_pcib_softc *sc;
+	uint32_t val;
+
+	sc = arg1;
+	val = bcm2712_pcib_read_reg(sc, bcm2712_pcib_regs_offset(sc, arg2));
+	return (sysctl_handle_int(oidp, &val, 0, req));
+}
+
+static void
+bcm2712_pcib_regs_report(struct bcm2712_pcib_softc *sc)
+{
+	struct sysctl_ctx_list *ctx;
+	struct sysctl_oid *tree;
+	u_int i;
+
+	device_printf(sc->dev, "as found:");
+	for (i = 0; i < nitems(bcm2712_pcib_regs); i++)
+		printf(" %s=0x%08x", bcm2712_pcib_regs[i].name,
+		    bcm2712_pcib_read_reg(sc, bcm2712_pcib_regs_offset(sc, i)));
+	printf("\n");
+
+	ctx = device_get_sysctl_ctx(sc->dev);
+	tree = SYSCTL_ADD_NODE(ctx,
+	    SYSCTL_CHILDREN(device_get_sysctl_tree(sc->dev)), OID_AUTO, "regs",
+	    CTLFLAG_RD | CTLFLAG_MPSAFE, NULL, "Controller registers (live)");
+	for (i = 0; i < nitems(bcm2712_pcib_regs); i++)
+		SYSCTL_ADD_PROC(ctx, SYSCTL_CHILDREN(tree), OID_AUTO,
+		    bcm2712_pcib_regs[i].name,
+		    CTLTYPE_UINT | CTLFLAG_RD | CTLFLAG_MPSAFE, sc, i,
+		    bcm2712_pcib_reg_sysctl, "IU", "");
+}
+
+/*
  * The DT "bridge" reset's state, for a controller left untouched.  Reading
  * it touches only the reset controller.
  */
@@ -1289,6 +1387,8 @@ bcm2712_pcib_attach(device_t dev)
 	hardware_rev = bcm2712_pcib_read_reg(sc, REG_CONTROLLER_HW_REV) & 0xffff;
 	device_printf(dev, "hardware identifies as revision 0x%x.\n",
 	    hardware_rev);
+	/* Adopted: as the firmware left it.  From reset: after the bridge reset. */
+	bcm2712_pcib_regs_report(sc);
 
 	if (adopt) {
 		/*
