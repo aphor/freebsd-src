@@ -180,6 +180,7 @@ struct rp1eth_softc {
 	u_int			rxoverruns;
 	u_int			rxnobufs;
 	u_int			rxdmamapfails;
+	u_int			intr_resched;	/* see cgem_work_pending() */
 	uint64_t		rxhighbufs;	/* buffers above 4 GB */
 
 	/* Transmit descriptor ring. */
@@ -278,6 +279,7 @@ static void rp1eth_update_speed(struct rp1eth_softc *);
 static int  cgem_intr_filter(void *);
 static void cgem_intr_task(void *, int);
 static void cgem_gem_poll(void *);
+static bool cgem_work_pending(struct rp1eth_softc *);
 static void cgem_recv(struct rp1eth_softc *);
 static void cgem_clean_tx(struct rp1eth_softc *);
 static void cgem_start_locked(if_t);
@@ -1012,6 +1014,30 @@ reschedule:
  * Uses callout_init(CALLOUT_MPSAFE) — acquires sc_mtx itself.
  * Safe to stop from interrupt context (cgem_intr_filter) without the lock.
  * ----------------------------------------------------------------------- */
+/*
+ * Has the GEM completed a receive or transmit descriptor we have not
+ * processed?  Completions while the interrupt sources are disabled raise no
+ * interrupt when they are re-enabled; Linux macb_rx_poll() says so and
+ * checks the ring after re-enabling, and so does cgem_intr_task().  Without
+ * the check a full receive ring stalls for good: the GEM then reports only
+ * RX_USED_READ, and refilling needs frames handed back first (M2 phase 4b,
+ * rpi5_modules.git doc/M2_PCIE_HOST.md).
+ */
+static bool
+cgem_work_pending(struct rp1eth_softc *sc)
+{
+
+	CGEM_ASSERT_LOCKED(sc);
+
+	if (sc->rxring_queued > 0 &&
+	    (sc->rxring[sc->rxring_tl_ptr].addr & CGEM_RXDESC_OWN) != 0)
+		return (true);
+	if (sc->txring_queued > 0 &&
+	    (sc->txring[sc->txring_tl_ptr].ctl & CGEM_TXDESC_USED) != 0)
+		return (true);
+	return (false);
+}
+
 static void
 cgem_gem_poll(void *arg)
 {
@@ -1029,7 +1055,7 @@ cgem_gem_poll(void *arg)
 	    (CGEM_INTR_RX_COMPLETE | CGEM_INTR_TX_USED_READ |
 	     CGEM_INTR_HRESP_NOT_OK | CGEM_INTR_RX_USED_READ |
 	     CGEM_INTR_RX_OVERRUN);
-	if (ist != 0) {
+	if (ist != 0 || cgem_work_pending(sc)) {
 		WR4(sc, CGEM_INTR_DIS, CGEM_INTR_ALL);
 		atomic_set_32(&sc->intr_pending, ist);
 		taskqueue_enqueue(taskqueue_fast, &sc->intr_task);
@@ -1084,8 +1110,12 @@ cgem_intr_task(void *arg, int pending __unused)
 
 	WR4(sc, CGEM_INTR_STAT, ist);		/* write-to-clear latched bits */
 
-	if ((ist & CGEM_INTR_RX_COMPLETE) != 0)
-		cgem_recv(sc);
+	/*
+	 * Always, not only on RX_COMPLETE: completions can arrive without it
+	 * (see cgem_work_pending()), and on RX_USED_READ the ring is full of
+	 * frames that only cgem_recv() can hand back.
+	 */
+	cgem_recv(sc);
 	cgem_clean_tx(sc);
 
 	if ((ist & CGEM_INTR_HRESP_NOT_OK) != 0) {
@@ -1111,12 +1141,24 @@ cgem_intr_task(void *arg, int pending __unused)
 	    CGEM_INTR_HRESP_NOT_OK | CGEM_INTR_RX_USED_READ |
 	    CGEM_INTR_RX_OVERRUN);
 
+	/* Completed while the sources were off: no interrupt will say so. */
+	if (cgem_work_pending(sc)) {
+		WR4(sc, CGEM_INTR_DIS, CGEM_INTR_ALL);
+		sc->intr_resched++;
+		taskqueue_enqueue(taskqueue_fast, &sc->intr_task);
+		CGEM_UNLOCK(sc);
+		return;
+	}
+
 	/*
-	 * Re-arm the 5ms fallback poll.  IACK cannot generate per-packet MSIs
-	 * on this platform (shared SPI-229 kept permanently asserted by USB),
-	 * so gem_poll is the sole mechanism for catching packets that arrive
-	 * while interrupts were masked.  Arm unconditionally; cgem_intr_filter
-	 * cancels it if a real interrupt fires first.
+	 * Re-arm the 5ms fallback poll.  On the FDT lane since M2 phase 4b
+	 * the GEM has its own RP1 MSI-X vector, which rp1pci acknowledges
+	 * after cgem_intr_filter, so a source still pending when INTR_EN is
+	 * written above raises a new interrupt and the poll is only a
+	 * backstop.  Before that, and on the ACPI lane, no GEM interrupt
+	 * reached the CPU and the poll was the only mechanism.  Arm
+	 * unconditionally; cgem_intr_filter cancels it if a real interrupt
+	 * fires first.
 	 */
 	callout_reset(&sc->gem_poll, MAX(1, hz / 200), cgem_gem_poll, sc);
 
@@ -1459,6 +1501,9 @@ rp1eth_add_sysctls(struct rp1eth_softc *sc, struct sysctl_oid *parent)
 	    &sc->rxnobufs, 0, "Receive ring empty events");
 	SYSCTL_ADD_UINT(ctx, child, OID_AUTO, "_rxdmamapfails", CTLFLAG_RD,
 	    &sc->rxdmamapfails, 0, "Receive DMA map failures");
+	SYSCTL_ADD_UINT(ctx, child, OID_AUTO, "_intr_resched", CTLFLAG_RD,
+	    &sc->intr_resched, 0,
+	    "Interrupt task reruns for work completed while masked");
 	SYSCTL_ADD_UINT(ctx, child, OID_AUTO, "_txfull", CTLFLAG_RD,
 	    &sc->txfull, 0, "Transmit ring full events");
 	SYSCTL_ADD_UINT(ctx, child, OID_AUTO, "_txdmamapfails", CTLFLAG_RD,
