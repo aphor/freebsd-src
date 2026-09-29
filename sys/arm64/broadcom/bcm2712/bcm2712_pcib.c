@@ -36,8 +36,8 @@
  *   - Each controller is either adopted with the link the firmware trained
  *     (phase 1; loader tunable hw.bcm2712_pcib.adopt, DT unit addresses,
  *     default "1000120000", PCIe2), or brought up from reset as Linux does
- *     (phase 3; hw.bcm2712_pcib.reset, empty by default, "1000110000" for
- *     PCIe1), or left untouched.  The VPU firmware logs "PCI1 reset" at hand-off (and
+ *     (phase 3; hw.bcm2712_pcib.reset, default "1000110000", PCIe1), or
+ *     left untouched.  The VPU firmware logs "PCI1 reset" at hand-off (and
  *     "PCI2 reset" unless config.txt sets pciex4_reset=0), yet the bridge
  *     resets in brcm,brcmstb-reset all read deasserted, so no register
  *     tells us which controllers are safe to read without a reset.
@@ -255,12 +255,15 @@ SYSCTL_STRING(_hw_bcm2712_pcib, OID_AUTO, adopt, CTLFLAG_RDTUN,
     "DT unit addresses of the controllers phase 1 may adopt");
 
 /*
- * Controllers phase 3 brings up from reset, in the same form.  None by
- * default: PCIe1 (the NVMe slot, "1000110000") trains, but multi-page
- * reads from the NVMe return the wrong data (rpi5_modules.git
- * doc/M2_PCIE_HOST.md, phase 3), so it is only set by hand, to test.
+ * Controllers phase 3 brings up from reset, in the same form.  PCIe1, the
+ * NVMe slot, by default.  It needs the freebsd-pcie1 overlay: without a
+ * 1:1 RAM mapping, attach leaves the device in PERST#.  To leave PCIe1
+ * untouched, set it at the loader to a value that names no controller, e.g.
+ * "none".  (Its multi-page NVMe reads were wrong
+ * until nvme(4) kept bounced page offsets and the overlays reserved the RAM
+ * the windows shadow: rpi5_modules.git doc/M2_PCIE_HOST.md, phase 3.)
  */
-static char bcm2712_pcib_reset[128] = "";
+static char bcm2712_pcib_reset[128] = "1000110000";
 SYSCTL_STRING(_hw_bcm2712_pcib, OID_AUTO, reset, CTLFLAG_RDTUN,
     bcm2712_pcib_reset, sizeof(bcm2712_pcib_reset),
     "DT unit addresses of the controllers phase 3 brings up from reset");
@@ -279,8 +282,9 @@ SYSCTL_INT(_hw_bcm2712_pcib, OID_AUTO, rescal, CTLFLAG_RDTUN,
  * MISC_CTRL fields a bring-up from reset writes, where Linux and EDK2 differ
  * (rpi5_modules.git doc/M2_PCIE_HOST.md, phase 3).  The defaults are Linux's
  * for 7712; EDK2's effective values are burst 0, rcb64 0, scb0_size 0x15.
- * -1 leaves a field as the bridge reset left it.  For finding which of them
- * breaks multi-page NVMe reads; not a permanent interface.
+ * -1 leaves a field as the bridge reset left it.  Added to find which of
+ * them broke multi-page NVMe reads; none did (the cause was bounced page
+ * offsets).  Kept for experiments; not a permanent interface.
  */
 static int bcm2712_pcib_burst = MAX_BURST_SIZE_512;
 SYSCTL_INT(_hw_bcm2712_pcib, OID_AUTO, burst, CTLFLAG_RDTUN,
