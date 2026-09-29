@@ -98,7 +98,8 @@ rp1_attach(device_t dev)
 	    "%ju KB\n", (uintmax_t)rman_get_start(sc->bar1), (uintmax_t)pa,
 	    (uintmax_t)size / 1024);
 
-	bcm2712_rp1_publish(pa, size);
+	/* RP1's bus masters' tags descend from this one. */
+	bcm2712_rp1_publish(pa, size, bus_get_dma_tag(dev));
 
 	/* RP1's function drivers, now that their registers can be found. */
 	bus_identify_children(dev);

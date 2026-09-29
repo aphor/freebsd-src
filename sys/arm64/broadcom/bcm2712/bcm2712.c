@@ -289,6 +289,7 @@ MTX_SYSINIT(bcm2712_rp1, &bcm2712_rp1_mtx, "bcm2712 rp1", MTX_DEF);
 static bool bcm2712_rp1_published;
 static bus_addr_t bcm2712_rp1_pa;
 static bus_size_t bcm2712_rp1_size;
+static bus_dma_tag_t bcm2712_rp1_dmat;
 static struct bcm2712_rp1_deferred bcm2712_rp1_queue[BCM2712_RP1_DEFER_MAX];
 static int bcm2712_rp1_nqueued;
 
@@ -301,7 +302,7 @@ bcm2712_rp1_needs_pci(void)
 }
 
 void
-bcm2712_rp1_publish(bus_addr_t pa, bus_size_t size)
+bcm2712_rp1_publish(bus_addr_t pa, bus_size_t size, bus_dma_tag_t dmat)
 {
 	struct bcm2712_rp1_deferred run[BCM2712_RP1_DEFER_MAX];
 	int i, n;
@@ -309,6 +310,7 @@ bcm2712_rp1_publish(bus_addr_t pa, bus_size_t size)
 	mtx_lock(&bcm2712_rp1_mtx);
 	bcm2712_rp1_pa = pa;
 	bcm2712_rp1_size = size;
+	bcm2712_rp1_dmat = dmat;
 	bcm2712_rp1_published = true;
 	n = bcm2712_rp1_nqueued;
 	memcpy(run, bcm2712_rp1_queue, n * sizeof(run[0]));
@@ -333,6 +335,18 @@ bcm2712_rp1_bar(bus_addr_t *pa, bus_size_t *size)
 	}
 	mtx_unlock(&bcm2712_rp1_mtx);
 	return (published);
+}
+
+/* The parent tag for RP1's bus masters; NULL until published. */
+bus_dma_tag_t
+bcm2712_rp1_dma_tag(void)
+{
+	bus_dma_tag_t dmat;
+
+	mtx_lock(&bcm2712_rp1_mtx);
+	dmat = bcm2712_rp1_dmat;
+	mtx_unlock(&bcm2712_rp1_mtx);
+	return (dmat);
 }
 
 /* Run fn(arg) once RP1 is published: now, if it already is. */

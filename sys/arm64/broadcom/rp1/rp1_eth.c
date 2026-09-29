@@ -85,6 +85,7 @@
 #include "rp1_eth_hw.h"
 #include "rp1_eth_var.h"	/* for rp1eth_attach_args */
 #include <arm64/broadcom/bcm2712/bcm2712_pcie.h>
+#include <arm64/broadcom/bcm2712/bcm2712_var.h>	/* bcm2712_rp1_dma_tag() */
 
 /* NOTE: CGEM64 is deliberately NOT defined; 32-bit descriptors only. */
 
@@ -387,18 +388,28 @@ cgem_setup_descs(struct rp1eth_softc *sc)
 	/*
 	 * Descriptor DMA tag: 32-bit address space only.
 	 * RP1 PCIe2 inbound window maps BCM2712 DRAM at 32-bit addresses.
+	 *
+	 * On the FDT lane the parent is RP1's bus DMA tag, which keeps DMA
+	 * out of the RAM that the PCIe outbound window shadows (see
+	 * bcm2712_pcib.c).  On the ACPI lane there is none, and NULL is used
+	 * as before.
 	 */
-	err = bus_dma_tag_create(NULL, 1, 0,
+	err = bus_dma_tag_create(bcm2712_rp1_dma_tag(), 1, 0,
 	    BUS_SPACE_MAXADDR_32BIT, BUS_SPACE_MAXADDR, NULL, NULL,
 	    desc_rings_size, 1, desc_rings_size, 0,
 	    busdma_lock_mutex, &sc->sc_mtx, &sc->desc_dma_tag);
 	if (err)
 		return (err);
 
-	/* Mbuf DMA tag: same 32-bit constraint. */
-	err = bus_dma_tag_create(NULL, 1, 0,
+	/*
+	 * Mbuf DMA tag: same 32-bit constraint, same parent.  Its maps are
+	 * created under sc_mtx (cgem_fill_rqueue, cgem_start_locked), so
+	 * BUS_DMA_ALLOCNOW sets up the bounce zone now instead: creating one
+	 * adds sysctls, which may sleep.
+	 */
+	err = bus_dma_tag_create(bcm2712_rp1_dma_tag(), 1, 0,
 	    BUS_SPACE_MAXADDR_32BIT, BUS_SPACE_MAXADDR, NULL, NULL,
-	    MCLBYTES, TX_MAX_DMA_SEGS, MCLBYTES, 0,
+	    MCLBYTES, TX_MAX_DMA_SEGS, MCLBYTES, BUS_DMA_ALLOCNOW,
 	    busdma_lock_mutex, &sc->sc_mtx, &sc->mbuf_dma_tag);
 	if (err)
 		return (err);
@@ -1185,6 +1196,12 @@ cgem_init_locked(struct rp1eth_softc *sc)
 	if_setdrvflagbits(sc->ifp, IFF_DRV_RUNNING, IFF_DRV_OACTIVE);
 
 	callout_reset(&sc->tick_ch, hz, rp1eth_tick, sc);
+
+	/*
+	 * Start the 5 ms fallback poll now, not after the first interrupt,
+	 * so that receive never waits on one arriving.
+	 */
+	callout_reset(&sc->gem_poll, MAX(1, hz / 200), cgem_gem_poll, sc);
 }
 
 static void

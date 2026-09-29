@@ -16,12 +16,14 @@
  * rp1_eth's ISR if the GEM fired.
  *
  * Discovery is by Device Tree, and registers are mapped by physical address,
- * the same way every other driver in this set reaches RP1.  The driver
- * registers under nexus rather than simplebus because, until there is a
- * brcm,bcm2712-pcie host controller driver, nothing enumerates the RP1
- * subtree of the device tree and there is no simplebus over it.  The FDT is
- * still available for discovery: machdep.c installs and initialises OFW
- * unconditionally, before bus_probe() picks a bus method.
+ * the same way every other driver in this set reaches RP1.  On the FDT lane
+ * RP1 is a PCI device behind bcm2712_pcib, and this driver attaches below
+ * rp1pci, the RP1 PCI driver, once it has published BAR1: RP1's windows are
+ * found relative to BAR1 (bcm2712_fdt.h), and the interrupt is RP1's INTA,
+ * found through the root complex's interrupt-map (rpi5_modules.git
+ * doc/M2_PCIE_HOST.md, phase 2).  The FDT is available for discovery on
+ * both lanes: machdep.c installs and initialises OFW unconditionally, before
+ * bus_probe() picks a bus method.
  *
  * This replaces an earlier ACPI attachment, which matched a _HID of "BCM2712"
  * injected into the RP1B scope by a hand-written DSDT override in
@@ -77,39 +79,30 @@
 				 CGEM_INT_HRESP_NOT_OK | CGEM_INT_RX_OVERRUN)
 
 /*
- * RP1 register windows, as CPU physical addresses seen through the PCIe2
- * outbound window the VPU firmware programmed.  These match
- * RP1_ETH_MAC_BASE_PHYS / RP1_ETH_CFG_BASE_PHYS in rp1_eth_var.h; the
- * derivation is documented there.
+ * RP1 register windows, as offsets into RP1's peripheral BAR (BAR1).  On the
+ * ACPI lane the GEM window comes from _CRS instead (EDK2 places BAR1 at CPU
+ * 0x1f_00000000; see RP1_ETH_MAC_BASE_PHYS in rp1_eth_var.h).  On the FDT
+ * lane the GEM is resolved from its node against the published BAR1, and
+ * GEM_MAC_OFFSET is the fallback.
+ *
+ * eth_cfg, at 0x104000, is not mapped here: nothing in this driver uses it.
+ * No device tree describes it; see rp1_eth_cfg.c.
  */
-#define GEM_MAC_PHYS		0x1f00100000UL	/* ethernet@100000 */
+#define GEM_MAC_OFFSET		0x100000	/* ethernet@100000 */
 #define GEM_MAC_SIZE		0x1000
-/*
- * ToDo: ETH_CFG_PHYS cannot come from the device tree -- no device tree
- * describes the block.  There is no eth_cfg node in the firmware-supplied
- * DTB, and none upstream: in Linux's rp1.dtsi ethernet@100000 is the only
- * node in the area and its reg is <0xc0 0x40100000 0x0 0x4000>, which ends
- * exactly where eth_cfg begins.  Linux has no use for it (macb(4) does not
- * touch the RGMII glue, RP1 firmware owns it), so there is no binding to
- * adopt.  If one appears -- an eth_cfg@104000 node, or a second reg entry on
- * ethernet@100000 with reg-names = "mac", "cfg" -- resolve it here.
- */
-#define ETH_CFG_PHYS		0x1f00104000UL	/* eth_cfg, no FDT node */
-#define ETH_CFG_SIZE		0x1000
 
 /*
  * RP1 PCIE_CFG registers for MSIx IACK re-arm (RP-008370-DS-1 ss6.2).
  *
- * ToDo: also absent from every device tree.  RP1's PCIe endpoint config
- * block at 0x108000 has no node in the vendor DTB or in Linux's rp1.dtsi --
- * on Linux the MSI-X plumbing is the host controller's business, so nothing
- * needs to name it.  A brcm,bcm2712-pcie host driver (the PCIe milestone)
- * would make this mapping unnecessary rather than resolvable: the GEM would
- * become a real PCI device and its MSI would be re-armed by the MSI
- * controller.  Until then this address is derived, not read: RP1 window base
- * 0x1f_00000000 + RP1 offset 0x108000.
+ * ToDo: absent from every device tree.  RP1's PCIe endpoint config block at
+ * 0x108000 has no node in the vendor DTB or in Linux's rp1.dtsi: on Linux,
+ * drivers/mfd/rp1.c is RP1's interrupt controller and reaches the block
+ * through BAR1 itself, so nothing needs to name it.  Until rp1pci does the
+ * same, the address is derived: BAR1 + 0x108000, where BAR1 is EDK2's
+ * 0x1f_00000000 on the ACPI lane and the published BAR1 on the FDT lane.
  */
-#define PCIE_CFG_PHYS       0x1f00108000UL  /* no FDT node; see above */
+#define PCIE_CFG_PHYS       0x1f00108000UL  /* ACPI lane; see above */
+#define PCIE_CFG_OFFSET     0x108000        /* in RP1's peripheral BAR */
 #define PCIE_CFG_SIZE       0x200
 #define PCIE_CFG_MSIX_CFG_0 0x008   /* MSIX_CFG_n base; vector n at offset +n*4 */
 #define MSIX_CFG_IACK       (1u << 2) /* SC: write 1 to re-arm vector */
@@ -129,9 +122,11 @@
  *
  * pcie@1000120000 in the Pi 5 device tree routes INTA to GIC SPI 229:
  *   interrupt-map = <0 0 0 1 &gicv2 GIC_SPI 229 IRQ_TYPE_LEVEL_HIGH>, ...
- * We do not walk that map, because without a host controller driver there is
- * no PCI device to map an INTx pin for.  We name the line directly, which is
- * what the ACPI DSDT override also did (GSI 261 = the same SPI).
+ * The ACPI DSDT override named the same line as GSI 261, and the GEM's
+ * interrupts arrive on it there, so RP1 raises them as INTA.  RP1 advertises
+ * INTA in its Interrupt Pin register, and its MSI-X capability is left
+ * disabled on both lanes.  This driver is not RP1's PCI driver, so it looks
+ * the INTA entry up itself rather than through pci_alloc_resource().
  *
  * GIC-400 uses three interrupt cells: <type, number, flags>.
  */
@@ -176,10 +171,14 @@ static u_int rp1_int_eth = RP1_INT_ETH;
 
 struct bcm2712_pcie_softc {
 	device_t	 dev;
-	struct resource	*mac_res;	/* SYS_RES_MEMORY rid 0: GEM MAC */
-	struct resource	*cfg_res;	/* SYS_RES_MEMORY rid 1: eth_cfg */
+	struct resource	*mac_res;	/* SYS_RES_MEMORY rid 0: GEM MAC (ACPI) */
+	struct resource	*cfg_res;	/* SYS_RES_MEMORY rid 1: eth_cfg (ACPI) */
 	struct resource	*irq_res;	/* SYS_RES_IRQ    rid 0: shared */
 	void		*intr_cookie;
+	bus_space_tag_t	 mac_bst;	/* GEM MAC, however it was mapped */
+	bus_space_handle_t mac_bsh;
+	int		 mac_mapped;	/* by bus_space_map (FDT) */
+	bus_addr_t	 mac_phys;
 	bus_space_tag_t	 pciecfg_bst;
 	bus_space_handle_t pciecfg_bsh;
 	int		 pciecfg_mapped;
@@ -243,7 +242,7 @@ bcm2712_pcie_filter(void *arg)
 	void *filter_arg;
 	uint32_t istat;
 
-	istat = bus_read_4(sc->mac_res, CGEM_INT_STATUS);
+	istat = bus_space_read_4(sc->mac_bst, sc->mac_bsh, CGEM_INT_STATUS);
 	if ((istat & CGEM_INT_ANY) == 0)
 		return (FILTER_STRAY);
 
@@ -334,6 +333,7 @@ bcm2712_pcie_probe(device_t dev)
 	return (BUS_PROBE_DEFAULT);
 }
 #else
+/* Called by rp1pci, after it has published BAR1. */
 static void
 bcm2712_pcie_identify(driver_t *driver, device_t parent)
 {
@@ -416,47 +416,22 @@ bcm2712_pcie_map_gic_spi(device_t dev, u_int spi)
 }
 #endif /* !DEV_ACPI */
 
+/*
+ * Map the GEM MAC window and RP1's PCIE_CFG block.  Under ACPI the MAC window
+ * is the device's first _CRS memory resource.  On the FDT lane both are
+ * inside BAR1, which rp1pci owns, so they are mapped directly by address.
+ */
 static int
-bcm2712_pcie_attach(device_t dev)
+bcm2712_pcie_map_regs(device_t dev, struct bcm2712_pcie_softc *sc)
 {
-	struct bcm2712_pcie_softc *sc = device_get_softc(dev);
-	int rid, error;
-#ifndef DEV_ACPI
-	bus_addr_t gem_phys;
-	u_int irq;
+	bus_addr_t pciecfg_phys;
+#ifdef DEV_ACPI
+	int rid;
+#else
+	bus_addr_t bar_pa;
 #endif
 
-	sc->dev = dev;
-
-	bcm2712_pcie_resolve_int_eth(dev);
-
-#ifndef DEV_ACPI
-	/*
-	 * Nothing enumerated this device from the device tree, so it has no
-	 * resources yet; name them here.  nexus keeps a resource list per
-	 * child (bus_generic_rl_set_resource), so bus_alloc_resource_any()
-	 * below finds them.  Under ACPI the _CRS supplies both windows and the
-	 * interrupt instead, and all of this is skipped.
-	 */
-	gem_phys = GEM_MAC_PHYS;
-	if (!bcm2712_fdt_rp1(bcm2712_pcie_gem_paths, "raspberrypi,rp1-gem", 0,
-	    &gem_phys, NULL))
-		device_printf(dev, "GEM reg not resolvable from FDT, "
-		    "using 0x%lx\n", (unsigned long)gem_phys);
-	error = bus_set_resource(dev, SYS_RES_MEMORY, 0, gem_phys,
-	    GEM_MAC_SIZE);
-	if (error != 0) {
-		device_printf(dev, "cannot set GEM MAC resource: %d\n", error);
-		return (error);
-	}
-	error = bus_set_resource(dev, SYS_RES_MEMORY, 1, ETH_CFG_PHYS,
-	    ETH_CFG_SIZE);
-	if (error != 0)
-		device_printf(dev, "warning: cannot set eth_cfg resource: %d\n",
-		    error);
-#endif
-
-	/* Map GEM MAC registers (memory resource 0) */
+#ifdef DEV_ACPI
 	rid = 0;
 	sc->mac_res = bus_alloc_resource_any(dev, SYS_RES_MEMORY, &rid,
 	    RF_ACTIVE);
@@ -464,19 +439,9 @@ bcm2712_pcie_attach(device_t dev)
 		device_printf(dev, "cannot map GEM MAC registers\n");
 		return (ENXIO);
 	}
-
-	/* Map RP1 PCIE_CFG for MSIx IACK re-arm (direct physical map) */
-	sc->pciecfg_bst = rman_get_bustag(sc->mac_res);
-	if (bus_space_map(sc->pciecfg_bst, PCIE_CFG_PHYS, PCIE_CFG_SIZE, 0,
-	    &sc->pciecfg_bsh) == 0) {
-		sc->pciecfg_mapped = 1;
-		g_pciecfg_bst = sc->pciecfg_bst;
-		g_pciecfg_bsh = sc->pciecfg_bsh;
-		g_pciecfg_mapped = 1;
-	} else {
-		device_printf(dev, "warning: cannot map PCIE_CFG, IACK disabled\n");
-		sc->pciecfg_mapped = 0;
-	}
+	sc->mac_bst = rman_get_bustag(sc->mac_res);
+	sc->mac_bsh = rman_get_bushandle(sc->mac_res);
+	sc->mac_phys = rman_get_start(sc->mac_res);
 
 	/* Map eth_cfg registers (memory resource 1) — optional for now */
 	rid = 1;
@@ -485,24 +450,114 @@ bcm2712_pcie_attach(device_t dev)
 	if (sc->cfg_res == NULL)
 		device_printf(dev, "warning: cannot map eth_cfg registers\n");
 
-	/* Allocate the shared interrupt (GIC SPI 229). */
+	pciecfg_phys = PCIE_CFG_PHYS;
+#else
+	if (!bcm2712_rp1_bar(&bar_pa, NULL)) {
+		device_printf(dev, "RP1's BAR1 has not been published\n");
+		return (ENXIO);
+	}
+	sc->mac_phys = bar_pa + GEM_MAC_OFFSET;
+	if (!bcm2712_fdt_rp1(bcm2712_pcie_gem_paths, "raspberrypi,rp1-gem", 0,
+	    &sc->mac_phys, NULL))
+		device_printf(dev, "GEM reg not resolvable from FDT, "
+		    "using BAR1 + %#x\n", GEM_MAC_OFFSET);
+	sc->mac_bst = bus_get_bus_tag(dev);
+	if (bus_space_map(sc->mac_bst, sc->mac_phys, GEM_MAC_SIZE, 0,
+	    &sc->mac_bsh) != 0) {
+		device_printf(dev, "cannot map GEM MAC registers at %#jx\n",
+		    (uintmax_t)sc->mac_phys);
+		return (ENXIO);
+	}
+	sc->mac_mapped = 1;
+
+	pciecfg_phys = bar_pa + PCIE_CFG_OFFSET;
+#endif
+
+	/* Map RP1 PCIE_CFG for MSIx IACK re-arm (direct physical map) */
+	sc->pciecfg_bst = sc->mac_bst;
+	if (bus_space_map(sc->pciecfg_bst, pciecfg_phys, PCIE_CFG_SIZE, 0,
+	    &sc->pciecfg_bsh) == 0) {
+		sc->pciecfg_mapped = 1;
+		g_pciecfg_bst = sc->pciecfg_bst;
+		g_pciecfg_bsh = sc->pciecfg_bsh;
+		g_pciecfg_mapped = 1;
+		/*
+		 * As found: whether the GEM's vector is enabled, and which of
+		 * RP1's interrupt sources are asserted.  Read only.
+		 */
+		device_printf(dev, "RP1 PCIE_CFG at %#jx: MSIX_CFG_%u=%#x "
+		    "INTSTATL=%#x\n", (uintmax_t)pciecfg_phys, rp1_int_eth,
+		    bus_space_read_4(sc->pciecfg_bst, sc->pciecfg_bsh,
+		    PCIE_CFG_MSIX_CFG_0 + rp1_int_eth * 4),
+		    bus_space_read_4(sc->pciecfg_bst, sc->pciecfg_bsh,
+		    PCIE_CFG_INTSTATL));
+	} else {
+		device_printf(dev, "warning: cannot map PCIE_CFG, IACK disabled\n");
+		sc->pciecfg_mapped = 0;
+	}
+	return (0);
+}
+
+static void
+bcm2712_pcie_unmap_regs(device_t dev, struct bcm2712_pcie_softc *sc)
+{
+
+	if (sc->pciecfg_mapped) {
+		g_pciecfg_mapped = 0;
+		bus_space_unmap(sc->pciecfg_bst, sc->pciecfg_bsh,
+		    PCIE_CFG_SIZE);
+		sc->pciecfg_mapped = 0;
+	}
+	if (sc->cfg_res != NULL) {
+		bus_release_resource(dev, SYS_RES_MEMORY, 1, sc->cfg_res);
+		sc->cfg_res = NULL;
+	}
+	if (sc->mac_res != NULL) {
+		bus_release_resource(dev, SYS_RES_MEMORY, 0, sc->mac_res);
+		sc->mac_res = NULL;
+	}
+	if (sc->mac_mapped) {
+		bus_space_unmap(sc->mac_bst, sc->mac_bsh, GEM_MAC_SIZE);
+		sc->mac_mapped = 0;
+	}
+}
+
+static int
+bcm2712_pcie_attach(device_t dev)
+{
+	struct bcm2712_pcie_softc *sc = device_get_softc(dev);
+	int rid, error;
 #ifndef DEV_ACPI
+	u_int irq;
+#endif
+
+	sc->dev = dev;
+
+	bcm2712_pcie_resolve_int_eth(dev);
+
+	error = bcm2712_pcie_map_regs(dev, sc);
+	if (error != 0)
+		goto fail_mem;
+
+	/* Allocate the shared interrupt (GIC SPI 229). */
+	rid = 0;
+#ifdef DEV_ACPI
+	sc->irq_res = bus_alloc_resource_any(dev, SYS_RES_IRQ, &rid,
+	    RF_SHAREABLE | RF_ACTIVE);
+#else
+	/*
+	 * rp1pci keeps no resource list for its children, so the interrupt is
+	 * allocated by number; pci and the host bridge pass it up to nexus.
+	 */
 	irq = bcm2712_pcie_map_gic_spi(dev, RP1_GEM_GIC_SPI);
 	if (irq == 0) {
 		device_printf(dev, "cannot map GIC SPI %d\n", RP1_GEM_GIC_SPI);
 		error = ENXIO;
 		goto fail_mem;
 	}
-	error = bus_set_resource(dev, SYS_RES_IRQ, 0, irq, 1);
-	if (error != 0) {
-		device_printf(dev, "cannot set IRQ resource: %d\n", error);
-		goto fail_mem;
-	}
-#endif
-
-	rid = 0;
-	sc->irq_res = bus_alloc_resource_any(dev, SYS_RES_IRQ, &rid,
+	sc->irq_res = bus_alloc_resource(dev, SYS_RES_IRQ, &rid, irq, irq, 1,
 	    RF_SHAREABLE | RF_ACTIVE);
+#endif
 	if (sc->irq_res == NULL) {
 		device_printf(dev, "cannot allocate interrupt\n");
 		error = ENXIO;
@@ -519,21 +574,13 @@ bcm2712_pcie_attach(device_t dev)
 
 	device_printf(dev,
 	    "GEM MAC mapped at %#jx, IRQ hooked (shared GIC SPI %d)\n",
-	    (uintmax_t)rman_get_start(sc->mac_res), RP1_GEM_GIC_SPI);
+	    (uintmax_t)sc->mac_phys, RP1_GEM_GIC_SPI);
 	return (0);
 
 fail_irq:
 	bus_release_resource(dev, SYS_RES_IRQ, 0, sc->irq_res);
 fail_mem:
-	if (sc->pciecfg_mapped) {
-		g_pciecfg_mapped = 0;
-		bus_space_unmap(sc->pciecfg_bst, sc->pciecfg_bsh,
-		    PCIE_CFG_SIZE);
-		sc->pciecfg_mapped = 0;
-	}
-	if (sc->cfg_res != NULL)
-		bus_release_resource(dev, SYS_RES_MEMORY, 1, sc->cfg_res);
-	bus_release_resource(dev, SYS_RES_MEMORY, 0, sc->mac_res);
+	bcm2712_pcie_unmap_regs(dev, sc);
 	return (error);
 }
 
@@ -544,15 +591,7 @@ bcm2712_pcie_detach(device_t dev)
 
 	bus_teardown_intr(dev, sc->irq_res, sc->intr_cookie);
 	bus_release_resource(dev, SYS_RES_IRQ, 0, sc->irq_res);
-	if (sc->pciecfg_mapped) {
-		g_pciecfg_mapped = 0;
-		bus_space_unmap(sc->pciecfg_bst, sc->pciecfg_bsh,
-		    PCIE_CFG_SIZE);
-		sc->pciecfg_mapped = 0;
-	}
-	if (sc->cfg_res != NULL)
-		bus_release_resource(dev, SYS_RES_MEMORY, 1, sc->cfg_res);
-	bus_release_resource(dev, SYS_RES_MEMORY, 0, sc->mac_res);
+	bcm2712_pcie_unmap_regs(dev, sc);
 	return (0);
 }
 
@@ -575,14 +614,15 @@ static driver_t bcm2712_pcie_driver = {
 /*
  * Which bus this driver rides is decided when the kernel is configured, not at
  * run time.  A kernel with "device acpi" (RPI5) takes the ACPI attachment and
- * still needs the DSDT override; a kernel without it (RPI5-FDT) takes the
- * device tree attachment and needs no override.
+ * still needs the DSDT override; a kernel without it (RPI5-FDT) boots only
+ * by FDT, where RP1 is a PCI device, and attaches below rp1pci.
  */
 #ifdef DEV_ACPI
 DRIVER_MODULE(bcm2712_pcie, acpi, bcm2712_pcie_driver, NULL, NULL);
 MODULE_DEPEND(bcm2712_pcie, acpi, 1, 1, 1);
 #else
-DRIVER_MODULE(bcm2712_pcie, nexus, bcm2712_pcie_driver, NULL, NULL);
+DRIVER_MODULE(bcm2712_pcie, rp1pci, bcm2712_pcie_driver, NULL, NULL);
+MODULE_DEPEND(bcm2712_pcie, rp1, 1, 1, 1);
 #endif
 MODULE_VERSION(bcm2712_pcie, 1);
 MODULE_DEPEND(bcm2712_pcie, bcm2712, 1, 1, 1);	/* bcm2712_fdt.h */

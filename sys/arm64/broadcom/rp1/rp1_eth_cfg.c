@@ -477,20 +477,24 @@ rp1_eth_cfg_status_fmt_sysctl(SYSCTL_HANDLER_ARGS)
 }
 
 /* -----------------------------------------------------------------------
- * Module event handler
+ * Set-up: everything from the FDT walk to the network interface.
+ *
+ * Run at MOD_LOAD on the ACPI lane.  On the FDT lane RP1 is a PCI device and
+ * its registers cannot be found until rp1pci has published BAR1, which
+ * happens at SI_SUB_CONFIGURE, after MOD_LOAD; the set-up is deferred until
+ * then (rpi5_modules.git doc/M2_PCIE_HOST.md, phase 2).
  * ----------------------------------------------------------------------- */
 static int
-rp1_eth_modevent(module_t mod __unused, int event, void *arg __unused)
+rp1_eth_load(void)
 {
 	struct rp1_eth_softc *sc;
 	struct sysctl_oid *tree, *cfg_tree, *mac_tree;
-	bus_addr_t mac_phys;
+	bus_addr_t mac_phys, cfg_phys;
 	bus_size_t mac_sz;
 	bool mac_from_fdt;
 	int error;
 
-	switch (event) {
-	case MOD_LOAD:
+	{
 		sc = malloc(sizeof(*sc), M_RP1ETH, M_WAITOK | M_ZERO);
 
 		mtx_init(&sc->sc_mtx, "rp1_eth", NULL, MTX_DEF);
@@ -553,14 +557,16 @@ rp1_eth_modevent(module_t mod __unused, int event, void *arg __unused)
 		 * owns the RGMII glue -- so there is no binding to adopt.
 		 * Until one exists (an eth_cfg@104000 node, or a second reg
 		 * entry on ethernet@100000 with reg-names = "mac", "cfg"),
-		 * RP1_ETH_CFG_BASE_PHYS below stays the only source, derived
-		 * in rp1_eth_var.h from the pcie2 and rp1 ranges.
+		 * it is found by its fixed offset from the MAC window, which
+		 * holds wherever RP1's BAR has been placed.
 		 */
-		sc->cfg_kva = pmap_mapdev_attr(RP1_ETH_CFG_BASE_PHYS,
+		cfg_phys = mac_phys +
+		    (RP1_ETH_CFG_BASE_PHYS - RP1_ETH_MAC_BASE_PHYS);
+		sc->cfg_kva = pmap_mapdev_attr(cfg_phys,
 		    RP1_ETH_CFG_MAP_SIZE, VM_MEMATTR_DEVICE);
 		if (sc->cfg_kva == NULL) {
 			printf("rp1_eth: cannot map eth_cfg at 0x%lx\n",
-			    (unsigned long)RP1_ETH_CFG_BASE_PHYS);
+			    (unsigned long)cfg_phys);
 			pmap_unmapdev(sc->mac_kva, RP1_ETH_MAC_MAP_SIZE);
 			sysctl_ctx_free(&sc->sysctl_ctx);
 			mtx_destroy(&sc->sc_mtx);
@@ -569,8 +575,10 @@ rp1_eth_modevent(module_t mod __unused, int event, void *arg __unused)
 		}
 		sc->cfg_mapped = 1;
 		printf("rp1_eth: eth_cfg mapped at phys 0x%lx KVA %p "
-		    "(hardcoded, no FDT node exists)\n",
-		    (unsigned long)RP1_ETH_CFG_BASE_PHYS, sc->cfg_kva);
+		    "(MAC + 0x%lx, no FDT node exists)\n",
+		    (unsigned long)cfg_phys, sc->cfg_kva,
+		    (unsigned long)(RP1_ETH_CFG_BASE_PHYS -
+		    RP1_ETH_MAC_BASE_PHYS));
 
 		/* Snapshot firmware-left register state before any writes. */
 		printf("rp1_eth: entry snapshot — "
@@ -1367,9 +1375,40 @@ rp1_eth_modevent(module_t mod __unused, int event, void *arg __unused)
 		if (rp1eth_attach(sc) != 0)
 			printf("rp1_eth: Milestone 2 attach failed "
 			    "(M1 diagnostics still available)\n");
-		break;
+	}
+	return (0);
+}
+
+static void
+rp1_eth_load_deferred(void *arg __unused)
+{
+	int error;
+
+	error = rp1_eth_load();
+	if (error != 0)
+		printf("rp1_eth: set-up failed (%d); no Ethernet\n", error);
+}
+
+/* -----------------------------------------------------------------------
+ * Module event handler
+ * ----------------------------------------------------------------------- */
+static int
+rp1_eth_modevent(module_t mod __unused, int event, void *arg __unused)
+{
+	struct rp1_eth_softc *sc;
+	int error;
+
+	switch (event) {
+	case MOD_LOAD:
+		if (!bcm2712_rp1_needs_pci())
+			return (rp1_eth_load());
+		error = bcm2712_rp1_defer(rp1_eth_load_deferred, NULL);
+		if (error != 0)
+			printf("rp1_eth: cannot wait for RP1 (%d)\n", error);
+		return (error);
 
 	case MOD_UNLOAD:
+		bcm2712_rp1_undefer(rp1_eth_load_deferred, NULL);
 		sc = rp1_eth_sc;
 		if (sc == NULL)
 			break;
