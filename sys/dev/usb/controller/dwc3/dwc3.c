@@ -96,8 +96,6 @@ struct snps_dwc3_softc {
 #define	DWC3_READ(_sc, _off)		\
     bus_space_read_4(_sc->bst, _sc->bsh, _off)
 
-#define	IS_DMA_32B	1
-
 static void
 xhci_interrupt_poll(void *_sc)
 {
@@ -149,7 +147,14 @@ snps_dwc3_attach_xhci(device_t dev)
 		}
 	}
 
-	err = xhci_init(sc, dev, IS_DMA_32B);
+	/*
+	 * 64-bit DMA when the controller reports AC64, as Linux xhci-plat
+	 * does; hw.usb.xhci.dma32=1 forces 32-bit where the interconnect
+	 * cannot address more.  This driver passed 32-bit unconditionally
+	 * from its import (no reason given), making every transfer to RAM
+	 * above 4 GB bounce.
+	 */
+	err = xhci_init(sc, dev, 0);
 	if (err != 0) {
 		device_printf(dev, "Failed to init XHCI, with error %d\n", err);
 		return (ENXIO);
