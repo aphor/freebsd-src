@@ -41,8 +41,8 @@
 
 /*
  * Forked from sys/dev/cadence/if_cgem_hw.h for rp1_eth KLD.
- * CGEM64 is intentionally NOT defined here; rp1_eth uses 32-bit
- * descriptors since the RP1 PCIe2 inbound DMA window is 32-bit.
+ * CGEM64 is not defined here: rp1_eth.c defines it before including this
+ * file, as upstream if_cgem.c does, and so uses 64-bit descriptors.
  */
 #ifndef _RP1_ETH_HW_H_
 #define _RP1_ETH_HW_H_
