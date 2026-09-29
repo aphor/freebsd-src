@@ -66,9 +66,12 @@
  *     FreeBSD does not translate dma-ranges, so RAM must be mapped 1:1;
  *     the freebsd-pcie2 overlay does that (rpi5_modules.git
  *     doc/DT_OVERLAYS.md).  Attach says so if it is not.
- *   - The bus DMA tag keeps DMA out of RAM that the outbound window
- *     shadows (bcm2838_pci.c limits DMA with its tag too, for another
- *     reason).
+ *   - The 32-bit outbound window shadows the RAM at the same addresses,
+ *     because RAM is mapped 1:1.  The freebsd-pcieN overlays reserve that
+ *     RAM (/reserved-memory, no-map), as EDK2 does on the ACPI lane, and
+ *     then the DMA tag has nothing to exclude.  Without the reservation
+ *     the tag keeps DMA out of the shadowed RAM, by bouncing
+ *     (bcm2838_pci.c limits DMA with its tag too, for another reason).
  *
  *  Adopted controllers only -- a link the firmware already trained:
  *   - No bridge reset, PHY/PLL set-up, PERST# or link training (phase 5
@@ -101,6 +104,10 @@
 #include <dev/pci/pcivar.h>
 #include <dev/pci/pcireg.h>
 #include <dev/pci/pcib_private.h>
+
+#include <vm/vm.h>
+#include <vm/vm_param.h>
+#include <vm/vm_dumpset.h>
 
 #include <machine/bus.h>
 #include <machine/intr.h>
@@ -734,13 +741,42 @@ bcm2712_pcib_set_inbound_wins(struct bcm2712_pcib_softc *sc,
 }
 
 /*
+ * Does [lo, hi] hold RAM that the kernel may give a device for DMA?
+ *
+ * dump_avail[] is RAM less the regions the kernel was told to leave alone
+ * (EXFLAG_NODUMP: /reserved-memory no-map nodes, the EFI memreserve table).
+ * Unlike phys_avail[], it keeps the kernel image, whose static buffers can
+ * be DMA targets too.
+ */
+static bool
+bcm2712_pcib_ram_in(vm_paddr_t lo, vm_paddr_t hi)
+{
+	int i;
+
+	for (i = 0; dump_avail[i + 1] != 0; i += 2)
+		if (dump_avail[i] <= hi && dump_avail[i + 1] > lo)
+			return (true);
+	return (false);
+}
+
+/*
  * Program the inbound windows from dma-ranges and build the DMA tag.
  *
  * busdma gives devices CPU physical addresses, so all of RAM must be in a
  * window that maps PCIe X to CPU X.  The outbound window's PCIe range then
- * shadows the RAM at the same addresses -- a device's DMA to them would be
- * taken for a transfer to a device behind the bridge -- so the tag keeps
- * DMA out of it, the way a DMA limit would, with bounce buffers.
+ * shadows the RAM at the same addresses: once the root port's memory
+ * window (which bcm2712_pcib_relocate_bridge_window() keeps inside that
+ * range) decodes an address, a device's DMA to it is taken for a transfer
+ * to a device behind the bridge, and never reaches RAM.
+ *
+ * The freebsd-pcieN overlays reserve the shadowed RAM, so nothing can be
+ * allocated there, and the tag needs no exclusion.  That matters beyond
+ * the shadow itself: a child tag's exclusion is the parent's widened to
+ * the child's highaddr (common_bus_dma_tag_create() takes the MIN of the
+ * lowaddrs and the MAX of the highaddrs), so for nvme(4) or rp1_eth, whose
+ * highaddr is BUS_SPACE_MAXADDR, excluding the shadow here means bouncing
+ * every buffer above it.  If the RAM is not reserved, it is excluded
+ * anyway, as a safety net, and bouncing is the cost.
  */
 static int
 bcm2712_pcib_setup_inbound(struct bcm2712_pcib_softc *sc)
@@ -789,17 +825,24 @@ bcm2712_pcib_setup_inbound(struct bcm2712_pcib_softc *sc)
 
 	bcm2712_pcib_set_inbound_wins(sc, wins, n);
 
-	/* Keep DMA out of the RAM the outbound window shadows. */
+	/* Keep DMA out of the RAM the outbound window shadows, if any. */
 	lowaddr = BUS_SPACE_MAXADDR;
 	highaddr = BUS_SPACE_MAXADDR;
 	ob_lo = sc->base.base.ranges[0].pci_base;
 	ob_hi = ob_lo + sc->base.base.ranges[0].size - 1;
 	if (ram_1to1 && ob_lo < ram_end) {
-		lowaddr = ob_lo - 1;
-		highaddr = ob_hi;
-		device_printf(sc->dev, "DMA excluded from 0x%jx-0x%jx, "
-		    "shadowed by the outbound window\n", (uintmax_t)ob_lo,
-		    (uintmax_t)ob_hi);
+		if (bcm2712_pcib_ram_in(ob_lo, ob_hi)) {
+			lowaddr = ob_lo - 1;
+			highaddr = ob_hi;
+			device_printf(sc->dev, "DMA excluded from 0x%jx-0x%jx, "
+			    "RAM shadowed by the outbound window and not "
+			    "reserved: devices below may bounce any buffer "
+			    "from 0x%jx up\n", (uintmax_t)ob_lo,
+			    (uintmax_t)ob_hi, (uintmax_t)ob_lo);
+		} else
+			device_printf(sc->dev, "outbound window 0x%jx-0x%jx "
+			    "shadows no RAM the kernel uses (reserved); no DMA "
+			    "exclusion\n", (uintmax_t)ob_lo, (uintmax_t)ob_hi);
 	}
 	error = bus_dma_tag_create(bus_get_dma_tag(sc->dev), /* parent */
 	    1, 0,				/* alignment, bounds */
