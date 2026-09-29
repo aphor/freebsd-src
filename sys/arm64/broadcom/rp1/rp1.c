@@ -34,6 +34,14 @@
  * (rp1_eth's filter masks the GEM).  rpi5_modules.git doc/M2_PCIE_HOST.md,
  * phase 4b.
  *
+ * And it is the parent of the RP1 functions that stock FreeBSD FDT
+ * drivers can run, through a simplebus over the rp1 node (rp1_simplebus,
+ * below): the DT's rp1 ranges assume BAR1 at PCIe 0, so the subclass
+ * translates them to where PCI put BAR1, and this driver sub-allocates
+ * BAR1 for those children.  Only whitelisted compatibles get a child
+ * (rp1_ofw_compat), so no stock driver takes a function one of ours
+ * drives.  First: RP1's two xHCI controllers, snps,dwc3 (phase 4c).
+ *
  * On the ACPI lane EDK2 does not expose RP1 as a PCI device, so this
  * driver never attaches there.
  */
@@ -57,6 +65,7 @@
 #include <machine/intr.h>
 #include <machine/resource.h>
 
+#include <dev/fdt/simplebus.h>
 #include <dev/ofw/openfirm.h>
 #include <dev/ofw/ofw_bus.h>
 #include <dev/ofw/ofw_bus_subr.h>
@@ -66,6 +75,7 @@
 
 #include <arm64/broadcom/bcm2712/bcm2712_var.h>
 
+#include "ofw_bus_if.h"
 #include "pic_if.h"
 
 #define	RP1_VENDOR	0x1de4
@@ -113,6 +123,18 @@ struct rp1_softc {
 	int		bar0_rid;
 	int		nirqs;		/* 0: no interrupts, children poll */
 	struct rp1_irqsrc irqs[RP1_NIRQS];
+	struct rman	mem_rman;	/* BAR1, in PCIe bus addresses */
+	device_t	sbus;		/* rp1_simplebus, or NULL */
+	struct ofw_bus_devinfo sbus_obd;
+};
+
+/*
+ * The RP1 functions the rp1 simplebus gives a device: those a stock
+ * FreeBSD FDT driver handles and none of ours does.
+ */
+static const char * const rp1_ofw_compat[] = {
+	"snps,dwc3",		/* USB 3 hosts, usb@200000 and usb@300000 */
+	NULL
 };
 
 static void
@@ -382,6 +404,164 @@ rp1_probe(device_t dev)
 	return (BUS_PROBE_DEFAULT);
 }
 
+/*
+ * Memory for the rp1 simplebus's children: sub-ranges of BAR1, in PCIe bus
+ * addresses (the simplebus translates to those), mapped through BAR1.
+ * Everything else, interrupts included, goes up as before.
+ */
+static struct rman *
+rp1_get_rman(device_t dev, int type, u_int flags)
+{
+	struct rp1_softc *sc = device_get_softc(dev);
+
+	if (type == SYS_RES_MEMORY && sc->sbus != NULL)
+		return (&sc->mem_rman);
+	return (NULL);
+}
+
+static struct resource *
+rp1_alloc_resource(device_t dev, device_t child, int type, int rid,
+    rman_res_t start, rman_res_t end, rman_res_t count, u_int flags)
+{
+
+	if (rp1_get_rman(dev, type, flags) != NULL)
+		return (bus_generic_rman_alloc_resource(dev, child, type, rid,
+		    start, end, count, flags));
+	return (bus_generic_alloc_resource(dev, child, type, rid, start, end,
+	    count, flags));
+}
+
+static bool
+rp1_is_ours(device_t dev, struct resource *r)
+{
+	struct rp1_softc *sc = device_get_softc(dev);
+
+	return (rman_get_type(r) == SYS_RES_MEMORY && sc->sbus != NULL &&
+	    rman_is_region_manager(r, &sc->mem_rman));
+}
+
+static int
+rp1_release_resource(device_t dev, device_t child, struct resource *r)
+{
+
+	if (rp1_is_ours(dev, r))
+		return (bus_generic_rman_release_resource(dev, child, r));
+	return (bus_generic_release_resource(dev, child, r));
+}
+
+static int
+rp1_activate_resource(device_t dev, device_t child, struct resource *r)
+{
+
+	if (rp1_is_ours(dev, r))
+		return (bus_generic_rman_activate_resource(dev, child, r));
+	return (bus_generic_activate_resource(dev, child, r));
+}
+
+static int
+rp1_deactivate_resource(device_t dev, device_t child, struct resource *r)
+{
+
+	if (rp1_is_ours(dev, r))
+		return (bus_generic_rman_deactivate_resource(dev, child, r));
+	return (bus_generic_deactivate_resource(dev, child, r));
+}
+
+static int
+rp1_adjust_resource(device_t dev, device_t child, struct resource *r,
+    rman_res_t start, rman_res_t end)
+{
+
+	if (rp1_is_ours(dev, r))
+		return (bus_generic_rman_adjust_resource(dev, child, r, start,
+		    end));
+	return (bus_generic_adjust_resource(dev, child, r, start, end));
+}
+
+static int
+rp1_map_resource(device_t dev, device_t child, struct resource *r,
+    struct resource_map_request *argsp, struct resource_map *map)
+{
+	struct rp1_softc *sc = device_get_softc(dev);
+	struct resource_map_request args;
+	rman_res_t length, start;
+	int error;
+
+	if (!rp1_is_ours(dev, r))
+		return (bus_generic_map_resource(dev, child, r, argsp, map));
+	if ((rman_get_flags(r) & RF_ACTIVE) == 0)
+		return (ENXIO);
+
+	resource_init_map_request(&args);
+	error = resource_validate_map_request(r, argsp, &args, &start,
+	    &length);
+	if (error != 0)
+		return (error);
+	args.offset = start - rman_get_start(sc->bar1);
+	args.length = length;
+	return (bus_map_resource(dev, sc->bar1, &args, map));
+}
+
+static int
+rp1_unmap_resource(device_t dev, device_t child, struct resource *r,
+    struct resource_map *map)
+{
+	struct rp1_softc *sc = device_get_softc(dev);
+
+	if (!rp1_is_ours(dev, r))
+		return (bus_generic_unmap_resource(dev, child, r, map));
+	return (bus_unmap_resource(dev, sc->bar1, map));
+}
+
+/* OFW: only the rp1 simplebus has a node. */
+static const struct ofw_bus_devinfo *
+rp1_get_devinfo(device_t dev, device_t child)
+{
+	struct rp1_softc *sc = device_get_softc(dev);
+
+	if (child != NULL && child == sc->sbus)
+		return (&sc->sbus_obd);
+	return (NULL);
+}
+
+/*
+ * The rp1 node as a bus for stock FDT drivers.  Its BAR1 part is managed
+ * here; the child is a simplebus subclass (rp1_simplebus).
+ */
+static void
+rp1_sbus_attach(struct rp1_softc *sc)
+{
+	device_t dev = sc->dev;
+	phandle_t node;
+	int error;
+
+	node = rp1_find_node();
+	if (node == -1)
+		return;
+
+	sc->mem_rman.rm_type = RMAN_ARRAY;
+	sc->mem_rman.rm_descr = "RP1 peripherals (BAR1)";
+	error = rman_init(&sc->mem_rman);
+	if (error == 0)
+		error = rman_manage_region(&sc->mem_rman,
+		    rman_get_start(sc->bar1), rman_get_end(sc->bar1));
+	if (error != 0) {
+		device_printf(dev, "cannot manage BAR1 for the rp1 bus: %d\n",
+		    error);
+		return;
+	}
+	if (ofw_bus_gen_setup_devinfo(&sc->sbus_obd, node) != 0) {
+		rman_fini(&sc->mem_rman);
+		return;
+	}
+	sc->sbus = BUS_ADD_CHILD(dev, 0, "simplebus", DEVICE_UNIT_ANY);
+	if (sc->sbus == NULL) {
+		device_printf(dev, "cannot add the rp1 bus\n");
+		ofw_bus_gen_destroy_devinfo(&sc->sbus_obd);
+		rman_fini(&sc->mem_rman);
+	}
+}
+
 static int
 rp1_attach(device_t dev)
 {
@@ -420,6 +600,7 @@ rp1_attach(device_t dev)
 
 	/* Before the children, which set up their interrupts at attach. */
 	rp1_intr_attach(sc);
+	rp1_sbus_attach(sc);
 
 	/* RP1's function drivers, now that their registers can be found. */
 	bus_identify_children(dev);
@@ -443,13 +624,25 @@ static device_method_t rp1_methods[] = {
 	/* Bus interface, for RP1's function drivers. */
 	DEVMETHOD(bus_add_child,	bus_generic_add_child),
 	DEVMETHOD(bus_print_child,	bus_generic_print_child),
-	DEVMETHOD(bus_alloc_resource,	bus_generic_alloc_resource),
-	DEVMETHOD(bus_release_resource,	bus_generic_release_resource),
-	DEVMETHOD(bus_activate_resource, bus_generic_activate_resource),
-	DEVMETHOD(bus_deactivate_resource, bus_generic_deactivate_resource),
+	DEVMETHOD(bus_get_rman,		rp1_get_rman),
+	DEVMETHOD(bus_alloc_resource,	rp1_alloc_resource),
+	DEVMETHOD(bus_release_resource,	rp1_release_resource),
+	DEVMETHOD(bus_activate_resource, rp1_activate_resource),
+	DEVMETHOD(bus_deactivate_resource, rp1_deactivate_resource),
+	DEVMETHOD(bus_adjust_resource,	rp1_adjust_resource),
+	DEVMETHOD(bus_map_resource,	rp1_map_resource),
+	DEVMETHOD(bus_unmap_resource,	rp1_unmap_resource),
 	DEVMETHOD(bus_setup_intr,	bus_generic_setup_intr),
 	DEVMETHOD(bus_teardown_intr,	bus_generic_teardown_intr),
 	DEVMETHOD(bus_get_dma_tag,	bus_generic_get_dma_tag),
+
+	/* OFW, for the rp1 simplebus. */
+	DEVMETHOD(ofw_bus_get_devinfo,	rp1_get_devinfo),
+	DEVMETHOD(ofw_bus_get_compat,	ofw_bus_gen_get_compat),
+	DEVMETHOD(ofw_bus_get_model,	ofw_bus_gen_get_model),
+	DEVMETHOD(ofw_bus_get_name,	ofw_bus_gen_get_name),
+	DEVMETHOD(ofw_bus_get_node,	ofw_bus_gen_get_node),
+	DEVMETHOD(ofw_bus_get_type,	ofw_bus_gen_get_type),
 
 	/* Interrupt controller interface, for the rp1 node's children. */
 	DEVMETHOD(pic_map_intr,		rp1_pic_map_intr),
@@ -472,6 +665,107 @@ static driver_t rp1_driver = {
 };
 
 DRIVER_MODULE(rp1, pci, rp1_driver, NULL, NULL);
+
+/*
+ * rp1_simplebus: simplebus over the rp1 node, with its ranges translated
+ * to BAR1 and only rp1_ofw_compat children.  Named "simplebus" so that
+ * stock drivers, which register on simplebus, attach below it.
+ */
+static int
+rp1_simplebus_probe(device_t dev)
+{
+
+	if (ofw_bus_get_node(dev) == -1 ||
+	    !ofw_bus_is_compatible(dev, "simple-bus"))
+		return (ENXIO);
+	device_set_desc(dev, "RP1 peripherals (FDT)");
+	return (BUS_PROBE_SPECIFIC);
+}
+
+/*
+ * rp1's ranges map its 2-cell child space to PCI space (3 cells:
+ * phys.hi, then a 64-bit address).  The DT assumes BAR1 at PCIe 0; the
+ * host side here is where PCI put BAR1, plus the DT's PCIe address,
+ * as bcm2712_fdt_rp1_reg() computes for our own drivers.
+ */
+static int
+rp1_simplebus_ranges(device_t dev, struct simplebus_softc *sc)
+{
+	struct rp1_softc *psc = device_get_softc(device_get_parent(dev));
+	rman_res_t bar_start, bar_size;
+	pcell_t *r;
+	uint64_t pci;
+	int e, i, k, len, n;
+
+	e = sc->acells + 3 + sc->scells;
+	len = OF_getencprop_alloc(sc->node, "ranges", (void **)&r);
+	if (len <= 0)
+		return (ENXIO);
+	n = len / (int)sizeof(pcell_t) / e;
+	if (n == 0) {
+		OF_prop_free(r);
+		return (ENXIO);
+	}
+	bar_start = rman_get_start(psc->bar1);
+	bar_size = rman_get_size(psc->bar1);
+	sc->ranges = malloc(n * sizeof(sc->ranges[0]), M_DEVBUF,
+	    M_WAITOK | M_ZERO);
+	sc->nranges = n;
+	for (i = 0; i < n; i++) {
+		pcell_t *c = &r[i * e];
+
+		for (k = 0; k < sc->acells; k++)
+			sc->ranges[i].bus = (sc->ranges[i].bus << 32) | c[k];
+		pci = ((uint64_t)c[sc->acells + 1] << 32) | c[sc->acells + 2];
+		for (k = 0; k < sc->scells; k++)
+			sc->ranges[i].size = (sc->ranges[i].size << 32) |
+			    c[sc->acells + 3 + k];
+		/* Only what BAR1 holds. */
+		if (pci >= bar_size)
+			sc->ranges[i].size = 0;
+		else if (sc->ranges[i].size > bar_size - pci)
+			sc->ranges[i].size = bar_size - pci;
+		sc->ranges[i].host = bar_start + pci;
+	}
+	OF_prop_free(r);
+	return (0);
+}
+
+static int
+rp1_simplebus_attach(device_t dev)
+{
+	struct simplebus_softc *sc = device_get_softc(dev);
+	phandle_t node;
+	int i;
+
+	simplebus_init(dev, 0);
+	if (rp1_simplebus_ranges(dev, sc) != 0) {
+		device_printf(dev, "cannot translate the rp1 ranges\n");
+		return (ENXIO);
+	}
+	for (node = OF_child(sc->node); node > 0; node = OF_peer(node)) {
+		if (!ofw_bus_node_status_okay(node))
+			continue;
+		for (i = 0; rp1_ofw_compat[i] != NULL; i++)
+			if (ofw_bus_node_is_compatible(node, rp1_ofw_compat[i]))
+				break;
+		if (rp1_ofw_compat[i] != NULL)
+			simplebus_add_device(dev, node, 0, NULL,
+			    DEVICE_UNIT_ANY, NULL);
+	}
+	bus_attach_children(dev);
+	return (0);
+}
+
+static device_method_t rp1_simplebus_methods[] = {
+	DEVMETHOD(device_probe,		rp1_simplebus_probe),
+	DEVMETHOD(device_attach,	rp1_simplebus_attach),
+	DEVMETHOD_END
+};
+
+DEFINE_CLASS_1(simplebus, rp1_simplebus_driver, rp1_simplebus_methods,
+    sizeof(struct simplebus_softc), simplebus_driver);
+DRIVER_MODULE(rp1_simplebus, rp1pci, rp1_simplebus_driver, NULL, NULL);
 MODULE_DEPEND(rp1, pci, 1, 1, 1);
 MODULE_DEPEND(rp1, bcm2712, 1, 1, 1);
 MODULE_VERSION(rp1, 1);
