@@ -56,6 +56,7 @@ device		rpi_fw			# VPU firmware mailbox, TryBoot
 device		brcmstb_gpio		# SoC-native GPIO (WL_ON, SD power)
 device		bcm2712_pinctrl		# SoC pin mux (SDIO2 for WiFi)
 device		brcmstb_reset		# SW_INIT reset controller (PCIe bridge resets)
+device		brcmstb_rescal		# SATA/PCIe resistor calibration ("rescal" reset)
 device		bcm2712_pcib		# PCIe host controller (M2 phase 1: adopts a trained link)
 device		rp1			# RP1 on PCIe2: owns BAR1, publishes it to the RP1 drivers
 

@@ -30,19 +30,26 @@
  *    mirrors Linux pcie-brcmstb.c struct pcie_cfg_data.  The BCM2711
  *    values that bcm2838_pci.c hardcodes are given beside each field.
  *
- * Divergences from bcm2838_pci.c, as of phase 1:
+ * Divergences from bcm2838_pci.c, as of phase 3:
  *
  *  BCM2712 differs:
- *   - Only controllers named in the loader tunable hw.bcm2712_pcib.adopt
- *     (DT unit addresses; default "1000120000", PCIe2) are touched at
- *     all.  The VPU firmware logs "PCI1 reset" at hand-off (and "PCI2
- *     reset" unless config.txt sets pciex4_reset=0), yet the bridge resets
- *     in brcm,brcmstb-reset all read deasserted, so no register tells us
- *     which controllers are safe to read.  Linux never reads one before
- *     resetting "rescal".  The list goes away in phase 3.
- *   - The DT "bridge" reset (via hwreset) is also checked before any
+ *   - Each controller is either adopted with the link the firmware trained
+ *     (phase 1; loader tunable hw.bcm2712_pcib.adopt, DT unit addresses,
+ *     default "1000120000", PCIe2), or brought up from reset as Linux does
+ *     (phase 3; hw.bcm2712_pcib.reset, empty by default, "1000110000" for
+ *     PCIe1), or left untouched.  The VPU firmware logs "PCI1 reset" at hand-off (and
+ *     "PCI2 reset" unless config.txt sets pciex4_reset=0), yet the bridge
+ *     resets in brcm,brcmstb-reset all read deasserted, so no register
+ *     tells us which controllers are safe to read without a reset.
+ *   - Adopting, the DT "bridge" reset (via hwreset) is checked before any
  *     controller register is read: asserted means unusable.  Necessary,
  *     not sufficient, as above.
+ *   - From reset: the bridge reset, the 54 MHz refclk PLL set-up over MDIO,
+ *     PERST# and link training follow Linux pcie-brcmstb.c for
+ *     bcm2712_cfg (see "Phase 3" below).  The shared "rescal" calibration
+ *     is run only if hw.bcm2712_pcib.rescal is set, because the adopted
+ *     PCIe2 shares it.  PERST# is not released unless RAM is mapped 1:1
+ *     for DMA.
  *   - UBUS/AXI error replies are suppressed so that failed reads return
  *     all ones (Linux brcm_pcie_post_setup_bcm2712).  Without this, config
  *     reads of empty slots return 0xdeaddead, which enumeration would take
@@ -63,9 +70,9 @@
  *     shadows (bcm2838_pci.c limits DMA with its tag too, for another
  *     reason).
  *
- *  Phase 1 only -- adopts a link the firmware already trained:
- *   - No bridge reset, PHY/PLL set-up, PERST# or link training (phases 3
- *     and 5); if the link is not up, attach fails.
+ *  Adopted controllers only -- a link the firmware already trained:
+ *   - No bridge reset, PHY/PLL set-up, PERST# or link training (phase 5
+ *     does that for PCIe2); if the link is not up, attach fails.
  *
  *  Duplicate, merge as-is: the config-space window, the outbound window
  *  encoders, the root port class fix-up, the bridge window relocation.
@@ -135,6 +142,68 @@
 #define UBUS_BAR_CONFIG_REMAP_ACCESS_EN		0x1
 #define MAX_INBOUND_WINS			10
 
+/*
+ * Bring-up from reset (phase 3), BCM2712 (7712) layout.  Linux names:
+ * PCIE_RC_CFG_VENDOR_VENDOR_SPECIFIC_REG1, PCIE_RC_CFG_PRIV1_*,
+ * PCIE_RC_DL_MDIO_*, PCIE_RC_PL_PHY_CTL_15, PCIE_MISC_*, and the
+ * PCIE_MISC_HARD_PCIE_HARD_DEBUG_* bits of cfg->hard_debug.
+ */
+#define REG_VENDOR_SPECIFIC_REG1		0x0188
+#define VENDOR_REG1_ENDIAN_MODE_BAR2_MASK	0xc	/* 0: little endian */
+#define REG_PCIE_CAP				0x00ac	/* the RC's PCIe capability */
+#define LINK_CTL2_TARGET_SPEED_MASK		0xf
+#define REG_LINK_CAPABILITY			0x04dc
+#define LINK_CAPABILITY_MAX_LINK_SPEED_MASK	0xf
+#define LINK_CAPABILITY_ASPM_SUPPORT_SHIFT	10
+#define LINK_CAPABILITY_ASPM_SUPPORT_MASK	0xc00
+#define ASPM_SUPPORT_L0S			0x1
+#define ASPM_SUPPORT_L1				0x2
+#define REG_ROOT_CAP				0x04f8
+#define ROOT_CAP_L1SS_MODE_SHIFT		3
+#define ROOT_CAP_L1SS_MODE_MASK			0xf8
+#define REG_MDIO_ADDR				0x1100
+#define REG_MDIO_WR_DATA			0x1104
+#define REG_MDIO_RD_DATA			0x1108
+#define MDIO_PORT0				0x0
+#define MDIO_PORT_SHIFT				16	/* MDIO_PORT_MASK 0xf0000 */
+#define MDIO_CMD_WRITE				(0u << 20) /* MDIO_CMD_MASK */
+#define MDIO_DATA_DONE				(1u << 31)
+#define MDIO_SET_ADDR_OFFSET			0x1f
+#define REG_PL_PHY_CTL_15			0x184c
+#define PL_PHY_CTL_15_PM_CLK_PERIOD_MASK	0xff
+#define REG_MISC_CTRL				0x4008
+#define MISC_CTRL_RCB_64B_MODE			0x80
+#define MISC_CTRL_RCB_MPS_MODE			0x400
+#define MISC_CTRL_SCB_ACCESS_EN			0x1000
+#define MISC_CTRL_CFG_READ_UR_MODE		0x2000
+#define MISC_CTRL_MAX_BURST_SIZE_SHIFT		20
+#define MISC_CTRL_MAX_BURST_SIZE_MASK		0x300000
+#define MAX_BURST_SIZE_512			0x2	/* not 2711, 7278 or BMIPS */
+#define REG_RC_CONFIG_RETRY_TIMEOUT		0x405c
+#define REG_PCIE_CTRL				0x4064
+#define PCIE_CTRL_PERSTB			0x4	/* 7278 way: 0 asserts PERST# */
+#define BRIDGE_STATE_PORT			0x80	/* PCIE_STATUS: RC, not EP */
+#define REG_MISC_CTRL_1				0x40a0
+#define MISC_CTRL_1_EN_VDM_QOS_CONTROL		(1u << 5)
+#define REG_UBUS_TIMEOUT			0x40a8
+#define REG_TC_QUEUE_TO_QOS_MAP(x)		(0x4160 - (x) * 4)
+#define REG_AXI_INTF_CTRL			0x416c
+#define AXI_EN_RCLK_QOS_ARRAY_FIX		(1u << 13)
+#define AXI_EN_QOS_UPDATE_TIMING_FIX		(1u << 12)
+#define AXI_DIS_QOS_GATING_IN_MASTER		(1u << 11)
+#define AXI_REQFIFO_EN_QOS_PROPAGATION		(1u << 7)
+#define AXI_MASTER_MAX_OUTSTANDING_MASK		0x3f
+#define HARD_DEBUG_CLKREQ_DEBUG_ENABLE		0x2
+#define HARD_DEBUG_PERST_ASSERT			0x8
+#define HARD_DEBUG_REFCLK_OVRD_ENABLE		0x10000
+#define HARD_DEBUG_REFCLK_OVRD_OUT		0x100000
+#define HARD_DEBUG_L1SS_ENABLE			0x200000
+#define HARD_DEBUG_SERDES_IDDQ			0x08000000
+#define HARD_DEBUG_CLKREQ_MASK			(HARD_DEBUG_CLKREQ_DEBUG_ENABLE | \
+						 HARD_DEBUG_REFCLK_OVRD_ENABLE | \
+						 HARD_DEBUG_REFCLK_OVRD_OUT | \
+						 HARD_DEBUG_L1SS_ENABLE)
+
 struct bcm2712_pcib_inbound_win {
 	uint64_t	pci_base;
 	uint64_t	cpu_base;
@@ -176,6 +245,27 @@ SYSCTL_STRING(_hw_bcm2712_pcib, OID_AUTO, adopt, CTLFLAG_RDTUN,
     bcm2712_pcib_adopt, sizeof(bcm2712_pcib_adopt),
     "DT unit addresses of the controllers phase 1 may adopt");
 
+/*
+ * Controllers phase 3 brings up from reset, in the same form.  None by
+ * default: PCIe1 (the NVMe slot, "1000110000") trains, but multi-page
+ * reads from the NVMe return the wrong data (rpi5_modules.git
+ * doc/M2_PCIE_HOST.md, phase 3), so it is only set by hand, to test.
+ */
+static char bcm2712_pcib_reset[128] = "";
+SYSCTL_STRING(_hw_bcm2712_pcib, OID_AUTO, reset, CTLFLAG_RDTUN,
+    bcm2712_pcib_reset, sizeof(bcm2712_pcib_reset),
+    "DT unit addresses of the controllers phase 3 brings up from reset");
+
+/*
+ * Run the shared SATA/PCIe resistor calibration before a bring-up from
+ * reset, as Linux does.  Off by default: it is shared with the adopted
+ * PCIe2, whose link the firmware trained after its own calibration.
+ */
+static int bcm2712_pcib_rescal;
+SYSCTL_INT(_hw_bcm2712_pcib, OID_AUTO, rescal, CTLFLAG_RDTUN,
+    &bcm2712_pcib_rescal, 0,
+    "Run rescal before bringing a controller up from reset");
+
 struct bcm2712_pcib_softc {
 	struct generic_pcie_fdt_softc	base;
 	device_t			dev;
@@ -183,6 +273,7 @@ struct bcm2712_pcib_softc {
 	hwreset_t			bridge_rst;
 	struct mtx			config_mtx;
 	bus_dma_tag_t			dmat;
+	bool				ram_1to1;
 };
 
 static struct ofw_compat_data compat_data[] = {
@@ -672,9 +763,10 @@ bcm2712_pcib_setup_inbound(struct bcm2712_pcib_softc *sc)
 		device_printf(sc->dev, "WARNING: dma-ranges do not map RAM "
 		    "(0-0x%jx) 1:1, and FreeBSD does not translate them: DMA "
 		    "by devices behind this bridge will not reach RAM.  "
-		    "Expected the freebsd-pcie2 device-tree overlay "
+		    "Expected a freebsd-pcieN device-tree overlay "
 		    "(rpi5_modules.git doc/DT_OVERLAYS.md).\n",
 		    (uintmax_t)ram_end);
+	sc->ram_1to1 = ram_1to1;
 
 	bcm2712_pcib_set_inbound_wins(sc, wins, n);
 
@@ -716,9 +808,12 @@ bcm2712_pcib_get_dma_tag(device_t dev, device_t child)
 	return (sc->dmat != NULL ? sc->dmat : sc->base.base.dmat);
 }
 
-/* Is this controller's DT unit address in hw.bcm2712_pcib.adopt? */
+/*
+ * Is this controller's DT unit address in list (hw.bcm2712_pcib.adopt or
+ * .reset)?
+ */
 static bool
-bcm2712_pcib_adopt_listed(device_t dev)
+bcm2712_pcib_listed(device_t dev, const char *list)
 {
 	const char *name, *ua, *p;
 	size_t len, n;
@@ -728,7 +823,7 @@ bcm2712_pcib_adopt_listed(device_t dev)
 		return (false);
 	ua++;
 	len = strlen(ua);
-	for (p = bcm2712_pcib_adopt; *p != '\0'; p += n) {
+	for (p = list; *p != '\0'; p += n) {
 		if (*p == ' ' || *p == ',') {
 			n = 1;
 			continue;
@@ -739,6 +834,383 @@ bcm2712_pcib_adopt_listed(device_t dev)
 			return (true);
 	}
 	return (false);
+}
+
+/*
+ * Phase 3: bringing a controller up from reset, as Linux pcie-brcmstb.c
+ * does with bcm2712_cfg: brcm_pcie_probe(), brcm_pcie_setup(),
+ * brcm_pcie_post_setup_bcm2712() and brcm_pcie_start_link().  bcm2712_cfg
+ * has no PHY to start (brcm_phy_start() does nothing without has_phy),
+ * drives PERST# the 7278 way, has the NO_SSC quirk, and no SCB sizes to
+ * program (brcm_pcie_get_inbound_wins() returns before them for 7712).
+ */
+
+/* Linux brcm_pcie_mdio_write(), port 0 only.  0 or ETIMEDOUT. */
+static int
+bcm2712_pcib_mdio_write(struct bcm2712_pcib_softc *sc, u_int port,
+    u_int regad, uint16_t data)
+{
+	int us;
+
+	bcm2712_pcib_set_reg(sc, REG_MDIO_ADDR, (port << MDIO_PORT_SHIFT) |
+	    (regad & 0xffff) | MDIO_CMD_WRITE);
+	(void)bcm2712_pcib_read_reg(sc, REG_MDIO_ADDR);
+	bcm2712_pcib_set_reg(sc, REG_MDIO_WR_DATA, MDIO_DATA_DONE | data);
+	for (us = 0; us <= 100; us += 10) {
+		if ((bcm2712_pcib_read_reg(sc, REG_MDIO_WR_DATA) &
+		    MDIO_DATA_DONE) == 0)
+			return (0);
+		DELAY(10);
+	}
+	return (ETIMEDOUT);
+}
+
+/*
+ * Linux brcm_pcie_probe() up to brcm_pcie_setup()'s first register access:
+ * the bridge out of reset, the shared calibration if asked for, then
+ * brcm_pcie_setup()'s bridge reset pulse.  Touches only the reset
+ * controllers.
+ */
+static int
+bcm2712_pcib_reset_bridge(device_t dev)
+{
+	struct bcm2712_pcib_softc *sc;
+	hwreset_t rescal;
+	int error;
+
+	sc = device_get_softc(dev);
+	error = hwreset_get_by_ofw_name(dev, 0, "bridge", &sc->bridge_rst);
+	if (error != 0) {
+		device_printf(dev, "no \"bridge\" reset in the DT (%d); "
+		    "not touching the controller\n", error);
+		return (ENXIO);
+	}
+	error = hwreset_deassert(sc->bridge_rst);
+	if (error != 0) {
+		device_printf(dev, "cannot deassert the bridge reset (%d)\n",
+		    error);
+		goto fail;
+	}
+
+	if (bcm2712_pcib_rescal != 0) {
+		error = hwreset_get_by_ofw_name(dev, 0, "rescal", &rescal);
+		if (error == 0) {
+			error = hwreset_deassert(rescal);
+			hwreset_release(rescal);
+		}
+		if (error != 0) {
+			device_printf(dev, "rescal failed (%d)\n", error);
+			goto fail;
+		}
+	} else
+		device_printf(dev, "rescal left as the firmware set it "
+		    "(hw.bcm2712_pcib.rescal=0)\n");
+
+	/* brcm_pcie_setup(): reset the bridge, then take it out of reset. */
+	error = hwreset_assert(sc->bridge_rst);
+	if (error == 0) {
+		DELAY(200);
+		error = hwreset_deassert(sc->bridge_rst);
+	}
+	if (error != 0) {
+		device_printf(dev, "cannot pulse the bridge reset (%d)\n",
+		    error);
+		goto fail;
+	}
+	return (0);
+fail:
+	hwreset_release(sc->bridge_rst);
+	return (ENXIO);
+}
+
+/*
+ * Linux brcm_pcie_setup() after the bridge reset, less the windows and the
+ * class code, which attach programs on both paths.
+ */
+static int
+bcm2712_pcib_setup(struct bcm2712_pcib_softc *sc)
+{
+	uint32_t aspm, tmp;
+
+	/* SerDes out of IDDQ, then let it settle. */
+	tmp = bcm2712_pcib_read_reg(sc, sc->cfg->hard_debug);
+	tmp &= ~HARD_DEBUG_SERDES_IDDQ;
+	bcm2712_pcib_set_reg(sc, sc->cfg->hard_debug, tmp);
+	DELAY(200);
+
+	tmp = bcm2712_pcib_read_reg(sc, REG_MISC_CTRL);
+	tmp |= MISC_CTRL_SCB_ACCESS_EN | MISC_CTRL_CFG_READ_UR_MODE |
+	    MISC_CTRL_RCB_MPS_MODE | MISC_CTRL_RCB_64B_MODE;
+	tmp &= ~MISC_CTRL_MAX_BURST_SIZE_MASK;
+	tmp |= MAX_BURST_SIZE_512 << MISC_CTRL_MAX_BURST_SIZE_SHIFT;
+	bcm2712_pcib_set_reg(sc, REG_MISC_CTRL, tmp);
+
+	if ((bcm2712_pcib_read_reg(sc, REG_BRIDGE_STATE) &
+	    BRIDGE_STATE_PORT) == 0) {
+		device_printf(sc->dev, "misconfigured as an endpoint\n");
+		return (ENXIO);
+	}
+
+	/* Always advertise L1; L0s too unless aspm-no-l0s. */
+	aspm = ASPM_SUPPORT_L1;
+	if (!OF_hasprop(ofw_bus_get_node(sc->dev), "aspm-no-l0s"))
+		aspm |= ASPM_SUPPORT_L0S;
+	tmp = bcm2712_pcib_read_reg(sc, REG_LINK_CAPABILITY);
+	tmp &= ~LINK_CAPABILITY_ASPM_SUPPORT_MASK;
+	tmp |= aspm << LINK_CAPABILITY_ASPM_SUPPORT_SHIFT;
+	bcm2712_pcib_set_reg(sc, REG_LINK_CAPABILITY, tmp);
+
+	/* PCIe->SCB endian mode for inbound window: little endian. */
+	tmp = bcm2712_pcib_read_reg(sc, REG_VENDOR_SPECIFIC_REG1);
+	tmp &= ~VENDOR_REG1_ENDIAN_MODE_BAR2_MASK;
+	bcm2712_pcib_set_reg(sc, REG_VENDOR_SPECIFIC_REG1, tmp);
+
+	return (0);
+}
+
+/* Linux brcm_pcie_post_setup_bcm2712(). */
+static int
+bcm2712_pcib_post_setup(struct bcm2712_pcib_softc *sc)
+{
+	static const uint16_t data[] =
+	    { 0x50b9, 0xbda1, 0x0094, 0x97b4, 0x5030, 0x5030, 0x0007 };
+	static const uint8_t regs[] =
+	    { 0x16, 0x17, 0x18, 0x19, 0x1b, 0x1c, 0x1e };
+	phandle_t node;
+	uint8_t qos_map[4];
+	uint32_t tmp;
+	int error, i;
+
+	/* Allow a 54 MHz (xosc) refclk source. */
+	error = bcm2712_pcib_mdio_write(sc, MDIO_PORT0, MDIO_SET_ADDR_OFFSET,
+	    0x1600);
+	for (i = 0; error == 0 && i < nitems(regs); i++)
+		error = bcm2712_pcib_mdio_write(sc, MDIO_PORT0, regs[i],
+		    data[i]);
+	if (error != 0) {
+		device_printf(sc->dev, "refclk PLL set-up over MDIO timed "
+		    "out\n");
+		return (error);
+	}
+	DELAY(200);
+
+	/* L1SS sub-state timers: PM clock period 18.52 ns (1/54 MHz). */
+	tmp = bcm2712_pcib_read_reg(sc, REG_PL_PHY_CTL_15);
+	tmp &= ~PL_PHY_CTL_15_PM_CLK_PERIOD_MASK;
+	tmp |= 0x12;
+	bcm2712_pcib_set_reg(sc, REG_PL_PHY_CTL_15, tmp);
+
+	/* UBUS-AXI bridge: failed reads return all ones, not an AXI error. */
+	tmp = bcm2712_pcib_read_reg(sc, REG_UBUS_CTRL);
+	tmp |= UBUS_CTRL_REPLY_ERR_DIS | UBUS_CTRL_REPLY_DECERR_DIS;
+	bcm2712_pcib_set_reg(sc, REG_UBUS_CTRL, tmp);
+	bcm2712_pcib_set_reg(sc, REG_AXI_READ_ERROR_DATA, 0xffffffff);
+
+	/*
+	 * UBUS timeout 250 ms, then the RC config retry timeout ~240 ms,
+	 * in clocks of 750 MHz.
+	 */
+	bcm2712_pcib_set_reg(sc, REG_UBUS_TIMEOUT, 0xb2d0000);
+	bcm2712_pcib_set_reg(sc, REG_RC_CONFIG_RETRY_TIMEOUT, 0xaba0000);
+
+	/* Disable broken forwarding search; chicken bits for 2712D0. */
+	tmp = bcm2712_pcib_read_reg(sc, REG_AXI_INTF_CTRL);
+	tmp &= ~AXI_REQFIFO_EN_QOS_PROPAGATION;
+	tmp |= AXI_EN_RCLK_QOS_ARRAY_FIX | AXI_EN_QOS_UPDATE_TIMING_FIX |
+	    AXI_DIS_QOS_GATING_IN_MASTER;
+	bcm2712_pcib_set_reg(sc, REG_AXI_INTF_CTRL, tmp);
+
+	/*
+	 * QOS_UPDATE_TIMING_FIX reads as 0 on a 2712C1 or a single-lane RC:
+	 * throttle AXI requests in flight instead.
+	 */
+	tmp = bcm2712_pcib_read_reg(sc, REG_AXI_INTF_CTRL);
+	if ((tmp & AXI_EN_QOS_UPDATE_TIMING_FIX) == 0) {
+		tmp &= ~AXI_MASTER_MAX_OUTSTANDING_MASK;
+		tmp |= 15;
+		bcm2712_pcib_set_reg(sc, REG_AXI_INTF_CTRL, tmp);
+	}
+
+	/* VDM reception off. */
+	tmp = bcm2712_pcib_read_reg(sc, REG_MISC_CTRL_1);
+	tmp &= ~MISC_CTRL_1_EN_VDM_QOS_CONTROL;
+	bcm2712_pcib_set_reg(sc, REG_MISC_CTRL_1, tmp);
+
+	/*
+	 * brcm,fifo-qos-map: a QoS for each quartile of FIFO level, the same
+	 * for every TC.  Linux's alternative, brcm,vdm-qos-map, is not
+	 * implemented; it is only reported.
+	 */
+	node = ofw_bus_get_node(sc->dev);
+	if (OF_getprop(node, "brcm,fifo-qos-map", qos_map,
+	    sizeof(qos_map)) == sizeof(qos_map)) {
+		tmp = 0;
+		for (i = 0; i < 4; i++)
+			tmp |= (uint32_t)(qos_map[i] & 0x0f) << (i * 4);
+		for (i = 0; i < 8; i++)
+			bcm2712_pcib_set_reg(sc, REG_TC_QUEUE_TO_QOS_MAP(i), tmp);
+	} else if (OF_hasprop(node, "brcm,vdm-qos-map"))
+		device_printf(sc->dev, "brcm,vdm-qos-map is not implemented; "
+		    "ignored\n");
+
+	return (0);
+}
+
+/* Linux brcm_config_clkreq(), for the DT's brcm,clkreq-mode. */
+static void
+bcm2712_pcib_config_clkreq(struct bcm2712_pcib_softc *sc)
+{
+	char mode[16];
+	uint32_t hd, tmp;
+	bool no_l1ss;
+
+	memset(mode, 0, sizeof(mode));
+	if (OF_getprop(ofw_bus_get_node(sc->dev), "brcm,clkreq-mode", mode,
+	    sizeof(mode) - 1) <= 0)
+		strlcpy(mode, "default", sizeof(mode));
+
+	/*
+	 * Read-modify-write, starting from the register with the CLKREQ bits
+	 * cleared.  The Raspberry Pi Linux source ORs the mode's bits into an
+	 * uninitialised clkreq_cntl and writes that whole; this keeps the
+	 * other HARD_DEBUG bits (SERDES_IDDQ among them) as they are.
+	 */
+	hd = bcm2712_pcib_read_reg(sc, sc->cfg->hard_debug);
+	hd &= ~HARD_DEBUG_CLKREQ_MASK;
+	no_l1ss = true;
+	if (strcmp(mode, "no-l1ss") == 0)
+		hd |= HARD_DEBUG_CLKREQ_DEBUG_ENABLE;
+	else if (strcmp(mode, "default") == 0) {
+		/* brcm_extend_rbus_timeout() does nothing on 7712. */
+		hd |= HARD_DEBUG_L1SS_ENABLE;
+		no_l1ss = false;
+	} else {
+		if (strcmp(mode, "safe") != 0)
+			device_printf(sc->dev, "invalid brcm,clkreq-mode "
+			    "\"%s\"\n", mode);
+		strlcpy(mode, "safe", sizeof(mode));
+		hd |= HARD_DEBUG_REFCLK_OVRD_OUT | HARD_DEBUG_REFCLK_OVRD_ENABLE;
+	}
+	if (no_l1ss) {
+		/* Un-advertise L1 substates. */
+		tmp = bcm2712_pcib_read_reg(sc, REG_ROOT_CAP);
+		tmp &= ~ROOT_CAP_L1SS_MODE_MASK;
+		tmp |= 2 << ROOT_CAP_L1SS_MODE_SHIFT;
+		bcm2712_pcib_set_reg(sc, REG_ROOT_CAP, tmp);
+	}
+	bcm2712_pcib_set_reg(sc, sc->cfg->hard_debug, hd);
+	device_printf(sc->dev, "clkreq-mode set to %s\n", mode);
+}
+
+static void
+bcm2712_pcib_set_perst(struct bcm2712_pcib_softc *sc, bool assert)
+{
+	uint32_t tmp;
+
+	/* The 7278 way: PERSTB, where 0 asserts PERST#. */
+	tmp = bcm2712_pcib_read_reg(sc, REG_PCIE_CTRL);
+	if (assert)
+		tmp &= ~PCIE_CTRL_PERSTB;
+	else
+		tmp |= PCIE_CTRL_PERSTB;
+	bcm2712_pcib_set_reg(sc, REG_PCIE_CTRL, tmp);
+}
+
+/* Linux brcm_pcie_start_link(), without SSC (the NO_SSC quirk). */
+static int
+bcm2712_pcib_start_link(struct bcm2712_pcib_softc *sc)
+{
+	phandle_t node;
+	pcell_t gen, tperst_ms;
+	uint32_t tmp;
+	uint16_t val;
+	int ms;
+
+	node = ofw_bus_get_node(sc->dev);
+
+	/* Limit the generation to max-link-speed: brcm_pcie_set_gen(). */
+	if (OF_getencprop(node, "max-link-speed", &gen, sizeof(gen)) ==
+	    sizeof(gen) && gen > 0) {
+		tmp = bcm2712_pcib_read_reg(sc, REG_LINK_CAPABILITY);
+		tmp &= ~LINK_CAPABILITY_MAX_LINK_SPEED_MASK;
+		tmp |= gen & LINK_CAPABILITY_MAX_LINK_SPEED_MASK;
+		bcm2712_pcib_set_reg(sc, REG_LINK_CAPABILITY, tmp);
+		val = le16toh(bus_read_2(sc->base.base.res,
+		    REG_PCIE_CAP + PCIER_LINK_CTL2));
+		val &= ~LINK_CTL2_TARGET_SPEED_MASK;
+		val |= gen & LINK_CTL2_TARGET_SPEED_MASK;
+		bus_write_2(sc->base.base.res, REG_PCIE_CAP + PCIER_LINK_CTL2,
+		    htole16(val));
+	}
+
+	/* CLKREQ# input off before link-up. */
+	tmp = bcm2712_pcib_read_reg(sc, sc->cfg->hard_debug);
+	tmp &= ~HARD_DEBUG_CLKREQ_MASK;
+	bcm2712_pcib_set_reg(sc, sc->cfg->hard_debug, tmp);
+
+	/*
+	 * Deassert PERST#.  brcm,tperst-clk-ms keeps the PERST# output low
+	 * for that long after the internal reset is released, so that the
+	 * refclk is stable sooner.
+	 */
+	if (OF_getencprop(node, "brcm,tperst-clk-ms", &tperst_ms,
+	    sizeof(tperst_ms)) == sizeof(tperst_ms) && tperst_ms > 0) {
+		tmp = bcm2712_pcib_read_reg(sc, sc->cfg->hard_debug);
+		bcm2712_pcib_set_reg(sc, sc->cfg->hard_debug,
+		    tmp | HARD_DEBUG_PERST_ASSERT);
+		bcm2712_pcib_set_perst(sc, false);
+		DELAY(tperst_ms * 1000);
+		tmp = bcm2712_pcib_read_reg(sc, sc->cfg->hard_debug);
+		bcm2712_pcib_set_reg(sc, sc->cfg->hard_debug,
+		    tmp & ~HARD_DEBUG_PERST_ASSERT);
+	} else
+		bcm2712_pcib_set_perst(sc, false);
+
+	/*
+	 * 100 ms after PERST# (PCIe CEM 2.2, PCIe r5.0 6.6.1), then up to
+	 * 100 ms more for the link.
+	 */
+	DELAY(100 * 1000);
+	for (ms = 0; ms < 100 && !bcm2712_pcib_link_up(sc); ms += 5)
+		DELAY(5 * 1000);
+	if (!bcm2712_pcib_link_up(sc)) {
+		device_printf(sc->dev, "link down (status 0x%08x)\n",
+		    bcm2712_pcib_read_reg(sc, REG_BRIDGE_STATE));
+		return (ENXIO);
+	}
+
+	bcm2712_pcib_config_clkreq(sc);
+
+	/* Root Control is reset by PERST#: re-enable CRS visibility. */
+	val = le16toh(bus_read_2(sc->base.base.res,
+	    REG_PCIE_CAP + PCIER_ROOT_CAP));
+	if ((val & PCIEM_ROOT_CAP_CRS_VIS) != 0) {
+		val = le16toh(bus_read_2(sc->base.base.res,
+		    REG_PCIE_CAP + PCIER_ROOT_CTL));
+		bus_write_2(sc->base.base.res, REG_PCIE_CAP + PCIER_ROOT_CTL,
+		    htole16(val | PCIEM_ROOT_CTL_CRS_VIS));
+	}
+	return (0);
+}
+
+/*
+ * The DT "bridge" reset's state, for a controller left untouched.  Reading
+ * it touches only the reset controller.
+ */
+static const char *
+bcm2712_pcib_bridge_reset_state(device_t dev)
+{
+	hwreset_t rst;
+	bool asserted;
+	int error;
+
+	if (hwreset_get_by_ofw_name(dev, 0, "bridge", &rst) != 0)
+		return ("not in the DT");
+	error = hwreset_is_asserted(rst, &asserted);
+	hwreset_release(rst);
+	if (error != 0)
+		return ("unreadable");
+	return (asserted ? "asserted" : "deasserted");
 }
 
 /*
@@ -781,6 +1253,7 @@ bcm2712_pcib_attach(device_t dev)
 	pci_addr_t phys_base, pci_base;
 	bus_size_t size;
 	uint32_t hardware_rev, link_state, tmp;
+	bool adopt;
 	int error;
 
 	sc = device_get_softc(dev);
@@ -788,13 +1261,20 @@ bcm2712_pcib_attach(device_t dev)
 	sc->cfg = (const struct bcm2712_pcib_cfg *)
 	    ofw_bus_search_compatible(dev, compat_data)->ocd_data;
 
-	if (!bcm2712_pcib_adopt_listed(dev)) {
-		device_printf(dev, "not in hw.bcm2712_pcib.adopt (\"%s\"); "
-		    "left untouched\n", bcm2712_pcib_adopt);
+	/* Adopt a trained link (phase 1), or bring one up from reset. */
+	adopt = bcm2712_pcib_listed(dev, bcm2712_pcib_adopt);
+	if (!adopt && !bcm2712_pcib_listed(dev, bcm2712_pcib_reset)) {
+		device_printf(dev, "not in hw.bcm2712_pcib.adopt (\"%s\") or "
+		    ".reset (\"%s\"); left untouched, bridge reset %s\n",
+		    bcm2712_pcib_adopt, bcm2712_pcib_reset,
+		    bcm2712_pcib_bridge_reset_state(dev));
 		return (ENXIO);
 	}
 
-	error = bcm2712_pcib_check_reset(dev);
+	if (adopt)
+		error = bcm2712_pcib_check_reset(dev);
+	else
+		error = bcm2712_pcib_reset_bridge(dev);
 	if (error != 0)
 		return (error);
 
@@ -810,30 +1290,41 @@ bcm2712_pcib_attach(device_t dev)
 	device_printf(dev, "hardware identifies as revision 0x%x.\n",
 	    hardware_rev);
 
-	/*
-	 * Phase 1 adopts the link the firmware trained (pciex4_reset=0 for
-	 * PCIe2); it does not reset, set up the PHY or train one itself.
-	 */
-	if (!bcm2712_pcib_link_up(sc)) {
-		device_printf(dev, "error: link is not up (status 0x%08x); "
-		    "link training is not implemented yet.\n",
-		    bcm2712_pcib_read_reg(sc, REG_BRIDGE_STATE));
-		error = ENXIO;
-		goto failed;
+	if (adopt) {
+		/*
+		 * Phase 1 adopts the link the firmware trained (pciex4_reset=0
+		 * for PCIe2); it does not reset, set up the PHY or train one.
+		 */
+		if (!bcm2712_pcib_link_up(sc)) {
+			device_printf(dev, "error: link is not up (status "
+			    "0x%08x); not in hw.bcm2712_pcib.reset, so not "
+			    "trained here.\n",
+			    bcm2712_pcib_read_reg(sc, REG_BRIDGE_STATE));
+			error = ENXIO;
+			goto failed;
+		}
+	} else {
+		error = bcm2712_pcib_setup(sc);
+		if (error != 0)
+			goto failed;
 	}
 
 	mtx_init(&sc->config_mtx, "bcm2712_pcib: config_mtx", NULL, MTX_DEF);
 
-	link_state = bcm2712_pcib_read_reg(sc, REG_BRIDGE_LINK_STATE) >> 0x10;
-	device_printf(dev, "link up at %s (adopted from the firmware).\n",
-	    bcm2712_pcib_link_state_string(link_state));
+	if (adopt) {
+		link_state = bcm2712_pcib_read_reg(sc, REG_BRIDGE_LINK_STATE) >>
+		    0x10;
+		device_printf(dev, "link up at %s (adopted from the firmware).\n",
+		    bcm2712_pcib_link_state_string(link_state));
 
-	/* Failed reads return all ones, not 0xdeaddead, and do not abort. */
-	if (sc->cfg->ubus_err_suppress) {
-		tmp = bcm2712_pcib_read_reg(sc, REG_UBUS_CTRL);
-		tmp |= UBUS_CTRL_REPLY_ERR_DIS | UBUS_CTRL_REPLY_DECERR_DIS;
-		bcm2712_pcib_set_reg(sc, REG_UBUS_CTRL, tmp);
-		bcm2712_pcib_set_reg(sc, REG_AXI_READ_ERROR_DATA, 0xffffffff);
+		/* Failed reads return all ones, not 0xdeaddead, and do not abort. */
+		if (sc->cfg->ubus_err_suppress) {
+			tmp = bcm2712_pcib_read_reg(sc, REG_UBUS_CTRL);
+			tmp |= UBUS_CTRL_REPLY_ERR_DIS | UBUS_CTRL_REPLY_DECERR_DIS;
+			bcm2712_pcib_set_reg(sc, REG_UBUS_CTRL, tmp);
+			bcm2712_pcib_set_reg(sc, REG_AXI_READ_ERROR_DATA,
+			    0xffffffff);
+		}
 	}
 
 	/*
@@ -867,6 +1358,35 @@ bcm2712_pcib_attach(device_t dev)
 	if (error != 0) {
 		mtx_destroy(&sc->config_mtx);
 		goto failed;
+	}
+
+	if (!adopt) {
+		/*
+		 * A device's DMA would miss RAM, and an NVMe controller would
+		 * fetch garbage for commands: do not release PERST#.
+		 */
+		if (!sc->ram_1to1) {
+			device_printf(dev, "not starting the link: RAM is not "
+			    "mapped 1:1 for DMA\n");
+			error = ENXIO;
+		}
+		if (error == 0)
+			error = bcm2712_pcib_post_setup(sc);
+		if (error == 0)
+			error = bcm2712_pcib_start_link(sc);
+		if (error != 0) {
+			bcm2712_pcib_set_perst(sc, true);
+			if (sc->dmat != NULL) {
+				bus_dma_tag_destroy(sc->dmat);
+				sc->dmat = NULL;
+			}
+			mtx_destroy(&sc->config_mtx);
+			goto failed;
+		}
+		tmp = bcm2712_pcib_read_reg(sc, REG_BRIDGE_LINK_STATE) >> 0x10;
+		device_printf(dev, "link up at %s x%u (trained from reset).\n",
+		    bcm2712_pcib_link_state_string(tmp),
+		    (tmp & PCIEM_LINK_STA_WIDTH) >> 4);
 	}
 
 	bcm2712_pcib_relocate_bridge_window(dev);
