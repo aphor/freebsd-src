@@ -52,11 +52,20 @@
  *   - MSI is not provided here: the DT's msi-parent is a separate
  *     brcm,bcm2712-mip controller (phase 4), not this node.
  *
+ *   - Inbound (DMA) windows: one per dma-ranges entry, programmed as
+ *     Linux set_inbound_win_registers() does for BCM2712 (RC_BARn size and
+ *     PCIe address, UBUS_BARn remap to the CPU address), and the unused
+ *     ones cleared, because we adopt the controller without a reset.
+ *     FreeBSD does not translate dma-ranges, so RAM must be mapped 1:1;
+ *     the freebsd-pcie2 overlay does that (rpi5_modules.git
+ *     doc/DT_OVERLAYS.md).  Attach says so if it is not.
+ *   - The bus DMA tag keeps DMA out of RAM that the outbound window
+ *     shadows (bcm2838_pci.c limits DMA with its tag too, for another
+ *     reason).
+ *
  *  Phase 1 only -- adopts a link the firmware already trained:
  *   - No bridge reset, PHY/PLL set-up, PERST# or link training (phases 3
  *     and 5); if the link is not up, attach fails.
- *   - The inbound (DMA) windows are left as found; see "A constraint: DMA
- *     addresses must be 1:1" in M2_PCIE_HOST.md before changing them.
  *
  *  Duplicate, merge as-is: the config-space window, the outbound window
  *  encoders, the root port class fix-up, the bridge window relocation.
@@ -88,6 +97,7 @@
 
 #include <machine/bus.h>
 #include <machine/intr.h>
+#include <machine/md_var.h>
 
 #include "pcib_if.h"
 
@@ -111,6 +121,25 @@
 #define UBUS_CTRL_REPLY_ERR_DIS		(1u << 13)
 #define UBUS_CTRL_REPLY_DECERR_DIS	(1u << 19)
 #define REG_AXI_READ_ERROR_DATA			0x4170
+
+/*
+ * Inbound windows, BCM2712 (7712) layout: Linux PCIE_MISC_RC_BAR{1,4}_*,
+ * PCIE_MISC_UBUS_BAR{1,4}_CONFIG_REMAP, brcm_bar_reg_offset() and
+ * brcm_ubus_reg_offset().
+ */
+#define REG_RC_BAR1_CONFIG_LO			0x402c
+#define REG_RC_BAR4_CONFIG_LO			0x40d4
+#define RC_BAR_CONFIG_LO_SIZE_MASK		0x1f
+#define REG_UBUS_BAR1_CONFIG_REMAP		0x40ac
+#define REG_UBUS_BAR4_CONFIG_REMAP		0x410c
+#define UBUS_BAR_CONFIG_REMAP_ACCESS_EN		0x1
+#define MAX_INBOUND_WINS			10
+
+struct bcm2712_pcib_inbound_win {
+	uint64_t	pci_base;
+	uint64_t	cpu_base;
+	uint64_t	size;
+};
 
 /*
  * Per-SoC differences, after Linux pcie-brcmstb.c struct pcie_cfg_data.
@@ -153,6 +182,7 @@ struct bcm2712_pcib_softc {
 	const struct bcm2712_pcib_cfg	*cfg;
 	hwreset_t			bridge_rst;
 	struct mtx			config_mtx;
+	bus_dma_tag_t			dmat;
 };
 
 static struct ofw_compat_data compat_data[] = {
@@ -222,12 +252,20 @@ bcm2712_pcib_check_ranges(device_t dev)
 	/*
 	 * The controller can handle several distinct ranges, but, as in
 	 * bcm2838_pci.c, only the first is implemented.
+	 *
+	 * BCM2712 differs: said always, not only under bootverbose.  The
+	 * generic FDT host has already put every range in its resource
+	 * manager, so PCI may place BARs in one this driver never programs,
+	 * and a second region there breaks growing a bridge window
+	 * (INVARIANTS "next resource mismatch").  The freebsd-pcie2 overlay
+	 * leaves one range (rpi5_modules.git doc/DT_OVERLAYS.md).
 	 */
-	for (i = 1; (bootverbose || error) && i < MAX_RANGES_TUPLES; ++i) {
+	for (i = 1; i < MAX_RANGES_TUPLES; ++i) {
 		if (ranges[i].size > 0)
 			device_printf(dev,
-			    "note: outbound memory range %d (pci addr: 0x%jx, "
-			    "cpu addr: 0x%jx, size: 0x%jx) will be ignored.\n",
+			    "WARNING: outbound memory range %d (pci addr: 0x%jx, "
+			    "cpu addr: 0x%jx, size: 0x%jx) is not programmed, "
+			    "but PCI may still place BARs in it.\n",
 			    i, ranges[i].pci_base, ranges[i].phys_base,
 			    ranges[i].size);
 	}
@@ -379,24 +417,38 @@ bcm2712_pcib_relocate_bridge_window(device_t dev)
 	 */
 
 	struct bcm2712_pcib_softc *sc;
-	pci_addr_t base, size, new_base, new_limit;
+	pci_addr_t base, limit, size, new_base, new_limit, range_end;
 	uint16_t val;
 
 	sc = device_get_softc(dev);
 
+	/* uint32_t: PCI_PPBMEM*() shift val left 16, which overflows int. */
 	val = bcm2712_pcib_read_config(dev, 0, 0, 0, PCIR_MEMBASE_1, 2);
-	base = PCI_PPBMEMBASE(0, val);
+	base = PCI_PPBMEMBASE(0, (uint32_t)val);
 
 	val = bcm2712_pcib_read_config(dev, 0, 0, 0, PCIR_MEMLIMIT_1, 2);
-	size = PCI_PPBMEMLIMIT(0, val) - base;
+	limit = PCI_PPBMEMLIMIT(0, (uint32_t)val);
+	size = limit - base;
 
 	new_base = sc->base.base.ranges[0].pci_base;
 	val = (uint16_t) (new_base >> 16);
 	bcm2712_pcib_write_config(dev, 0, 0, 0, PCIR_MEMBASE_1, val, 2);
 
+	/*
+	 * BCM2712 differs: keep the moved window inside the range.  An
+	 * adopted link comes with the firmware's window, which need not fit
+	 * the DT's range at its new place.
+	 */
+	range_end = new_base + sc->base.base.ranges[0].size - 1;
 	new_limit = new_base + size;
+	if (limit < base || new_limit > range_end)
+		new_limit = range_end;
 	val = (uint16_t) (new_limit >> 16);
 	bcm2712_pcib_write_config(dev, 0, 0, 0, PCIR_MEMLIMIT_1, val, 2);
+
+	device_printf(dev, "root port memory window 0x%jx-0x%jx as found, "
+	    "now 0x%jx-0x%jx\n", (uintmax_t)base, (uintmax_t)limit,
+	    (uintmax_t)new_base, (uintmax_t)(new_limit | 0xfffff));
 }
 
 static uint32_t
@@ -419,6 +471,249 @@ encode_cpu_window_end_high(pci_addr_t phys_base, bus_size_t size)
 {
 
 	return (((phys_base + size - 1) >> 0x20) & 0xff);
+}
+
+static bus_size_t
+bcm2712_pcib_rc_bar_reg(u_int bar)
+{
+
+	return (bar <= 3 ? REG_RC_BAR1_CONFIG_LO + 8 * (bar - 1) :
+	    REG_RC_BAR4_CONFIG_LO + 8 * (bar - 4));
+}
+
+static bus_size_t
+bcm2712_pcib_ubus_bar_reg(u_int bar)
+{
+
+	return (bar <= 3 ? REG_UBUS_BAR1_CONFIG_REMAP + 8 * (bar - 1) :
+	    REG_UBUS_BAR4_CONFIG_REMAP + 8 * (bar - 4));
+}
+
+/*
+ * RC_BARn size field; Linux brcm_pcie_encode_ibar_size().  0 disables the
+ * window, and is also returned for a size the field cannot express.
+ */
+static uint32_t
+bcm2712_pcib_encode_ibar_size(uint64_t size)
+{
+	int log2_in;
+
+	if (size == 0 || !powerof2(size))
+		return (0);
+	log2_in = flsll(size) - 1;
+	if (log2_in >= 12 && log2_in <= 15)
+		return ((log2_in - 12) + 0x1c);
+	if (log2_in >= 16 && log2_in <= 36)
+		return (log2_in - 15);
+	return (0);
+}
+
+/*
+ * The DT's dma-ranges, as inbound windows.  Returns the number of windows,
+ * or -1 if the property cannot be read as <3 PCI cells, 1-2 parent
+ * address cells, 1-2 size cells>.
+ */
+static int
+bcm2712_pcib_get_inbound_wins(device_t dev,
+    struct bcm2712_pcib_inbound_win *wins, int max)
+{
+	phandle_t node;
+	pcell_t acells, pacells, scells, *cells, *c;
+	ssize_t len;
+	int i, k, n, tuple;
+
+	node = ofw_bus_get_node(dev);
+	if (OF_getencprop(node, "#address-cells", &acells,
+	    sizeof(acells)) <= 0)
+		acells = 3;
+	if (OF_getencprop(node, "#size-cells", &scells, sizeof(scells)) <= 0)
+		scells = 2;
+	if (OF_getencprop(OF_parent(node), "#address-cells", &pacells,
+	    sizeof(pacells)) <= 0)
+		pacells = 2;
+	if (acells != 3 || pacells < 1 || pacells > 2 || scells < 1 ||
+	    scells > 2)
+		return (-1);
+
+	len = OF_getencprop_alloc_multi(node, "dma-ranges", sizeof(*cells),
+	    (void **)&cells);
+	if (len <= 0)
+		return (0);
+	tuple = acells + pacells + scells;
+	n = 0;
+	for (i = 0; i + tuple <= len && n < max; i += tuple) {
+		c = &cells[i];
+		wins[n].pci_base = ((uint64_t)c[1] << 32) | c[2];
+		wins[n].cpu_base = 0;
+		for (k = 0; k < pacells; k++)
+			wins[n].cpu_base = (wins[n].cpu_base << 32) | c[3 + k];
+		wins[n].size = 0;
+		for (k = 0; k < scells; k++)
+			wins[n].size = (wins[n].size << 32) |
+			    c[3 + pacells + k];
+		n++;
+	}
+	OF_prop_free(cells);
+	return (n);
+}
+
+/*
+ * Report the inbound windows as the firmware left them; the enabled ones
+ * only.  RC_BARn holds the PCIe address and the size code, UBUS_BARn the
+ * CPU address it maps to.
+ */
+static void
+bcm2712_pcib_log_inbound_wins(struct bcm2712_pcib_softc *sc)
+{
+	uint32_t lo, hi, ulo, uhi;
+	u_int bar;
+
+	for (bar = 1; bar <= sc->cfg->num_inbound_wins; bar++) {
+		lo = bcm2712_pcib_read_reg(sc, bcm2712_pcib_rc_bar_reg(bar));
+		hi = bcm2712_pcib_read_reg(sc, bcm2712_pcib_rc_bar_reg(bar) + 4);
+		ulo = bcm2712_pcib_read_reg(sc, bcm2712_pcib_ubus_bar_reg(bar));
+		uhi = bcm2712_pcib_read_reg(sc,
+		    bcm2712_pcib_ubus_bar_reg(bar) + 4);
+		if ((lo & RC_BAR_CONFIG_LO_SIZE_MASK) == 0 &&
+		    (ulo & UBUS_BAR_CONFIG_REMAP_ACCESS_EN) == 0)
+			continue;
+		device_printf(sc->dev, "inbound window %u as found: "
+		    "PCIe 0x%jx size code 0x%x -> CPU 0x%jx%s\n", bar,
+		    (uintmax_t)(((uint64_t)hi << 32) |
+		    (lo & ~RC_BAR_CONFIG_LO_SIZE_MASK)),
+		    lo & RC_BAR_CONFIG_LO_SIZE_MASK,
+		    (uintmax_t)(((uint64_t)uhi << 32) | (ulo & ~0xfffu)),
+		    (ulo & UBUS_BAR_CONFIG_REMAP_ACCESS_EN) ? "" :
+		    " (remap disabled)");
+	}
+}
+
+/* Linux set_inbound_win_registers() for BCM2712, clearing the rest. */
+static void
+bcm2712_pcib_set_inbound_wins(struct bcm2712_pcib_softc *sc,
+    const struct bcm2712_pcib_inbound_win *wins, int n)
+{
+	const struct bcm2712_pcib_inbound_win *w;
+	bus_size_t reg, ureg;
+	uint32_t lo;
+	u_int bar;
+
+	for (bar = 1; bar <= sc->cfg->num_inbound_wins; bar++) {
+		reg = bcm2712_pcib_rc_bar_reg(bar);
+		ureg = bcm2712_pcib_ubus_bar_reg(bar);
+		if (bar > (u_int)n) {
+			bcm2712_pcib_set_reg(sc, reg, 0);
+			bcm2712_pcib_set_reg(sc, reg + 4, 0);
+			bcm2712_pcib_set_reg(sc, ureg, 0);
+			bcm2712_pcib_set_reg(sc, ureg + 4, 0);
+			continue;
+		}
+		w = &wins[bar - 1];
+		lo = ((uint32_t)w->pci_base & ~RC_BAR_CONFIG_LO_SIZE_MASK) |
+		    bcm2712_pcib_encode_ibar_size(w->size);
+		bcm2712_pcib_set_reg(sc, reg, lo);
+		bcm2712_pcib_set_reg(sc, reg + 4, w->pci_base >> 32);
+		bcm2712_pcib_set_reg(sc, ureg,
+		    ((uint32_t)w->cpu_base & ~0xfffu) |
+		    UBUS_BAR_CONFIG_REMAP_ACCESS_EN);
+		bcm2712_pcib_set_reg(sc, ureg + 4, w->cpu_base >> 32);
+		device_printf(sc->dev, "inbound window %u: PCIe 0x%jx -> "
+		    "CPU 0x%jx, size 0x%jx\n", bar, (uintmax_t)w->pci_base,
+		    (uintmax_t)w->cpu_base, (uintmax_t)w->size);
+	}
+}
+
+/*
+ * Program the inbound windows from dma-ranges and build the DMA tag.
+ *
+ * busdma gives devices CPU physical addresses, so all of RAM must be in a
+ * window that maps PCIe X to CPU X.  The outbound window's PCIe range then
+ * shadows the RAM at the same addresses -- a device's DMA to them would be
+ * taken for a transfer to a device behind the bridge -- so the tag keeps
+ * DMA out of it, the way a DMA limit would, with bounce buffers.
+ */
+static int
+bcm2712_pcib_setup_inbound(struct bcm2712_pcib_softc *sc)
+{
+	struct bcm2712_pcib_inbound_win wins[MAX_INBOUND_WINS];
+	uint64_t ram_end, ob_lo, ob_hi;
+	bus_addr_t lowaddr, highaddr;
+	bool ram_1to1;
+	int error, i, n;
+
+	bcm2712_pcib_log_inbound_wins(sc);
+
+	n = bcm2712_pcib_get_inbound_wins(sc->dev, wins,
+	    MIN(sc->cfg->num_inbound_wins, MAX_INBOUND_WINS));
+	if (n <= 0) {
+		device_printf(sc->dev, "no usable dma-ranges (%d); inbound "
+		    "windows left as found\n", n);
+		return (0);
+	}
+	for (i = 0; i < n; i++) {
+		if (bcm2712_pcib_encode_ibar_size(wins[i].size) == 0 ||
+		    (wins[i].pci_base & (wins[i].size - 1)) != 0) {
+			device_printf(sc->dev, "dma-ranges entry %d (PCIe "
+			    "0x%jx, size 0x%jx) cannot be an inbound window; "
+			    "inbound windows left as found\n", i,
+			    (uintmax_t)wins[i].pci_base,
+			    (uintmax_t)wins[i].size);
+			return (0);
+		}
+	}
+
+	ram_end = ptoa((uint64_t)Maxmem);
+	ram_1to1 = false;
+	for (i = 0; i < n; i++)
+		if (wins[i].pci_base == 0 && wins[i].cpu_base == 0 &&
+		    wins[i].size >= ram_end)
+			ram_1to1 = true;
+	if (!ram_1to1)
+		device_printf(sc->dev, "WARNING: dma-ranges do not map RAM "
+		    "(0-0x%jx) 1:1, and FreeBSD does not translate them: DMA "
+		    "by devices behind this bridge will not reach RAM.  "
+		    "Expected the freebsd-pcie2 device-tree overlay "
+		    "(rpi5_modules.git doc/DT_OVERLAYS.md).\n",
+		    (uintmax_t)ram_end);
+
+	bcm2712_pcib_set_inbound_wins(sc, wins, n);
+
+	/* Keep DMA out of the RAM the outbound window shadows. */
+	lowaddr = BUS_SPACE_MAXADDR;
+	highaddr = BUS_SPACE_MAXADDR;
+	ob_lo = sc->base.base.ranges[0].pci_base;
+	ob_hi = ob_lo + sc->base.base.ranges[0].size - 1;
+	if (ram_1to1 && ob_lo < ram_end) {
+		lowaddr = ob_lo - 1;
+		highaddr = ob_hi;
+		device_printf(sc->dev, "DMA excluded from 0x%jx-0x%jx, "
+		    "shadowed by the outbound window\n", (uintmax_t)ob_lo,
+		    (uintmax_t)ob_hi);
+	}
+	error = bus_dma_tag_create(bus_get_dma_tag(sc->dev), /* parent */
+	    1, 0,				/* alignment, bounds */
+	    lowaddr,				/* lowaddr */
+	    highaddr,				/* highaddr */
+	    NULL, NULL,				/* filter, filterarg */
+	    BUS_SPACE_MAXSIZE,			/* maxsize */
+	    BUS_SPACE_UNRESTRICTED,		/* nsegments */
+	    BUS_SPACE_MAXSIZE,			/* maxsegsize */
+	    sc->base.base.coherent ? BUS_DMA_COHERENT : 0, /* flags */
+	    NULL, NULL,				/* lockfunc, lockarg */
+	    &sc->dmat);
+	if (error != 0)
+		device_printf(sc->dev, "cannot create the DMA tag (%d)\n",
+		    error);
+	return (error);
+}
+
+static bus_dma_tag_t
+bcm2712_pcib_get_dma_tag(device_t dev, device_t child)
+{
+	struct bcm2712_pcib_softc *sc;
+
+	sc = device_get_softc(dev);
+	return (sc->dmat != NULL ? sc->dmat : sc->base.base.dmat);
 }
 
 /* Is this controller's DT unit address in hw.bcm2712_pcib.adopt? */
@@ -567,6 +862,13 @@ bcm2712_pcib_attach(device_t dev)
 	bcm2712_pcib_set_reg(sc, PCI_ID_VAL3,
 	    PCIC_BRIDGE << CLASS_SHIFT | PCIS_BRIDGE_PCI << SUBCLASS_SHIFT);
 
+	/* The PCI->CPU (DMA) direction, and the tag that goes with it. */
+	error = bcm2712_pcib_setup_inbound(sc);
+	if (error != 0) {
+		mtx_destroy(&sc->config_mtx);
+		goto failed;
+	}
+
 	bcm2712_pcib_relocate_bridge_window(dev);
 
 	/* Done. */
@@ -586,6 +888,9 @@ static device_method_t bcm2712_pcib_methods[] = {
 	/* Device interface. */
 	DEVMETHOD(device_probe,			bcm2712_pcib_probe),
 	DEVMETHOD(device_attach,		bcm2712_pcib_attach),
+
+	/* Bus interface. */
+	DEVMETHOD(bus_get_dma_tag,		bcm2712_pcib_get_dma_tag),
 
 	/* PCIB interface. */
 	DEVMETHOD(pcib_read_config,		bcm2712_pcib_read_config),
