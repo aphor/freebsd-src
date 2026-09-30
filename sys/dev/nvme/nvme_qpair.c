@@ -549,12 +549,35 @@ nvme_qpair_construct(struct nvme_qpair *qpair,
 	qpair->timer_armed = false;
 	qpair->recovery_state = RECOVERY_WAITING;
 
-	/* Note: NVMe PRP format is restricted to 4-byte alignment. */
+	/*
+	 * Note: NVMe PRP format is restricted to 4-byte alignment.
+	 *
+	 * BUS_DMA_KEEP_PG_OFFSET: only PRP1 may carry an offset into its
+	 * page, the data it describes runs to the end of that page, and every
+	 * later PRP entry must be page aligned.  nvme_payload_map() builds the
+	 * PRPs from segment addresses alone, so a bounced segment must keep
+	 * the page offset of the data it stands in for.  Without the flag the
+	 * bounce code gives it a bounce page at offset 0 but keeps its length:
+	 * the controller then reads the transfer's layout differently from
+	 * the segment list, and puts the data at the wrong addresses or fails
+	 * the command (status 00/13, PRP Offset Invalid).
+	 *
+	 * The intent is correct I/O on every platform whose busdma bounces,
+	 * not only on hosts where bouncing is rare.  The bounce code shared by
+	 * arm, arm64, powerpc and riscv (kern/subr_busdma_bounce.c) and x86's
+	 * busdma_bounce.c honour the flag.  On
+	 * arm64, busdma bounces buffers that are not cache-line aligned on a
+	 * non-coherent bus, and buffers outside the DMA range of a host
+	 * bridge's tag (e.g. a Raspberry Pi 5 with RAM behind the 32-bit
+	 * outbound window).  usb(4) and storvsc(4) set the flag for the same
+	 * reason.  Bounced segments already end at a page boundary, so the
+	 * kept offset leaves them within their bounce page.
+	 */
 	err = bus_dma_tag_create(bus_get_dma_tag(ctrlr->dev),
 	    4, ctrlr->page_size, BUS_SPACE_MAXADDR,
 	    BUS_SPACE_MAXADDR, NULL, NULL, ctrlr->max_xfer_size,
 	    howmany(ctrlr->max_xfer_size, ctrlr->page_size) + 1,
-	    ctrlr->page_size, 0,
+	    ctrlr->page_size, BUS_DMA_KEEP_PG_OFFSET,
 	    NULL, NULL, &qpair->dma_tag_payload);
 	if (err != 0) {
 		nvme_printf(ctrlr, "payload tag create failed %d\n", err);

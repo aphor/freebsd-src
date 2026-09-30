@@ -39,6 +39,14 @@
 
 #include "cyw_var.h"
 
+/*
+ * The "join" payload must have Linux's natural-alignment layout
+ * (brcmf_ext_join_params_le); the firmware parses it by these offsets.
+ */
+CTASSERT(offsetof(struct cyw_ext_join_params, scan_le) == 36);
+CTASSERT(offsetof(struct cyw_ext_join_params, assoc_le) == 56);
+CTASSERT(offsetof(struct cyw_assoc_params_le, chanspec_list) == 12);
+
 /* -------------------------------------------------------------------------
  * Private VAP structure
  * ------------------------------------------------------------------------- */
@@ -56,8 +64,9 @@ struct cyw_vap {
  *
  * State transitions handled here:
  *   * → INIT:   if link_up, issue WLC_DISASSOC.
- *   * → AUTH:   abort any escan, push wsec/wpa_auth/wsec_pmk, issue
- *               WLC_SET_SSID with the target BSSID.  Firmware drives
+ *   * → AUTH:   abort any escan, push wsec/wpa_auth/wsec_pmk, issue the
+ *               "join" iovar with the target BSSID (WLC_SET_SSID if it
+ *               fails).  Firmware drives
  *               802.11 auth + assoc + 4-way handshake internally and
  *               reports completion via E_LINK (handled by security.c).
  *
@@ -289,6 +298,7 @@ cyw_newstate(struct ieee80211vap *vap, enum ieee80211_state nstate, int arg)
 		 */
 		{
 			struct cyw_ext_join_params join;
+			size_t join_len;
 			uint16_t chanspec;
 			int ieee_chan;
 
@@ -337,32 +347,31 @@ cyw_newstate(struct ieee80211vap *vap, enum ieee80211_state nstate, int arg)
 			}
 
 			/*
-			 * Use bsscfg-scoped iovar: prepends a 4-byte LE
-			 * bsscfg index (= 0, primary BSS) matching Linux
-			 * brcmf_fil_bsscfg_data_set().  Without the prefix,
-			 * firmware interprets the first 4 bytes of
-			 * ext_join_params (SSID_len field) as the bsscfg
-			 * index, looks up a non-existent BSS, and returns
-			 * BCME_NOTUP (-14).
+			 * Length as Linux computes it: everything up to the
+			 * chanspec list, plus one chanspec if there is one.
+			 * On the primary BSS, cyw_fil_bsscfg_data_set() is a
+			 * plain iovar, as brcmf_fil_bsscfg_data_set() is.
+			 *
+			 * This returned -14 on every join until the layout of
+			 * cyw_ext_join_params matched Linux (see cyw_var.h).
+			 * -14 is BCME_BUFTOOSHORT in Linux brcmf_fil_errstr[];
+			 * it had been read as BCME_NOTUP, which is -4.
 			 */
+			join_len =
+			    offsetof(struct cyw_ext_join_params, assoc_le) +
+			    offsetof(struct cyw_assoc_params_le, chanspec_list) +
+			    (chanspec != 0 ? sizeof(uint16_t) : 0);
+
 			err = cyw_fil_bsscfg_data_set(sc, "join",
-			    &join, sizeof(join));
+			    &join, join_len);
 			device_printf(sc->dev,
 			    "AUTH: join chan=%d chanspec=0x%04x returned %d\n",
 			    ieee_chan, chanspec, err);
 
 			/*
-			 * Fallback: WLC_SET_SSID legacy join.
-			 *
-			 * Linux brcmf_cfg80211_connect (cfg80211.c:2587-2601)
-			 * falls back to BRCMF_C_SET_SSID with brcmf_join_params
-			 * when the extended "join" IOVAR fails.  CYW43455
-			 * firmware 7.45.265 appears to selectively reject the
-			 * bsscfg-scoped "join" with a stable BCME_NOTUP even
-			 * with bss enable=1, wpaie, set_pmk, and bsscfg-scoped
-			 * security iovars all confirmed succeeding.  Now that
-			 * those prerequisites are in place, WLC_SET_SSID may
-			 * succeed where it previously returned NO_NETWORKS.
+			 * Fallback: WLC_SET_SSID legacy join, as Linux
+			 * brcmf_cfg80211_connect (cfg80211.c:2587-2601) falls
+			 * back to BRCMF_C_SET_SSID when "join" fails.
 			 *
 			 * Format: brcmf_join_params = ssid_le + assoc_params_le
 			 * (see cyw_join_params in cyw_var.h).  Sent as a
@@ -829,7 +838,7 @@ static int
 cyw_tx_data_frame(struct cyw_softc *sc, struct mbuf *m)
 {
 	struct cyw_sdpcm_hdr *sph;
-	struct ether_header *eh;
+	struct ether_header ehdr, *eh;
 	uint8_t *bdc, *frame_buf, *pkt;
 	size_t eth_len, framelen;
 	uint16_t ethertype;
@@ -837,15 +846,21 @@ cyw_tx_data_frame(struct cyw_softc *sc, struct mbuf *m)
 	uint8_t priority;
 	int err;
 
-	/* Linearize — mbuf chain may be scattered. */
-	if (m->m_next != NULL) {
-		struct mbuf *n = m_pullup(m, m->m_pkthdr.len);
-		if (n == NULL)
-			return (ENOBUFS);
-		m = n;
-	}
-	eth_len  = m->m_len;
+	/*
+	 * The frame is copied out of the mbuf chain below, straight into the
+	 * flat SDPCM buffer, so the chain never needs linearising.  This used
+	 * to m_pullup() the whole packet first, and m_pullup() refuses any
+	 * length over MHLEN (about 200 bytes): every chained frame larger
+	 * than that -- most TCP data, and anything the stack built in two
+	 * mbufs -- was freed with ENOBUFS before it reached the bus.  The
+	 * Ethernet header is copied to the stack for classification.
+	 */
+	eth_len  = m->m_pkthdr.len;
 	framelen = ALIGN4(CYW_SDPCM_HDR_LEN + CYW_BDC_DATA_HDR_LEN + eth_len);
+	if (eth_len >= sizeof(ehdr))
+		m_copydata(m, 0, sizeof(ehdr), (caddr_t)&ehdr);
+	else
+		memset(&ehdr, 0, sizeof(ehdr));
 
 	/*
 	 * EAPOL classification — mirrors Linux brcmf_netdev_start_xmit
@@ -853,7 +868,7 @@ cyw_tx_data_frame(struct cyw_softc *sc, struct mbuf *m)
 	 * data (cfg80211_classify8021d() returns 0 for non-IP traffic).
 	 * Log every EAPOL TX so we can confirm M2 / M4 actually leave.
 	 */
-	eh = mtod(m, struct ether_header *);
+	eh = &ehdr;
 	if (eth_len >= sizeof(*eh)) {
 		ethertype = ntohs(eh->ether_type);
 		is_eapol  = (ethertype == ETHERTYPE_PAE);
@@ -873,21 +888,42 @@ cyw_tx_data_frame(struct cyw_softc *sc, struct mbuf *m)
 		    eh->ether_shost, ":", eh->ether_dhost, ":");
 	}
 
-	/* Drop rather than block if no TX credits. */
-	if ((uint8_t)(sc->sdpcm_rx_max - sc->sdpcm_tx_seq) == 0) {
+	/*
+	 * cyw_tx_task only calls here with credit available, so this is a
+	 * backstop: a frame dropped here is lost to TCP until it retransmits.
+	 */
+	if (!cyw_tx_credits_ok(sc)) {
+		sc->tx_credit_drops++;
 		m_freem(m);
 		return (ENOBUFS);
 	}
 
-	pkt = malloc(framelen, M_CYW, M_NOWAIT | M_ZERO);
+	/*
+	 * Allocated to the CYW_F2_BLKSIZE multiple that cyw_f2_write_block()
+	 * actually sends, not to framelen: the padding goes to the card and
+	 * must be zeros from this buffer, not whatever follows it in the heap.
+	 */
+	pkt = malloc(roundup2(framelen, CYW_F2_BLKSIZE), M_CYW,
+	    M_NOWAIT | M_ZERO);
 	if (pkt == NULL) {
 		m_freem(m);
 		return (ENOBUFS);
 	}
 
 	sph = (struct cyw_sdpcm_hdr *)pkt;
-	sph->len         = htole16((uint16_t)framelen);
-	sph->len_inv     = htole16(~(uint16_t)framelen);
+	/*
+	 * The header carries the real length -- SDPCM + BDC headers plus the
+	 * Ethernet frame -- not framelen.  framelen is ALIGN4'd, and the
+	 * firmware takes this field as the frame's extent: with the padding
+	 * counted, a 1513- or 1514-byte Ethernet frame looked like 1516 bytes,
+	 * over the maximum, and was silently dropped (ping payload 1470
+	 * answered, 1471 not), while shorter frames went out with up to three
+	 * trailing junk bytes.  Linux brcmf_sdio_txpkt_prep() likewise sets
+	 * hd_info.len before any tail padding.
+	 */
+	sph->len         = htole16((uint16_t)(CYW_SDPCM_HDR_LEN +
+	    CYW_BDC_DATA_HDR_LEN + eth_len));
+	sph->len_inv     = htole16((uint16_t)~le16toh(sph->len));
 	sph->chan_flags  = CYW_SDPCM_CHAN_DATA;
 	sph->data_offset = CYW_SDPCM_HDR_LEN;
 
@@ -898,7 +934,7 @@ cyw_tx_data_frame(struct cyw_softc *sc, struct mbuf *m)
 	bdc[3] = 0;				/* data_offset: no padding */
 
 	frame_buf = pkt + CYW_SDPCM_HDR_LEN + CYW_BDC_DATA_HDR_LEN;
-	memcpy(frame_buf, mtod(m, void *), eth_len);
+	m_copydata(m, 0, eth_len, (caddr_t)frame_buf);
 
 	sx_xlock(&sc->f2_sx);
 	sph->seq = sc->sdpcm_tx_seq++;
@@ -929,6 +965,8 @@ cyw_tx_data_frame(struct cyw_softc *sc, struct mbuf *m)
 	m_freem(m);
 
 	err = cyw_f2_write_block(sc, pkt, framelen);
+	if (err != 0)
+		cyw_txfail(sc);		/* as Linux brcmf_sdio_txpkt(); no retry */
 	sx_xunlock(&sc->f2_sx);
 
 	free(pkt, M_CYW);
@@ -952,6 +990,8 @@ cyw_tx_task(void *arg, int pending __unused)
 	struct cyw_softc *sc = arg;
 	struct mbuf *m, *tx_list;
 
+	u_int sent = 0;
+
 	mtx_lock(&sc->tx_queue_mtx);
 	tx_list = sc->tx_queue_head;
 	sc->tx_queue_head = NULL;
@@ -959,10 +999,37 @@ cyw_tx_task(void *arg, int pending __unused)
 	mtx_unlock(&sc->tx_queue_mtx);
 
 	while ((m = tx_list) != NULL) {
+		if (!cyw_tx_credits_ok(sc)) {
+			struct mbuf *last = tx_list;
+
+			/*
+			 * Out of credit: put the unsent frames back at the
+			 * head of the queue, in order, and stop.  Frames
+			 * queued meanwhile stay behind them.  RX restarts
+			 * this task when a header brings more credit (see
+			 * cyw_sdpcm_recv_one).  Sleeping here instead would
+			 * block that very RX, which runs on this taskqueue.
+			 */
+			while (last->m_nextpkt != NULL)
+				last = last->m_nextpkt;
+			mtx_lock(&sc->tx_queue_mtx);
+			last->m_nextpkt = sc->tx_queue_head;
+			if (sc->tx_queue_head == NULL)
+				sc->tx_queue_tail = &last->m_nextpkt;
+			sc->tx_queue_head = tx_list;
+			sc->tx_queue_len -= sent;
+			sc->tx_credit_waits++;
+			mtx_unlock(&sc->tx_queue_mtx);
+			return;
+		}
 		tx_list = m->m_nextpkt;
 		m->m_nextpkt = NULL;
+		sent++;
 		(void)cyw_tx_data_frame(sc, m);
 	}
+	mtx_lock(&sc->tx_queue_mtx);
+	sc->tx_queue_len -= sent;
+	mtx_unlock(&sc->tx_queue_mtx);
 }
 
 /*
@@ -1019,9 +1086,18 @@ cyw_vap_transmit(if_t ifp, struct mbuf *m)
 	 * MTX_DEF), then enqueue tx_task on rx_tq (sleepable thread).
 	 */
 	mtx_lock(&sc->tx_queue_mtx);
+	if (sc->tx_queue_len >= CYW_TX_QUEUE_MAX) {
+		/* Out of credit for a long time; do not grow without bound. */
+		sc->tx_queue_drops++;
+		mtx_unlock(&sc->tx_queue_mtx);
+		m_freem(m);
+		if_inc_counter(ifp, IFCOUNTER_OERRORS, 1);
+		return (ENOBUFS);
+	}
 	m->m_nextpkt = NULL;
 	*sc->tx_queue_tail = m;
 	sc->tx_queue_tail = &m->m_nextpkt;
+	sc->tx_queue_len++;
 	mtx_unlock(&sc->tx_queue_mtx);
 
 	taskqueue_enqueue(sc->rx_tq, &sc->tx_task);
@@ -1135,21 +1211,13 @@ cyw_parent(struct ieee80211com *ic)
 			(void)cyw_fil_iovar_int_set(sc, "bcn_timeout", 4);
 			(void)cyw_fil_iovar_int_set(sc, "assoc_retry_max", 3);
 			(void)cyw_fil_cmd_int_set(sc, WLC_SET_FAKEFRAG, 1);
-			(void)cyw_fil_iovar_int_set(sc, "txbf", 1);
-
 			/*
-			 * QUESTION: Does WLC_SET_PM here conflict with the pm=0
-			 * IOVAR issued during attach (boot-time polling path)?
-			 * WLC_SET_PM (cmd 86) and the "pm" IOVAR (cmd 263) address
-			 * the same firmware power-management knob.  Issuing both may
-			 * be redundant; "pm" IOVAR returns BCME_UNSUPPORTED on this
-			 * firmware, so WLC_SET_PM may be the correct form — but it
-			 * is unclear whether sending it here (post-WLC_UP) is needed
-			 * or whether the attach-time "pm" IOVAR attempt suffices.
+			 * No "txbf": Linux never sets it (it only reads
+			 * txbf_bfe_cap/txbf_bfr_cap to advertise VHT
+			 * beamforming), and 7.45.265 rejects it with
+			 * BCME_UNSUPPORTED.  Power management is set once, at
+			 * attach, with WLC_SET_PM (see cyw_attach()).
 			 */
-#if 0	/* PM off — correct command form unclear; may belong in attach */
-			(void)cyw_fil_cmd_int_set(sc, WLC_SET_PM, 0);
-#endif
 
 			/*
 			 * QUESTION: Are roam parameters needed before escan works?

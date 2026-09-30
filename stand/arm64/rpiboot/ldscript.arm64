@@ -1,0 +1,74 @@
+/*-
+ * ldscript.arm64 -- link the Raspberry Pi 5 loader at its load address.
+ *
+ * Linked at 0x200000 because that is where the firmware was measured to load
+ * a config.txt "kernel=" file:
+ *
+ *	Loading 'sdtest.bin' to 0x00000000 offset 0x200000
+ *
+ * Linking at the real load address means nothing has to be relocated at
+ * runtime, so stand/common/self_reloc.c is not needed and there is no window
+ * where the loader is running from an address it was not built for.  It also
+ * means an absolute address baked into .data by the compiler is simply
+ * correct, rather than a latent bug waiting for someone to add a string table.
+ *
+ * This is also why device_tree_address must stay clear of this range: the
+ * loader is about a megabyte once the memory disk is embedded, so a blob at
+ * 0x1f0000 would be overwritten outright.  0x4000000 is what
+ * tools/boot_config_install.sh configures and checks.
+ */
+
+OUTPUT_ARCH(aarch64)
+ENTRY(_start)
+
+SECTIONS
+{
+	. = 0x200000;
+
+	.text : {
+		KEEP(*(.text.boot))	/* the Image header must come first */
+		*(.text .text.* .gnu.linkonce.t.*)
+	}
+
+	.rodata : {
+		*(.rodata .rodata.* .gnu.linkonce.r.*)
+		. = ALIGN(8);
+		__start_set_Xcommand_set = .;
+		KEEP(*(set_Xcommand_set))
+		__stop_set_Xcommand_set = .;
+	}
+
+	.data : {
+		*(.data .data.* .gnu.linkonce.d.*)
+		. = ALIGN(8);
+	}
+
+	. = ALIGN(8);
+	__bss_start = .;
+	.bss : {
+		*(.sbss .sbss.*)
+		*(.bss .bss.*)
+		*(COMMON)
+		. = ALIGN(8);
+	}
+	__bss_end = .;
+
+	/*
+	 * Stack inside the image so image_size covers it and the firmware has
+	 * accounted for the range.  16-byte aligned for SP.
+	 */
+	. = ALIGN(16);
+	. += 0x10000;			/* 64 KiB */
+	. = ALIGN(16);
+	__stack_top = .;
+
+	_end = .;
+
+	/DISCARD/ : {
+		*(.note .note.*)
+		*(.comment)
+		*(.eh_frame .eh_frame_hdr)
+		*(.ARM.attributes)
+		*(.dynamic .dynsym .dynstr .hash .gnu.hash)
+	}
+}

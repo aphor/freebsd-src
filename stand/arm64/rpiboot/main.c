@@ -1,0 +1,301 @@
+/*-
+ * main.c -- startup for the Raspberry Pi 5 FreeBSD loader.
+ *
+ * Entered from start.S with the stack set up and BSS zeroed, at EL2 with the
+ * MMU off, and with the firmware's device tree physical address in the global
+ * rpi_dtb_pa.
+ *
+ * What makes this loader different from the EFI one is what it does NOT have:
+ * no EFI boot services, no EFI memory map, no runtime services, no wall clock,
+ * and at this stage no storage driver.  The memory it may use therefore has to
+ * come from the device tree's /memory node, which was proven to be present and
+ * correct on this board -- 15.99 GiB in 8 regions, patched into the tree by the
+ * firmware at runtime.  That measurement is the reason this loader can exist
+ * at all; see rpi5_modules.git/doc/LOADER_ZIMAGE.md.
+ */
+
+#include <stand.h>
+#include <sys/param.h>
+#include <sys/reboot.h>
+
+#include "bootstrap.h"
+#include "librpiboot.h"
+
+struct arch_switch archsw;
+
+extern uint64_t	rpi_dtb_pa;	/* from start.S: x0 at entry */
+extern char	_end[];
+
+/*
+ * Heap.
+ *
+ * Placed at a fixed physical address rather than immediately after _end, and
+ * the reason is the device tree.  The firmware puts the blob at
+ * device_tree_address, which tools/boot_config_install.sh sets to 0x4000000,
+ * and the loader itself lives at 0x200000 and is around a megabyte with the
+ * memory disk embedded.  Growing a heap up from _end would march straight into
+ * the blob.  Starting at 128 MiB clears both, and stays inside the first
+ * /memory region (0x0 .. 0x3f400000) with room to spare.
+ *
+ * This is deliberately not derived from /memory yet: the tree has to be parsed
+ * before it can be consulted, and parsing needs a working allocator.  Fixing
+ * that properly means an early bootstrap allocator, which is worth doing when
+ * something actually needs it.
+ */
+#define	RPI_HEAP_START	0x08000000UL
+#define	RPI_HEAP_SIZE	(48UL * 1024 * 1024)
+
+/* Sanity values checked at startup and reported; see rpi_report_entry(). */
+#define	RPI_LOAD_ADDR	0x00200000UL
+
+/*
+ * PSCI, which is how this loader resets the board.
+ *
+ * There is no firmware reset service to call, but ARM Trusted Firmware is
+ * live at EL3 -- its banner prints immediately before we are entered:
+ *
+ *	NOTICE:  BL31: v2.6(release):v2.6-240-gfc45bc492
+ *
+ * and the firmware's device tree advertises it:
+ *
+ *	/psci { compatible = "arm,psci-1.0", "arm,psci-0.2"; method = "smc"; }
+ *	/cpus/cpu@0..3 { enable-method = "psci"; }
+ *
+ * so an SMC from EL2 reaches BL31.  Function IDs are from
+ * sys/dev/psci/psci.h; SYSTEM_RESET and SYSTEM_OFF are both SMC32 calls, so
+ * the 0x84 prefix rather than 0xc4.
+ *
+ * Note this is the ATF the VPU firmware carries, which is NOT the one the
+ * EDK2 lane uses -- RPI_EFI.fd ships its own v2.10.0.  A PSCI difference
+ * between the two lanes would show up here first.
+ */
+#define	PSCI_FNID_VERSION	0x84000000U
+#define	PSCI_FNID_SYSTEM_OFF	0x84000008U
+#define	PSCI_FNID_SYSTEM_RESET	0x84000009U
+
+static uint64_t
+psci_smc(uint32_t fnid, uint64_t a1, uint64_t a2, uint64_t a3)
+{
+	register uint64_t x0 __asm__("x0") = fnid;
+	register uint64_t x1 __asm__("x1") = a1;
+	register uint64_t x2 __asm__("x2") = a2;
+	register uint64_t x3 __asm__("x3") = a3;
+
+	__asm__ __volatile__("smc #0"
+	    : "+r"(x0), "+r"(x1), "+r"(x2), "+r"(x3)
+	    :
+	    : "memory");
+
+	return (x0);
+}
+
+/*
+ * Reset via PSCI.  Does not return when it works.
+ *
+ * SYSTEM_RESET is specified never to return, so reaching the code after it
+ * means the call failed -- and the caller wants to know that rather than sit
+ * in a silent hang.
+ */
+void
+rpi_psci_reset(void)
+{
+	printf("Resetting via PSCI SYSTEM_RESET (SMC to BL31)...\n");
+
+	/*
+	 * Let the console drain before the world stops.  Without this the
+	 * message above can be lost in the UART FIFO, which makes a failed
+	 * reset look like a hang with no explanation.
+	 */
+	delay(100000);
+
+	(void)psci_smc(PSCI_FNID_SYSTEM_RESET, 0, 0, 0);
+
+	printf("PSCI SYSTEM_RESET returned, so it did not work.\n");
+	printf("Power-cycle the board.\n");
+}
+
+static void
+rpi_report_entry(void)
+{
+	uint64_t el;
+
+	__asm__ __volatile__("mrs %0, CurrentEL" : "=r"(el));
+
+	printf("Entered from the Raspberry Pi VPU firmware, no EFI.\n");
+	printf("   Exception level: EL%lu\n", (unsigned long)(el >> 2) & 3);
+	printf("   Load address:    0x%lx\n", RPI_LOAD_ADDR);
+	printf("   Device tree:     0x%lx (from x0)\n",
+	    (unsigned long)rpi_dtb_pa);
+	printf("   Loader end:      %p\n", _end);
+	printf("   Heap:            0x%lx + %lu MiB\n",
+	    (unsigned long)RPI_HEAP_START,
+	    (unsigned long)(RPI_HEAP_SIZE / (1024 * 1024)));
+
+	/*
+	 * A loader whose heap overlaps the device tree would corrupt the tree
+	 * the moment it allocated anything, and the symptom would appear much
+	 * later and look like a tree problem.  Say so here instead.
+	 */
+	if (rpi_dtb_pa != 0 &&
+	    rpi_dtb_pa >= RPI_HEAP_START &&
+	    rpi_dtb_pa < RPI_HEAP_START + RPI_HEAP_SIZE)
+		printf("   WARNING: the device tree is inside the heap; "
+		    "move device_tree_address.\n");
+	if ((uint64_t)(uintptr_t)_end > RPI_HEAP_START)
+		printf("   WARNING: the loader image overlaps the heap.\n");
+
+	/*
+	 * Ask PSCI its version.  Cheap, harmless, and it answers up front
+	 * whether "reboot" will work rather than finding out when it is
+	 * needed.  A sane reply is major:minor in bits 31:16 / 15:0; PSCI
+	 * NOT_SUPPORTED is returned as -1.
+	 */
+	{
+		uint64_t v = psci_smc(PSCI_FNID_VERSION, 0, 0, 0);
+
+		if ((int64_t)v < 0)
+			printf("   PSCI:            not supported; "
+			    "reboot will not work\n");
+		else
+			printf("   PSCI:            v%lu.%lu via smc "
+			    "(reboot available)\n",
+			    (unsigned long)((v >> 16) & 0xffff),
+			    (unsigned long)(v & 0xffff));
+	}
+
+	/*
+	 * config.txt or tryboot.txt?  The firmware records which one in the
+	 * tree, and after a "tryboot" it is the only proof the one-shot was
+	 * honoured rather than merely requested.
+	 */
+	rpi_print_boot_config();
+}
+
+int
+main(void)
+{
+	int i;
+
+	/*
+	 * Heap first: nothing else here may allocate until this is done, and
+	 * that includes the console probe.
+	 */
+	setheap((void *)RPI_HEAP_START,
+	    (void *)(RPI_HEAP_START + RPI_HEAP_SIZE));
+
+	/*
+	 * Console next, so that everything after this point can report what
+	 * it is doing.  cons_probe() walks the consoles[] array in conf.c.
+	 */
+	cons_probe();
+
+	printf("\n%s", bootprog_info);
+	printf("\n");
+	rpi_report_entry();
+
+	archsw.arch_getdev = rpi_getdev;
+	archsw.arch_copyin = rpi_copyin;
+	archsw.arch_copyout = rpi_copyout;
+	archsw.arch_readin = rpi_readin;
+	archsw.arch_autoload = rpi_autoload;
+
+	/*
+	 * Probe the device switch.  Today that is the embedded memory disk
+	 * and nothing else, which is the point: it needs no hardware driver,
+	 * so the loader has a filesystem before it has a disk.
+	 */
+	for (i = 0; devsw[i] != NULL; i++) {
+		if (devsw[i]->dv_init == NULL)
+			continue;
+		if ((devsw[i]->dv_init)() != 0)
+			continue;
+		printf("Found device: %s\n", devsw[i]->dv_name);
+	}
+
+	/*
+	 * Point currdev at the memory disk.
+	 *
+	 * set_currdev() is the MI helper in stand/common/misc.c: it sets both
+	 * currdev and loaddev and installs gen_setcurrdev() as the hook, so a
+	 * later assignment from the prompt re-parses and remounts properly.
+	 * An earlier version of this file installed a local hook that
+	 * duplicated gen_setcurrdev() badly enough to break every path.
+	 */
+	set_currdev("md0:");
+	setenv("LINES", "24", 1);
+
+	interact();			/* doesn't return */
+
+	return (0);
+}
+
+/*
+ * No hardware autodetection to drive module loading yet.  Returning 0 keeps
+ * the MI code happy without pretending to have looked.
+ */
+int
+rpi_autoload(void)
+{
+	return (0);
+}
+
+/*
+ * reboot and poweroff are registered per-platform, not by MI code: there is a
+ * COMMAND_SET for them in stand/efi/loader/main.c, stand/uboot/main.c and so
+ * on, and none in stand/common.  Their absence here is why the first build
+ * reached its prompt with no way to reset the board, which on this hardware
+ * meant a physical power cycle for every iteration.
+ */
+static int
+command_reboot(int argc __unused, char *argv[] __unused)
+{
+	rpi_psci_reset();
+
+	/* Only reached if the reset failed; rpi_psci_reset() has said so. */
+	for (;;)
+		__asm__ __volatile__("wfi");
+
+	return (CMD_OK);
+}
+COMMAND_SET(reboot, "reboot", "reboot the system", command_reboot);
+
+static int
+command_poweroff(int argc __unused, char *argv[] __unused)
+{
+	printf("Powering off via PSCI SYSTEM_OFF...\n");
+	delay(100000);
+	(void)psci_smc(PSCI_FNID_SYSTEM_OFF, 0, 0, 0);
+
+	printf("PSCI SYSTEM_OFF returned, so it did not work.\n");
+	for (;;)
+		__asm__ __volatile__("wfi");
+
+	return (CMD_OK);
+}
+COMMAND_SET(poweroff, "poweroff", "power off the system", command_poweroff);
+
+/*
+ * exit() is what "quit" reaches.  Resetting is the useful thing to do: there
+ * is no firmware menu to fall back to, so halting would just strand the
+ * board.  This cannot loop, because nothing calls exit() except an explicit
+ * quit from the prompt.
+ */
+void
+exit(int code)
+{
+	printf("\nLoader exit(%d); there is nothing to exit to, so "
+	    "resetting.\n", code);
+	rpi_psci_reset();
+
+	for (;;)
+		__asm__ __volatile__("wfi");
+}
+
+void
+reboot(void)
+{
+	rpi_psci_reset();
+
+	for (;;)
+		__asm__ __volatile__("wfi");
+}

@@ -153,10 +153,31 @@ struct bcm2712_softc {
 	struct mtx thermal_mtx;			/* Protect thermal reads */
 	struct callout thermal_callout;		/* Periodic update timer */
 	uint32_t cached_temp_mc;		/* Cached milli-°C value */
-	time_t last_update;			/* Timestamp of last read */
+	time_t last_update;			/* Timestamp of last *valid* read */
+
+	/*
+	 * Sensor health.  The AVS ring oscillator does not always present a
+	 * valid reading, and the old behaviour was to silently substitute the
+	 * last cached value -- so a sensor that stopped answering left
+	 * cpu_temp frozen at a comfortable number while the die heated, with
+	 * nothing to see in any sysctl and no way for the fan controller's
+	 * critical-temperature supervisor to trip.  Count the misses instead,
+	 * and stop claiming to know the temperature once they persist.
+	 */
+	uint32_t thermal_invalid_total;		/* ticks with no valid reading */
+	uint32_t thermal_invalid_run;		/* consecutive such ticks */
+	bool thermal_healthy;			/* temperature is trustworthy */
 	struct sysctl_ctx_list sysctl_ctx;	/* sysctl context */
 	struct sysctl_oid *sysctl_tree;		/* sysctl tree root */
 };
+
+/*
+ * Consecutive invalid reads before the temperature is declared untrusted.
+ * The tick is 1 s, so this is a few seconds of silence -- long enough not to
+ * fire on an isolated miss, short enough that the fan goes to full well
+ * before the die reaches the throttle point from an idle start.
+ */
+#define BCM2712_THERMAL_STALE_TICKS	5
 
 /* Function prototypes for other modules */
 int bcm2712_read_cpu_temp(uint32_t *temp);
@@ -164,5 +185,23 @@ struct bcm2712_softc *bcm2712_get_softc(void);
 int bcm2712_pwm_set_config(u_int channel, u_int period, u_int duty);
 int bcm2712_pwm_enable(u_int channel, bool enable);
 uint32_t bcm2712_read_fan_rpm(void);
+
+/*
+ * RP1's peripheral window.
+ *
+ * On the ACPI lane EDK2 places RP1 where the device tree's RP1 addresses
+ * say, and nothing below is used.  On the FDT lane RP1 is a PCI device
+ * enumerated by bcm2712_pcib, its BAR1 lands wherever PCI puts it, and RP1
+ * registers cannot be touched until then.  The rp1 PCI driver publishes
+ * BAR1 when it attaches; drivers that need RP1 defer to that.  It publishes
+ * its bus DMA tag too, the parent for tags of RP1's bus masters, which is
+ * NULL on the ACPI lane.
+ */
+void bcm2712_rp1_publish(bus_addr_t pa, bus_size_t size, bus_dma_tag_t dmat);
+bool bcm2712_rp1_bar(bus_addr_t *pa, bus_size_t *size);
+bus_dma_tag_t bcm2712_rp1_dma_tag(void);
+int bcm2712_rp1_defer(void (*fn)(void *), void *arg);
+void bcm2712_rp1_undefer(void (*fn)(void *), void *arg);
+bool bcm2712_rp1_needs_pci(void);
 
 #endif /* _BCM2712_VAR_H_ */

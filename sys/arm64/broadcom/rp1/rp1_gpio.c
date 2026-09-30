@@ -52,6 +52,8 @@
 
 #include "gpio_if.h"
 #include "fdt_pinctrl_if.h"
+#include <arm64/broadcom/bcm2712/bcm2712_fdt.h>
+
 #include "rp1_gpio_var.h"
 
 /* -----------------------------------------------------------------------
@@ -117,12 +119,21 @@ rp1_gpio_parse_pin_names(struct rp1_gpio_softc *sc, phandle_t node)
 static int rp1_gpio_detach(device_t dev);	/* forward declaration */
 
 /*
- * identify: called by nexus bus_generic_probe.  Creates a device_t if the
- * gpio@d0000 FDT node is present and no instance already exists.
+ * identify: called by nexus, and on the FDT lane by rp1pci, the RP1 PCI
+ * driver.  Creates a device_t if the gpio@d0000 FDT node is present and no
+ * instance already exists.  Under ACPI, EDK2 has placed RP1 and this
+ * attaches to nexus as it always has; on an FDT boot RP1's registers
+ * cannot be found until rp1pci has published BAR1, so it attaches below
+ * rp1pci instead (M2 phase 2, rpi5_modules.git doc/M2_PCIE_HOST.md).
  */
 static void
 rp1_gpio_identify(driver_t *driver, device_t parent)
 {
+	bool under_rp1pci;
+
+	under_rp1pci = strcmp(device_get_name(parent), "rp1pci") == 0;
+	if (under_rp1pci != bcm2712_rp1_needs_pci())
+		return;
 	if (rp1_gpio_find_node() == -1)
 		return;
 	if (device_find_child(parent, "rp1_gpio", -1) != NULL)
@@ -147,6 +158,9 @@ rp1_gpio_attach(device_t dev)
 {
 	struct rp1_gpio_softc *sc;
 	phandle_t node;
+	bus_addr_t io_phys, rio_phys, pad_phys;
+	bus_size_t sz;
+	bool from_fdt;
 	uint32_t ctrl, funcsel, oe;
 	int bank, i;
 
@@ -161,24 +175,38 @@ rp1_gpio_attach(device_t dev)
 	}
 
 	/*
-	 * Map the three register windows.  Physical addresses are hard-coded
-	 * from the DTB reg property (verified in RP1_GPIO_spec.md §3.1).
-	 * pmap_mapdev_attr mirrors the approach in bcm2712.c and rp1_eth_cfg.c.
+	 * Map the three register windows.  gpio@d0000 describes all three as
+	 * successive reg entries, so take them from the node rather than from
+	 * the constants in rp1_gpio_var.h, which remain only as a fallback:
+	 *   reg[0] = IO_BANK0..2    0xc0_400d0000  0xc000
+	 *   reg[1] = SYS_RIO0..2    0xc0_400e0000  0xc000
+	 *   reg[2] = PADS_BANK0..2  0xc0_400f0000  0xc000
+	 * (RP1-child addresses; bcm2712_fdt_rp1_reg() applies the rp1 and
+	 * pcie ranges to reach 0x1f_000d0000 and friends -- see
+	 * bcm2712_fdt.h for why ofw_reg_to_paddr() cannot.)  pmap_mapdev_attr
+	 * mirrors the approach in bcm2712.c and rp1_eth_cfg.c.
 	 */
-	sc->sc_io_kva = pmap_mapdev_attr(RP1_IO_BANK_BASE_PHYS,
+	io_phys = RP1_IO_BANK_BASE_PHYS;
+	rio_phys = RP1_SYS_RIO_BASE_PHYS;
+	pad_phys = RP1_PADS_BANK_BASE_PHYS;
+	from_fdt = bcm2712_fdt_rp1_reg(node, 0, &io_phys, &sz);
+	from_fdt &= bcm2712_fdt_rp1_reg(node, 1, &rio_phys, &sz);
+	from_fdt &= bcm2712_fdt_rp1_reg(node, 2, &pad_phys, &sz);
+
+	sc->sc_io_kva = pmap_mapdev_attr(io_phys,
 	    RP1_GPIO_REGION_SIZE, VM_MEMATTR_DEVICE);
 	if (sc->sc_io_kva == NULL) {
 		device_printf(dev, "cannot map IO_BANK\n");
 		return (ENOMEM);
 	}
-	sc->sc_rio_kva = pmap_mapdev_attr(RP1_SYS_RIO_BASE_PHYS,
+	sc->sc_rio_kva = pmap_mapdev_attr(rio_phys,
 	    RP1_GPIO_REGION_SIZE, VM_MEMATTR_DEVICE);
 	if (sc->sc_rio_kva == NULL) {
 		device_printf(dev, "cannot map SYS_RIO\n");
 		pmap_unmapdev(sc->sc_io_kva, RP1_GPIO_REGION_SIZE);
 		return (ENOMEM);
 	}
-	sc->sc_pad_kva = pmap_mapdev_attr(RP1_PADS_BANK_BASE_PHYS,
+	sc->sc_pad_kva = pmap_mapdev_attr(pad_phys,
 	    RP1_GPIO_REGION_SIZE, VM_MEMATTR_DEVICE);
 	if (sc->sc_pad_kva == NULL) {
 		device_printf(dev, "cannot map PADS_BANK\n");
@@ -197,8 +225,12 @@ rp1_gpio_attach(device_t dev)
 	 * (similar to bcm2712_pcie.c's approach for the GEM IRQ).
 	 */
 	device_printf(dev,
-	    "IO_BANK@%p RIO@%p PADS@%p (IRQ chain: deferred to M4)\n",
-	    sc->sc_io_kva, sc->sc_rio_kva, sc->sc_pad_kva);
+	    "IO_BANK@%p RIO@%p PADS@%p phys 0x%lx/0x%lx/0x%lx (%s) "
+	    "(IRQ chain: deferred to M4)\n",
+	    sc->sc_io_kva, sc->sc_rio_kva, sc->sc_pad_kva,
+	    (unsigned long)io_phys, (unsigned long)rio_phys,
+	    (unsigned long)pad_phys,
+	    from_fdt ? "from FDT" : "hardcoded, reg lookup failed");
 
 	/* Populate pin table: names from gpio-line-names, flags from FUNCSEL/OE */
 	rp1_gpio_parse_pin_names(sc, node);
@@ -523,8 +555,10 @@ static driver_t rp1_gpio_driver = {
 };
 
 DRIVER_MODULE(rp1_gpio, nexus, rp1_gpio_driver, 0, 0);
+DRIVER_MODULE(rp1_gpio, rp1pci, rp1_gpio_driver, 0, 0);
 /* Register gpiobus as a child driver so device_probe_and_attach succeeds. */
 extern driver_t gpiobus_driver;
 DRIVER_MODULE(gpiobus, rp1_gpio, gpiobus_driver, 0, 0);
 MODULE_VERSION(rp1_gpio, 1);
 MODULE_DEPEND(rp1_gpio, gpiobus, 1, 1, 1);
+MODULE_DEPEND(rp1_gpio, bcm2712, 1, 1, 1);	/* bcm2712_fdt.h */

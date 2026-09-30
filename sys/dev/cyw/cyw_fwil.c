@@ -100,49 +100,105 @@ cyw_sdpcm_recv_one(struct cyw_softc *sc, uint8_t *buf, uint16_t *out_flen)
 		CYW_UNLOCK(sc);
 		return (EAGAIN);
 	}
-	if (flen > CYW_SDPCM_MAX_FRAME)
-		return (EINVAL);
+	if (flen > CYW_SDPCM_MAX_FRAME) {
+		/*
+		 * Too long for this buffer: a superframe whose descriptor was
+		 * not acted on (see cyw_sdpcm_rxglom()), or a bad header.
+		 * Flush it, as Linux brcmf_sdio_hdparse() does for "HW header
+		 * length too long", rather than leave its tail in the FIFO to
+		 * be read as the next header.
+		 */
+		cyw_rxfail(sc);
+		CYW_LOCK(sc);
+		sc->rx_eagain_count++;
+		CYW_UNLOCK(sc);
+		return (EAGAIN);
+	}
 
 	if (flen > CYW_F2_BLKSIZE) {
 		/*
-		 * Read the tail of the frame in byte-mode CMD53 chunks.
-		 *
-		 * sdiob uses F2 block size 512.  Any SDIO_READ_EXTENDED call
-		 * with size >= 512 is issued as block-mode CMD53, which fails
-		 * on this hardware (EIO, "b_count 1 blksz 512").  We stay in
-		 * byte-mode by capping each transfer at CYW_F2_MAX_BYTE_XFER
-		 * (448 = 7 × 64 bytes) and looping until the full tail has been
-		 * read.  (Linux does the same: brcmf_sdio_readframes loops with
-		 * brcmf_sdiod_recv_pkt which caps at a similarly-safe limit.)
+		 * The rest of the frame, padded to whole F2 blocks, in one
+		 * CMD53 -- as Linux brcmf_sdio_readframes() does after its
+		 * BRCMF_FIRSTREAD header read.  flen <= CYW_SDPCM_MAX_FRAME,
+		 * so this fits CYW_SDPCM_BUF_SIZE.
 		 */
-		uint8_t *dst      = buf + CYW_F2_BLKSIZE;
-		size_t  remaining = ((size_t)(flen - CYW_F2_BLKSIZE) +
-		    CYW_F2_BLKSIZE - 1) & ~(size_t)(CYW_F2_BLKSIZE - 1);
+		size_t tail = roundup2((size_t)flen - CYW_F2_BLKSIZE,
+		    CYW_F2_BLKSIZE);
 
-		while (remaining > 0) {
-			size_t chunk = (remaining > CYW_F2_MAX_BYTE_XFER)
-			    ? CYW_F2_MAX_BYTE_XFER : remaining;
-			err = SDIO_READ_EXTENDED(parent, 2 /* F2 */,
-			    CYW_F2_FIFO_ADDR, chunk, dst, false);
-			if (err) {
-				cyw_rx_eio_diag(sc, chunk, err, "tail");
-				cyw_rxfail(sc);
-				return (err);
-			}
-			dst       += chunk;
-			remaining -= chunk;
+		err = SDIO_READ_EXTENDED(parent, 2 /* F2 */,
+		    CYW_F2_FIFO_ADDR, tail, buf + CYW_F2_BLKSIZE, false);
+		if (err) {
+			cyw_rx_eio_diag(sc, tail, err, "tail");
+			cyw_rxfail(sc);
+			return (err);
 		}
 	}
 
 	CYW_LOCK(sc);
-	sc->sdpcm_rx_max = hdr->credit;
 	sc->rx_ok_count++;
 	sc->rx_last_ok_ticks = ticks;
 	CYW_UNLOCK(sc);
+	cyw_sdpcm_update_credit(sc, hdr->credit);
 
 	if (out_flen != NULL)
 		*out_flen = flen;
 	return (0);
+}
+
+/*
+ * cyw_sdpcm_update_credit — take the credit ceiling from a received frame
+ * or superframe header.
+ */
+void
+cyw_sdpcm_update_credit(struct cyw_softc *sc, uint8_t credit)
+{
+	CYW_LOCK(sc);
+	/*
+	 * As Linux brcmf_sdio_hdparse() does, a ceiling more than 0x40 ahead
+	 * of tx_seq is taken as corrupt and replaced by tx_seq + 2 rather
+	 * than believed.
+	 */
+	if ((uint8_t)(credit - sc->sdpcm_tx_seq) > 0x40) {
+		sc->sdpcm_rx_max = sc->sdpcm_tx_seq + 2;
+		sc->rx_credit_clamps++;
+	} else
+		sc->sdpcm_rx_max = credit;
+	CYW_UNLOCK(sc);
+
+	/*
+	 * cyw_tx_task stops, leaving frames queued, when credit runs out; the
+	 * only thing that returns credit is an RX header like this one.  So
+	 * restart it here.  It runs on this same taskqueue, after us.
+	 */
+	if (sc->tx_queue_head != NULL && cyw_tx_credits_ok(sc))
+		taskqueue_enqueue(sc->rx_tq, &sc->tx_task);
+}
+
+/* -------------------------------------------------------------------------
+ * cyw_txfail — recover from a failed F2 write, as Linux brcmf_sdio_txfail()
+ * does: abort F2, terminate the write frame, and read the write frame byte
+ * count until it clears (three tries, as Linux).
+ * ------------------------------------------------------------------------- */
+void
+cyw_txfail(struct cyw_softc *sc)
+{
+	device_t parent = device_get_parent(sc->dev);
+	uint8_t hi, lo;
+	int e = 0, i;
+
+	CYW_LOCK(sc);
+	sc->tx_eio_count++;
+	CYW_UNLOCK(sc);
+
+	(void)SDIO_WRITE_DIRECT(parent, 0 /* F0/CCCR */, SD_IO_CCCR_CTL, 2);
+	sdio_write_1(sc->f1, SBSDIO_FUNC1_FRAMECTRL,
+	    SBSDIO_FUNC1_FRAMECTRL_WF_TERM, &e);
+	for (i = 0; i < 3; i++) {
+		hi = sdio_read_1(sc->f1, SBSDIO_FUNC1_WFRAMEBCHI, &e);
+		lo = sdio_read_1(sc->f1, SBSDIO_FUNC1_WFRAMEBCLO, &e);
+		if (hi == 0 && lo == 0)
+			break;
+	}
 }
 
 /* -------------------------------------------------------------------------
@@ -192,6 +248,42 @@ cyw_rxfail(struct cyw_softc *sc)
 		device_printf(sc->dev,
 		    "cyw_rxfail: FIFO drain timeout (RBC=%u)\n",
 		    ((unsigned)hi << 8) | lo);
+}
+
+/* -------------------------------------------------------------------------
+ * cyw_tx_eio_diag — after a failed F2 write and its cyw_txfail(), log the
+ * chip's power and clock state.  CMD52 reads only.
+ * ------------------------------------------------------------------------- */
+void
+cyw_tx_eio_diag(struct cyw_softc *sc, size_t txlen, int err, const char *tag)
+{
+	uint8_t sleepcsr, clkcsr;
+	int e1 = 0, e2 = 0;
+
+	/*
+	 * A failed IOCTL write.  At 50 MHz the first ones after firmware
+	 * download sometimes fail; record the chip's power and clock state and
+	 * how long after FWREADY this was (cyw43455.md, "F2 writes fail right
+	 * after firmware download").  Called after cyw_txfail(), and limited
+	 * to CMD52 reads: a CMD53 backplane read here (INTSTATUS) preceded the
+	 * two attaches that wedged the SDIO bus.
+	 */
+	sleepcsr = sdio_read_1(sc->f1, SBSDIO_FUNC1_SLEEPCSR, &e1);
+	clkcsr = sdio_read_1(sc->f1, SBSDIO_FUNC1_CHIPCLKCSR, &e2);
+	device_printf(sc->dev,
+	    "TX EIO[%s] txlen=%zu err=%d %d ms after FWREADY "
+	    "SLEEPCSR=0x%02x%s%s CLKCSR=0x%02x%s%s "
+	    "(f1errs=%d/%d)\n",
+	    tag, txlen, err,
+	    sc->fwready_ticks != 0 ?
+	    (int)((int64_t)(ticks - sc->fwready_ticks) * 1000 / hz) : -1,
+	    sleepcsr,
+	    (sleepcsr & SBSDIO_FUNC1_SLEEPCSR_KSO_EN) ? " KSO" : " !KSO",
+	    (sleepcsr & SBSDIO_FUNC1_SLEEPCSR_DEVON_MASK) ? " DEVON" : " !DEVON",
+	    clkcsr,
+	    (clkcsr & SBSDIO_HT_AVAIL) ? " HT" : " !HT",
+	    (clkcsr & SBSDIO_ALP_AVAIL) ? " ALP" : " !ALP",
+	    e1, e2);
 }
 
 /* -------------------------------------------------------------------------
@@ -262,19 +354,31 @@ cyw_fil_txrx(struct cyw_softc *sc, uint32_t cmd, uint32_t bcdc_flags,
 	struct cyw_bcdc_hdr  *bch;
 	size_t namelen  = (name != NULL) ? strlen(name) + 1 : 0;
 	size_t payload  = namelen + buflen;
-	size_t framelen = ALIGN4(CYW_SDPCM_HDR_LEN + CYW_BCDC_HDR_LEN + payload);
+	size_t msglen   = CYW_SDPCM_HDR_LEN + CYW_BCDC_HDR_LEN + payload;
+	size_t framelen = ALIGN4(msglen);
 	uint8_t *frame, *data_start;
 	uint16_t id;
 	int err, i;
 
-	frame = malloc(framelen, M_CYW, M_WAITOK | M_ZERO);
+	/*
+	 * Allocated to the CYW_F2_BLKSIZE multiple that cyw_f2_write_block()
+	 * actually sends, not to framelen: the padding goes to the card and
+	 * must be zeros from this buffer, not whatever follows it in the heap.
+	 */
+	frame = malloc(roundup2(framelen, CYW_F2_BLKSIZE), M_CYW,
+	    M_WAITOK | M_ZERO);
 
 	sx_xlock(&sc->ioctl_sx);
 	id = ++sc->ioctl_id;
 
+	/*
+	 * The SDPCM length is the message, not the tail padding, as in
+	 * Linux brcmf_sdio_tx_ctrlframe() (hd_info.len = len - pad) and in
+	 * cyw_tx_data_frame().
+	 */
 	sph = (struct cyw_sdpcm_hdr *)frame;
-	sph->len         = htole16((uint16_t)framelen);
-	sph->len_inv     = htole16(~(uint16_t)framelen);
+	sph->len         = htole16((uint16_t)msglen);
+	sph->len_inv     = htole16((uint16_t)~le16toh(sph->len));
 	sph->chan_flags  = CYW_SDPCM_CHAN_CTRL;
 	sph->data_offset = CYW_SDPCM_HDR_LEN;
 
@@ -299,11 +403,11 @@ cyw_fil_txrx(struct cyw_softc *sc, uint32_t cmd, uint32_t bcdc_flags,
 
 		/* Wait for a TX credit; task keeps rx_max current. */
 		for (i = 0; i < 200; i++) {
-			if ((uint8_t)(sc->sdpcm_rx_max - sc->sdpcm_tx_seq) > 0)
+			if (cyw_tx_credits_ok(sc))
 				break;
 			DELAY(5000);
 		}
-		if ((uint8_t)(sc->sdpcm_rx_max - sc->sdpcm_tx_seq) == 0) {
+		if (!cyw_tx_credits_ok(sc)) {
 			device_printf(sc->dev,
 			    "cyw_fil: no TX credits (runtime) cmd %u\n", cmd);
 			err = ENOBUFS;
@@ -330,6 +434,16 @@ cyw_fil_txrx(struct cyw_softc *sc, uint32_t cmd, uint32_t bcdc_flags,
 		sx_xlock(&sc->f2_sx);
 		err = cyw_f2_write_block(sc, frame, framelen);
 		if (err != 0) {
+			cyw_txfail(sc);
+			cyw_tx_eio_diag(sc, framelen, err, name != NULL ? name : "cmd");
+			err = cyw_f2_write_block(sc, frame, framelen);
+			if (err == 0)
+				device_printf(sc->dev,
+				    "cyw_fil: %s written on retry\n",
+				    name != NULL ? name : "cmd");
+		}
+		if (err != 0) {
+			cyw_txfail(sc);
 			sx_xunlock(&sc->f2_sx);
 			CYW_LOCK(sc);
 			sc->ioctl_waiting = false;
@@ -375,25 +489,49 @@ cyw_fil_txrx(struct cyw_softc *sc, uint32_t cmd, uint32_t bcdc_flags,
 
 		/* Drain RX until firmware grants at least one TX credit. */
 		for (i = 0; i < 100; i++) {
-			if ((uint8_t)(sc->sdpcm_rx_max - sc->sdpcm_tx_seq) > 0)
+			if (cyw_tx_credits_ok(sc))
 				break;
 			err = cyw_sdpcm_recv_one(sc, rsp, NULL);
 			if (err != 0 && err != EAGAIN)
 				goto out_poll;
 			DELAY(10000);
 		}
-		if ((uint8_t)(sc->sdpcm_rx_max - sc->sdpcm_tx_seq) == 0) {
+		if (!cyw_tx_credits_ok(sc)) {
 			device_printf(sc->dev,
 			    "cyw_fil: no TX credits for cmd %u\n", cmd);
 			err = ENOBUFS;
 			goto out_poll;
 		}
 
-		sc->sdpcm_tx_seq++;
-
 		err = cyw_f2_write_block(sc, frame, framelen);
-		if (err)
-			goto out_poll;
+		if (!sc->first_tx_logged && sc->fwready_ticks != 0) {
+			sc->first_tx_logged = true;
+			device_printf(sc->dev, "first IOCTL write (%s) %d ms "
+			    "after FWREADY: %s\n", name != NULL ? name : "cmd",
+			    (int)((int64_t)(ticks - sc->fwready_ticks) * 1000 /
+			    hz), err == 0 ? "ok" : "failed");
+		}
+		if (err != 0) {
+			/*
+			 * Terminate the failed frame as Linux does, then send it
+			 * once more.  At 50 MHz the first writes after firmware
+			 * download sometimes fail, and losing them loses
+			 * bus:txglom=0 and roam_off (cyw43455.md).  Recovery
+			 * comes first, as in Linux; the diagnostic reads after it.
+			 */
+			cyw_txfail(sc);
+			cyw_tx_eio_diag(sc, framelen, err, name != NULL ? name : "cmd");
+			err = cyw_f2_write_block(sc, frame, framelen);
+			if (err != 0) {
+				cyw_txfail(sc);
+				cyw_tx_eio_diag(sc, framelen, err, "retry");
+				goto out_poll;
+			}
+			device_printf(sc->dev, "cyw_fil: %s written on retry\n",
+			    name != NULL ? name : "cmd");
+		}
+		/* As Linux: the sequence number advances only once sent. */
+		sc->sdpcm_tx_seq++;
 
 		if (sc->sdio_core_base != 0)
 			cyw_bp_write32(sc,

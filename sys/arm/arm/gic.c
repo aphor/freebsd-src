@@ -107,19 +107,6 @@
 #define	GIC_DEFAULT_ICFGR_INIT	0x00000000
 #endif
 
-struct gic_irqsrc {
-	struct intr_irqsrc	gi_isrc;
-	uint32_t		gi_irq;
-	enum intr_polarity	gi_pol;
-	enum intr_trigger	gi_trig;
-#define GI_FLAG_EARLY_EOI	(1 << 0)
-#define GI_FLAG_MSI		(1 << 1) /* This interrupt source should only */
-					 /* be used for MSI/MSI-X interrupts */
-#define GI_FLAG_MSI_USED	(1 << 2) /* This irq is already allocated */
-					 /* for a MSI/MSI-X interrupt */
-	u_int			gi_flags;
-};
-
 static u_int gic_irq_cpu;
 static int arm_gic_bind_intr(device_t dev, struct intr_irqsrc *isrc);
 

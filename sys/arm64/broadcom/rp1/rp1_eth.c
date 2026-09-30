@@ -34,8 +34,9 @@
  * Changes from the original:
  *  - FDT/OFW/clock probe+attach frontend removed; replaced by rp1eth_attach()
  *    called from rp1_eth_cfg.c MOD_LOAD after M1 hardware setup.
- *  - CGEM64 not defined: RP1 PCIe2 inbound window is 32-bit; 32-bit
- *    descriptors only; DMA constrained to BUS_SPACE_MAXADDR_32BIT.
+ *  - 64-bit descriptors (CGEM64) as upstream, but DMA limited to what RP1
+ *    passes straight to PCIe (RP1ETH_DMA_MAXADDR), and the tags descend
+ *    from RP1's bus DMA tag.
  *  - No interrupts (polled): all GEM interrupts masked; RX/TX serviced from
  *    a callout at RP1ETH_POLL_HZ.  ISR body kept for Milestone 3.
  *  - No miibus: link state polled from callout via direct MDIO reads;
@@ -82,11 +83,35 @@
 
 /* MII register constants come from rp1_eth_var.h to avoid redefinition. */
 
+/*
+ * 64-bit descriptors, as upstream if_cgem.c uses on any 64-bit bus.  RP1's
+ * GEM is built with 64-bit DMA addressing (DESIGN_CFG6 bit 23, DAW64; RP1
+ * datasheet RP-008370-DS-1, ch. 7), and every link to host RAM passes the
+ * high bits: RP1 puts bus-master addresses 0-512 GB on PCIe unchanged
+ * (table 1), and the root complex maps RAM 1:1 in a 64 GB window.  With
+ * 32-bit descriptors, every buffer above 4 GB (most of a 16 GB Pi 5's RAM)
+ * was bounced.  Must precede rp1_eth_hw.h, which sizes the descriptors.
+ */
+#if BUS_SPACE_MAXADDR > BUS_SPACE_MAXADDR_32BIT
+#define CGEM64
+#endif
+
 #include "rp1_eth_hw.h"
 #include "rp1_eth_var.h"	/* for rp1eth_attach_args */
 #include <arm64/broadcom/bcm2712/bcm2712_pcie.h>
+#include <arm64/broadcom/bcm2712/bcm2712_var.h>	/* bcm2712_rp1_dma_tag() */
 
-/* NOTE: CGEM64 is deliberately NOT defined; 32-bit descriptors only. */
+/*
+ * Highest address the GEM may DMA to: the top of RP1's "PCIe Outbound
+ * direct mapped space" (0-512 GB).  Addresses above it go through RP1's
+ * outbound ATU instead.  The host side's own limit belongs to the parent
+ * tag.
+ */
+#ifdef CGEM64
+#define RP1ETH_DMA_MAXADDR	0x7fffffffffUL
+#else
+#define RP1ETH_DMA_MAXADDR	BUS_SPACE_MAXADDR_32BIT
+#endif
 
 #define RP1ETH_NUM_RX_DESCS	256
 #define RP1ETH_NUM_TX_DESCS	256
@@ -155,6 +180,8 @@ struct rp1eth_softc {
 	u_int			rxoverruns;
 	u_int			rxnobufs;
 	u_int			rxdmamapfails;
+	u_int			intr_resched;	/* see cgem_work_pending() */
+	uint64_t		rxhighbufs;	/* buffers above 4 GB */
 
 	/* Transmit descriptor ring. */
 	struct cgem_tx_desc	*txring;
@@ -168,6 +195,7 @@ struct rp1eth_softc {
 	u_int			txdefrags;
 	u_int			txdefragfails;
 	u_int			txdmamapfails;
+	uint64_t		txhighsegs;	/* segments above 4 GB */
 
 	/* Null descriptor rings (for unused priority queues). */
 	void			*null_qs;
@@ -251,6 +279,7 @@ static void rp1eth_update_speed(struct rp1eth_softc *);
 static int  cgem_intr_filter(void *);
 static void cgem_intr_task(void *, int);
 static void cgem_gem_poll(void *);
+static bool cgem_work_pending(struct rp1eth_softc *);
 static void cgem_recv(struct rp1eth_softc *);
 static void cgem_clean_tx(struct rp1eth_softc *);
 static void cgem_start_locked(if_t);
@@ -366,8 +395,8 @@ cgem_null_qs(struct rp1eth_softc *sc)
 
 /* -----------------------------------------------------------------------
  * Descriptor ring setup — adapted from cgem:
- *   • parent DMA tag = NULL (root constraints)
- *   • lowaddr = BUS_SPACE_MAXADDR_32BIT (RP1 inbound window is 32-bit)
+ *   • parent DMA tag = RP1's (bcm2712_rp1_dma_tag()), NULL on the ACPI lane
+ *   • lowaddr = RP1ETH_DMA_MAXADDR
  *   • neednullqs always set (GEM_GXL has priority queues)
  * ----------------------------------------------------------------------- */
 static int
@@ -385,25 +414,43 @@ cgem_setup_descs(struct rp1eth_softc *sc)
 	sc->rxring = NULL;
 
 	/*
-	 * Descriptor DMA tag: 32-bit address space only.
-	 * RP1 PCIe2 inbound window maps BCM2712 DRAM at 32-bit addresses.
+	 * Descriptor DMA tag.  On the FDT lane the parent is RP1's bus DMA
+	 * tag, and through it the host bridge's (see bcm2712_pcib.c).  On
+	 * the ACPI lane there is none, and NULL is used as before.
 	 */
-	err = bus_dma_tag_create(NULL, 1, 0,
-	    BUS_SPACE_MAXADDR_32BIT, BUS_SPACE_MAXADDR, NULL, NULL,
+	err = bus_dma_tag_create(bcm2712_rp1_dma_tag(), 1,
+#ifdef CGEM64
+	    1ULL << 32,	/* Do not cross a 4G boundary (see below). */
+#else
+	    0,
+#endif
+	    RP1ETH_DMA_MAXADDR, BUS_SPACE_MAXADDR, NULL, NULL,
 	    desc_rings_size, 1, desc_rings_size, 0,
 	    busdma_lock_mutex, &sc->sc_mtx, &sc->desc_dma_tag);
 	if (err)
 		return (err);
 
-	/* Mbuf DMA tag: same 32-bit constraint. */
-	err = bus_dma_tag_create(NULL, 1, 0,
-	    BUS_SPACE_MAXADDR_32BIT, BUS_SPACE_MAXADDR, NULL, NULL,
-	    MCLBYTES, TX_MAX_DMA_SEGS, MCLBYTES, 0,
+	/*
+	 * Mbuf DMA tag: same limit, same parent.  Its maps are created under
+	 * sc_mtx (cgem_fill_rqueue, cgem_start_locked), so BUS_DMA_ALLOCNOW
+	 * sets up the bounce zone now instead: creating one adds sysctls,
+	 * which may sleep.  arm64 gives every tag's maps a zone, for
+	 * cache-line bounces, even when no address needs bouncing.
+	 */
+	err = bus_dma_tag_create(bcm2712_rp1_dma_tag(), 1, 0,
+	    RP1ETH_DMA_MAXADDR, BUS_SPACE_MAXADDR, NULL, NULL,
+	    MCLBYTES, TX_MAX_DMA_SEGS, MCLBYTES, BUS_DMA_ALLOCNOW,
 	    busdma_lock_mutex, &sc->sc_mtx, &sc->mbuf_dma_tag);
 	if (err)
 		return (err);
 
-	/* Allocate coherent DMA memory for all descriptor rings at once. */
+	/*
+	 * Allocate coherent DMA memory for all descriptor rings at once.
+	 * The hardware has one register for the upper 32 bits of every rx
+	 * queue's address (RX_QBAR_HI) and one for every tx queue's
+	 * (TX_QBAR_HI), null queues included, so one allocation that does
+	 * not cross 4 GB keeps them in step.
+	 */
 	err = bus_dmamem_alloc(sc->desc_dma_tag, (void **)&sc->rxring,
 	    BUS_DMA_NOWAIT | BUS_DMA_COHERENT | BUS_DMA_ZERO,
 	    &sc->rxring_dma_map);
@@ -415,13 +462,6 @@ cgem_setup_descs(struct rp1eth_softc *sc)
 	    cgem_getaddr, &sc->rxring_physaddr, BUS_DMA_NOWAIT);
 	if (err)
 		return (err);
-
-	/* Verify 32-bit constraint was met. */
-	if (sc->rxring_physaddr > 0xffffffffUL) {
-		printf("rp1_eth: descriptor ring physaddr 0x%lx > 32-bit!\n",
-		    (unsigned long)sc->rxring_physaddr);
-		return (ENOMEM);
-	}
 
 	/* Initialize RX descriptors. */
 	for (i = 0; i < RP1ETH_NUM_RX_DESCS; i++) {
@@ -504,6 +544,11 @@ cgem_fill_rqueue(struct rp1eth_softc *sc)
 		    BUS_DMASYNC_PREREAD);
 
 		sc->rxring[sc->rxring_hd_ptr].ctl = 0;
+#ifdef CGEM64
+		sc->rxring[sc->rxring_hd_ptr].addrhi = segs[0].ds_addr >> 32;
+		if ((segs[0].ds_addr >> 32) != 0)
+			sc->rxhighbufs++;
+#endif
 		if (sc->rxring_hd_ptr == RP1ETH_NUM_RX_DESCS - 1) {
 			sc->rxring[sc->rxring_hd_ptr].addr =
 			    segs[0].ds_addr | CGEM_RXDESC_WRAP;
@@ -630,8 +675,14 @@ cgem_clean_tx(struct rp1eth_softc *sc)
 		m_freem(m);
 
 		if ((ctl & CGEM_TXDESC_AHB_ERR) != 0) {
+#ifdef CGEM64
+			printf("rp1_eth: TX AHB error, addr=0x%x%08x\n",
+			    sc->txring[sc->txring_tl_ptr].addrhi,
+			    sc->txring[sc->txring_tl_ptr].addr);
+#else
 			printf("rp1_eth: TX AHB error, addr=0x%08x\n",
 			    sc->txring[sc->txring_tl_ptr].addr);
+#endif
 		} else if ((ctl & (CGEM_TXDESC_RETRY_ERR |
 		    CGEM_TXDESC_LATE_COLL)) != 0) {
 			if_inc_counter(sc->ifp, IFCOUNTER_OERRORS, 1);
@@ -738,6 +789,12 @@ cgem_start_locked(if_t ifp)
 		for (i = nsegs - 1; i >= 0; i--) {
 			sc->txring[sc->txring_hd_ptr + i].addr =
 			    segs[i].ds_addr;
+#ifdef CGEM64
+			sc->txring[sc->txring_hd_ptr + i].addrhi =
+			    segs[i].ds_addr >> 32;
+			if ((segs[i].ds_addr >> 32) != 0)
+				sc->txhighsegs++;
+#endif
 			ctl = segs[i].ds_len;
 			if (i == nsegs - 1) {
 				ctl |= CGEM_TXDESC_LAST_BUF;
@@ -957,6 +1014,30 @@ reschedule:
  * Uses callout_init(CALLOUT_MPSAFE) — acquires sc_mtx itself.
  * Safe to stop from interrupt context (cgem_intr_filter) without the lock.
  * ----------------------------------------------------------------------- */
+/*
+ * Has the GEM completed a receive or transmit descriptor we have not
+ * processed?  Completions while the interrupt sources are disabled raise no
+ * interrupt when they are re-enabled; Linux macb_rx_poll() says so and
+ * checks the ring after re-enabling, and so does cgem_intr_task().  Without
+ * the check a full receive ring stalls for good: the GEM then reports only
+ * RX_USED_READ, and refilling needs frames handed back first (M2 phase 4b,
+ * rpi5_modules.git doc/M2_PCIE_HOST.md).
+ */
+static bool
+cgem_work_pending(struct rp1eth_softc *sc)
+{
+
+	CGEM_ASSERT_LOCKED(sc);
+
+	if (sc->rxring_queued > 0 &&
+	    (sc->rxring[sc->rxring_tl_ptr].addr & CGEM_RXDESC_OWN) != 0)
+		return (true);
+	if (sc->txring_queued > 0 &&
+	    (sc->txring[sc->txring_tl_ptr].ctl & CGEM_TXDESC_USED) != 0)
+		return (true);
+	return (false);
+}
+
 static void
 cgem_gem_poll(void *arg)
 {
@@ -974,7 +1055,7 @@ cgem_gem_poll(void *arg)
 	    (CGEM_INTR_RX_COMPLETE | CGEM_INTR_TX_USED_READ |
 	     CGEM_INTR_HRESP_NOT_OK | CGEM_INTR_RX_USED_READ |
 	     CGEM_INTR_RX_OVERRUN);
-	if (ist != 0) {
+	if (ist != 0 || cgem_work_pending(sc)) {
 		WR4(sc, CGEM_INTR_DIS, CGEM_INTR_ALL);
 		atomic_set_32(&sc->intr_pending, ist);
 		taskqueue_enqueue(taskqueue_fast, &sc->intr_task);
@@ -1029,8 +1110,12 @@ cgem_intr_task(void *arg, int pending __unused)
 
 	WR4(sc, CGEM_INTR_STAT, ist);		/* write-to-clear latched bits */
 
-	if ((ist & CGEM_INTR_RX_COMPLETE) != 0)
-		cgem_recv(sc);
+	/*
+	 * Always, not only on RX_COMPLETE: completions can arrive without it
+	 * (see cgem_work_pending()), and on RX_USED_READ the ring is full of
+	 * frames that only cgem_recv() can hand back.
+	 */
+	cgem_recv(sc);
 	cgem_clean_tx(sc);
 
 	if ((ist & CGEM_INTR_HRESP_NOT_OK) != 0) {
@@ -1056,12 +1141,24 @@ cgem_intr_task(void *arg, int pending __unused)
 	    CGEM_INTR_HRESP_NOT_OK | CGEM_INTR_RX_USED_READ |
 	    CGEM_INTR_RX_OVERRUN);
 
+	/* Completed while the sources were off: no interrupt will say so. */
+	if (cgem_work_pending(sc)) {
+		WR4(sc, CGEM_INTR_DIS, CGEM_INTR_ALL);
+		sc->intr_resched++;
+		taskqueue_enqueue(taskqueue_fast, &sc->intr_task);
+		CGEM_UNLOCK(sc);
+		return;
+	}
+
 	/*
-	 * Re-arm the 5ms fallback poll.  IACK cannot generate per-packet MSIs
-	 * on this platform (shared SPI-229 kept permanently asserted by USB),
-	 * so gem_poll is the sole mechanism for catching packets that arrive
-	 * while interrupts were masked.  Arm unconditionally; cgem_intr_filter
-	 * cancels it if a real interrupt fires first.
+	 * Re-arm the 5ms fallback poll.  On the FDT lane since M2 phase 4b
+	 * the GEM has its own RP1 MSI-X vector, which rp1pci acknowledges
+	 * after cgem_intr_filter, so a source still pending when INTR_EN is
+	 * written above raises a new interrupt and the poll is only a
+	 * backstop.  Before that, and on the ACPI lane, no GEM interrupt
+	 * reached the CPU and the poll was the only mechanism.  Arm
+	 * unconditionally; cgem_intr_filter cancels it if a real interrupt
+	 * fires first.
 	 */
 	callout_reset(&sc->gem_poll, MAX(1, hz / 200), cgem_gem_poll, sc);
 
@@ -1141,6 +1238,9 @@ cgem_config(struct rp1eth_softc *sc)
 	    CGEM_DMA_CFG_RX_PKTBUF_MEMSZ_SEL_8K |
 	    CGEM_DMA_CFG_TX_PKTBUF_MEMSZ_SEL |
 	    CGEM_DMA_CFG_AHB_FIXED_BURST_LEN_16 |
+#ifdef CGEM64
+	    CGEM_DMA_CFG_ADDR_BUS_64 |
+#endif
 	    CGEM_DMA_CFG_DISC_WHEN_NO_AHB;
 
 	if ((if_getcapenable(ifp) & IFCAP_TXCSUM) != 0)
@@ -1150,6 +1250,10 @@ cgem_config(struct rp1eth_softc *sc)
 
 	WR4(sc, CGEM_RX_QBAR, (uint32_t)sc->rxring_physaddr);
 	WR4(sc, CGEM_TX_QBAR, (uint32_t)sc->txring_physaddr);
+#ifdef CGEM64
+	WR4(sc, CGEM_RX_QBAR_HI, (uint32_t)(sc->rxring_physaddr >> 32));
+	WR4(sc, CGEM_TX_QBAR_HI, (uint32_t)(sc->txring_physaddr >> 32));
+#endif
 
 	/* Enable RX and TX. */
 	sc->net_ctl_shadow |= (CGEM_NET_CTRL_TX_EN | CGEM_NET_CTRL_RX_EN);
@@ -1185,6 +1289,12 @@ cgem_init_locked(struct rp1eth_softc *sc)
 	if_setdrvflagbits(sc->ifp, IFF_DRV_RUNNING, IFF_DRV_OACTIVE);
 
 	callout_reset(&sc->tick_ch, hz, rp1eth_tick, sc);
+
+	/*
+	 * Start the 5 ms fallback poll now, not after the first interrupt,
+	 * so that receive never waits on one arriving.
+	 */
+	callout_reset(&sc->gem_poll, MAX(1, hz / 200), cgem_gem_poll, sc);
 }
 
 static void
@@ -1391,10 +1501,17 @@ rp1eth_add_sysctls(struct rp1eth_softc *sc, struct sysctl_oid *parent)
 	    &sc->rxnobufs, 0, "Receive ring empty events");
 	SYSCTL_ADD_UINT(ctx, child, OID_AUTO, "_rxdmamapfails", CTLFLAG_RD,
 	    &sc->rxdmamapfails, 0, "Receive DMA map failures");
+	SYSCTL_ADD_UINT(ctx, child, OID_AUTO, "_intr_resched", CTLFLAG_RD,
+	    &sc->intr_resched, 0,
+	    "Interrupt task reruns for work completed while masked");
 	SYSCTL_ADD_UINT(ctx, child, OID_AUTO, "_txfull", CTLFLAG_RD,
 	    &sc->txfull, 0, "Transmit ring full events");
 	SYSCTL_ADD_UINT(ctx, child, OID_AUTO, "_txdmamapfails", CTLFLAG_RD,
 	    &sc->txdmamapfails, 0, "Transmit DMA map failures");
+	SYSCTL_ADD_UQUAD(ctx, child, OID_AUTO, "_rxhighbufs", CTLFLAG_RD,
+	    &sc->rxhighbufs, "Receive buffers queued above 4 GB");
+	SYSCTL_ADD_UQUAD(ctx, child, OID_AUTO, "_txhighsegs", CTLFLAG_RD,
+	    &sc->txhighsegs, "Transmit segments queued above 4 GB");
 	SYSCTL_ADD_UINT(ctx, child, OID_AUTO, "_txdefrags", CTLFLAG_RD,
 	    &sc->txdefrags, 0, "Transmit m_defrag() calls");
 

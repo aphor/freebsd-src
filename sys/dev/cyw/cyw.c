@@ -74,6 +74,7 @@ cyw_probe_fwsup(struct cyw_softc *sc)
  *   hw.cyw.fw_wsec      — wsec     (cipher suite mask; 4 = AES-CCM)
  *   hw.cyw.fw_wpa_auth  — wpa_auth (key-mgmt mask; 0x80 = WPA2-PSK)
  *   hw.cyw.fw_auth      — auth     (0 = open system)
+ *   hw.cyw.fw_pm        — WLC_GET_PM (0 = PM_OFF, 1 = PM_MAX, 2 = PM_FAST)
  * ------------------------------------------------------------------------- */
 static int
 cyw_sysctl_fw_iovar(struct cyw_softc *sc, const char *iovar,
@@ -108,6 +109,22 @@ cyw_sysctl_fw_auth(SYSCTL_HANDLER_ARGS)
 	return (cyw_sysctl_fw_iovar(arg1, "auth", oidp, req));
 }
 
+static int
+cyw_sysctl_fw_pm(SYSCTL_HANDLER_ARGS)
+{
+	struct cyw_softc *sc = arg1;
+	uint32_t v = 0;
+	int err;
+
+	if (!sc->sdpcm_running)
+		return (ENXIO);
+	err = cyw_fil_cmd_data_get(sc, WLC_GET_PM, &v, sizeof(v));
+	if (err != 0)
+		return (err);
+	v = le32toh(v);
+	return (sysctl_handle_int(oidp, &v, 0, req));
+}
+
 /* -------------------------------------------------------------------------
  * Probe
  * ------------------------------------------------------------------------- */
@@ -127,6 +144,8 @@ cyw_probe(device_t dev)
 /* -------------------------------------------------------------------------
  * Attach
  * ------------------------------------------------------------------------- */
+static void cyw_init_task(void *, int);
+
 static int
 cyw_attach(device_t dev)
 {
@@ -201,6 +220,10 @@ cyw_attach(device_t dev)
 	    "F2 CMD53 reads that returned EIO");
 	SYSCTL_ADD_U64(&sc->sysctl_ctx,
 	    SYSCTL_CHILDREN(sc->sysctl_tree), OID_AUTO,
+	    "tx_eio_count", CTLFLAG_RD, &sc->tx_eio_count, 0,
+	    "F2 writes that failed and were terminated (cyw_txfail)");
+	SYSCTL_ADD_U64(&sc->sysctl_ctx,
+	    SYSCTL_CHILDREN(sc->sysctl_tree), OID_AUTO,
 	    "rx_eagain_count", CTLFLAG_RD, &sc->rx_eagain_count, 0,
 	    "F2 reads bounced by gate or header check");
 	SYSCTL_ADD_INT(&sc->sysctl_ctx,
@@ -233,6 +256,46 @@ cyw_attach(device_t dev)
 	    "Frames handed to cyw_transmit");
 	SYSCTL_ADD_U64(&sc->sysctl_ctx,
 	    SYSCTL_CHILDREN(sc->sysctl_tree), OID_AUTO,
+	    "tx_credit_waits", CTLFLAG_RD, &sc->tx_credit_waits, 0,
+	    "Times tx_task paused, frames queued, for firmware credit");
+	SYSCTL_ADD_U64(&sc->sysctl_ctx,
+	    SYSCTL_CHILDREN(sc->sysctl_tree), OID_AUTO,
+	    "tx_credit_drops", CTLFLAG_RD, &sc->tx_credit_drops, 0,
+	    "Frames dropped for lack of credit (backstop; expect 0)");
+	SYSCTL_ADD_U64(&sc->sysctl_ctx,
+	    SYSCTL_CHILDREN(sc->sysctl_tree), OID_AUTO,
+	    "tx_queue_drops", CTLFLAG_RD, &sc->tx_queue_drops, 0,
+	    "Frames dropped because tx_queue was full");
+	SYSCTL_ADD_UINT(&sc->sysctl_ctx,
+	    SYSCTL_CHILDREN(sc->sysctl_tree), OID_AUTO,
+	    "tx_queue_len", CTLFLAG_RD, &sc->tx_queue_len, 0,
+	    "Frames currently queued for TX");
+	SYSCTL_ADD_U64(&sc->sysctl_ctx,
+	    SYSCTL_CHILDREN(sc->sysctl_tree), OID_AUTO,
+	    "rx_credit_clamps", CTLFLAG_RD, &sc->rx_credit_clamps, 0,
+	    "RX headers whose credit ceiling was implausible and clamped");
+	SYSCTL_ADD_U64(&sc->sysctl_ctx,
+	    SYSCTL_CHILDREN(sc->sysctl_tree), OID_AUTO,
+	    "rx_glom_frames", CTLFLAG_RD, &sc->rx_glom_frames, 0,
+	    "RX superframes received");
+	SYSCTL_ADD_U64(&sc->sysctl_ctx,
+	    SYSCTL_CHILDREN(sc->sysctl_tree), OID_AUTO,
+	    "rx_glom_subframes", CTLFLAG_RD, &sc->rx_glom_subframes, 0,
+	    "Event and data frames delivered from RX superframes");
+	SYSCTL_ADD_U64(&sc->sysctl_ctx,
+	    SYSCTL_CHILDREN(sc->sysctl_tree), OID_AUTO,
+	    "rx_glom_errors", CTLFLAG_RD, &sc->rx_glom_errors, 0,
+	    "Bad glom descriptors and dropped RX superframes");
+	SYSCTL_ADD_U8(&sc->sysctl_ctx,
+	    SYSCTL_CHILDREN(sc->sysctl_tree), OID_AUTO,
+	    "tx_seq", CTLFLAG_RD, &sc->sdpcm_tx_seq, 0,
+	    "SDPCM TX sequence number");
+	SYSCTL_ADD_U8(&sc->sysctl_ctx,
+	    SYSCTL_CHILDREN(sc->sysctl_tree), OID_AUTO,
+	    "tx_max", CTLFLAG_RD, &sc->sdpcm_rx_max, 0,
+	    "SDPCM credit ceiling from firmware");
+	SYSCTL_ADD_U64(&sc->sysctl_ctx,
+	    SYSCTL_CHILDREN(sc->sysctl_tree), OID_AUTO,
 	    "tx_eapol_frames", CTLFLAG_RD, &sc->tx_eapol_frames, 0,
 	    "TX subset with EtherType 0x888E");
 	SYSCTL_ADD_U64(&sc->sysctl_ctx,
@@ -257,12 +320,56 @@ cyw_attach(device_t dev)
 	    SYSCTL_CHILDREN(sc->sysctl_tree), OID_AUTO, "fw_auth",
 	    CTLTYPE_INT | CTLFLAG_RD | CTLFLAG_MPSAFE, sc, 0,
 	    cyw_sysctl_fw_auth, "I", "firmware auth value (live GET)");
+	SYSCTL_ADD_PROC(&sc->sysctl_ctx,
+	    SYSCTL_CHILDREN(sc->sysctl_tree), OID_AUTO, "fw_pm",
+	    CTLTYPE_INT | CTLFLAG_RD | CTLFLAG_MPSAFE, sc, 0,
+	    cyw_sysctl_fw_pm, "I", "firmware power management mode (live GET)");
+
+	/*
+	 * The firmware bring-up runs on a taskqueue of our own, not here.
+	 * sdiob(4) attaches us from its discovery task on taskqueue_thread,
+	 * and sdda(4) initializes the SD card from that same single thread:
+	 * a bring-up that stalls in an SDIO transfer used to stall the root
+	 * file system with it, and a slow one delayed it (cyw43455.md).
+	 * Linux also brings the chip up asynchronously, in
+	 * brcmf_sdio_firmware_callback() after request_firmware_nowait().
+	 */
+	sc->init_tq = taskqueue_create("cyw_init", M_WAITOK,
+	    taskqueue_thread_enqueue, &sc->init_tq);
+	taskqueue_start_threads(&sc->init_tq, 1, PWAIT, "%s init",
+	    device_get_nameunit(dev));
+	TASK_INIT(&sc->init_task, 0, cyw_init_task, sc);
+	taskqueue_enqueue(sc->init_tq, &sc->init_task);
+	return (0);
+
+fail_mtx:
+	sx_destroy(&sc->ioctl_sx);
+	mtx_destroy(&sc->mtx);
+	return (err);
+}
+
+/* -------------------------------------------------------------------------
+ * Firmware bring-up (init_tq)
+ *
+ * Everything that talks to the chip.  On failure it undoes what it did and
+ * leaves cyw0 attached with WiFi down; kldunload/kldload retries.
+ * ------------------------------------------------------------------------- */
+static void
+cyw_init_task(void *arg, int pending __unused)
+{
+	struct cyw_softc *sc = arg;
+	device_t dev = sc->dev;
+	sbintime_t t0;
+	uint32_t pm;
+	int err;
+
+	t0 = sbinuptime();
 
 	/* SDIO attach: enable F1, enable clock, read chip ID */
 	err = cyw_sdio_attach(sc);
 	if (err != 0) {
 		device_printf(dev, "SDIO attach failed: %d\n", err);
-		goto fail_sysctl;
+		goto fail;
 	}
 
 	device_printf(dev, "chip 0x%04x rev %d\n", sc->chip_id, sc->chip_rev);
@@ -305,8 +412,19 @@ cyw_attach(device_t dev)
 	 */
 	if (cyw_fil_iovar_int_set(sc, "roam_off", 1) != 0)
 		device_printf(dev, "cyw_attach: roam_off IOVAR failed\n");
-	if (cyw_fil_iovar_int_set(sc, "pm", 0) != 0)
-		device_printf(dev, "cyw_attach: pm IOVAR failed\n");
+	/*
+	 * Power management off.  There is no "pm" iovar (7.45.265 rejects it
+	 * with BCME_UNSUPPORTED); Linux brcmf_config_dongle() uses the
+	 * BRCMF_C_SET_PM command, once, before the interface is up.  The
+	 * mode found is logged because it is the firmware's own default.
+	 */
+	pm = 0xffffffff;
+	(void)cyw_fil_cmd_data_get(sc, WLC_GET_PM, &pm, sizeof(pm));
+	if (cyw_fil_cmd_int_set(sc, WLC_SET_PM, CYW_PM_OFF) != 0)
+		device_printf(dev, "cyw_attach: WLC_SET_PM failed\n");
+	else
+		device_printf(dev, "power management: firmware mode %d, "
+		    "set to %d (off)\n", (int)le32toh(pm), CYW_PM_OFF);
 	if (cyw_fil_iovar_int_set(sc, "btc_mode", 0) != 0)
 		device_printf(dev, "cyw_attach: btc_mode IOVAR failed\n");
 	/* mpc intentionally left at firmware default (1 = enabled).
@@ -403,17 +521,19 @@ cyw_attach(device_t dev)
 	 * the FreeBSD equivalent and issues WLC_UP on first ic_nrunning > 0.
 	 */
 
-	return (0);
+	sc->init_done = true;
+	device_printf(dev, "firmware bring-up took %d ms, done %d ms "
+	    "after boot\n", (int)((sbinuptime() - t0) / SBT_1MS),
+	    (int)(sbinuptime() / SBT_1MS));
+	return;
 
 fail_cfg:
 	cyw_cfg_detach(sc);
 fail_sdio:
 	cyw_sdio_detach(sc);
-fail_sysctl:
-	sysctl_ctx_free(&sc->sysctl_ctx);
-fail_mtx:
-	mtx_destroy(&sc->mtx);
-	return (err);
+fail:
+	device_printf(dev, "firmware bring-up failed (%d); WiFi is down\n",
+	    err);
 }
 
 /* -------------------------------------------------------------------------
@@ -424,9 +544,14 @@ cyw_detach(device_t dev)
 {
 	struct cyw_softc *sc = device_get_softc(dev);
 
-	cyw_cfg_detach(sc);	/* ieee80211_ifdetach before SDPCM stops */
-	cyw_sdpcm_detach(sc);	/* stop callout; wake any sleeping fwil */
-	cyw_sdio_detach(sc);
+	/* A bring-up still running finishes (or unwinds) first. */
+	taskqueue_drain(sc->init_tq, &sc->init_task);
+	taskqueue_free(sc->init_tq);
+	if (sc->init_done) {
+		cyw_cfg_detach(sc);	/* ieee80211_ifdetach before SDPCM stops */
+		cyw_sdpcm_detach(sc);	/* stop callout; wake any sleeping fwil */
+	}
+	cyw_sdio_detach(sc);	/* no-op unless the SDIO side is up */
 	sysctl_ctx_free(&sc->sysctl_ctx);
 	sx_destroy(&sc->ioctl_sx);
 	mtx_destroy(&sc->mtx);

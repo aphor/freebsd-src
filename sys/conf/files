@@ -214,13 +214,12 @@ contrib/openzfs/module/os/freebsd/zfs/zfs_ctldir.c		optional zfs compile-with "$
 contrib/openzfs/module/os/freebsd/zfs/zfs_debug.c		optional zfs compile-with "${ZFS_C}"
 contrib/openzfs/module/os/freebsd/zfs/zfs_dir.c		optional zfs compile-with "${ZFS_C}"
 contrib/openzfs/module/os/freebsd/zfs/zfs_file_os.c		optional zfs compile-with "${ZFS_C}"
-contrib/openzfs/module/os/freebsd/zfs/zfs_ioctl_compat.c		optional zfs compile-with "${ZFS_C}"
 contrib/openzfs/module/os/freebsd/zfs/zfs_ioctl_os.c		optional zfs compile-with "${ZFS_C}"
 contrib/openzfs/module/os/freebsd/zfs/zfs_racct.c		optional zfs compile-with "${ZFS_C}"
 contrib/openzfs/module/os/freebsd/zfs/zfs_vfsops.c		optional zfs compile-with "${ZFS_C}"
 contrib/openzfs/module/os/freebsd/zfs/zfs_vnops_os.c		optional zfs compile-with "${ZFS_C}"
 contrib/openzfs/module/os/freebsd/zfs/zfs_znode_os.c		optional zfs compile-with "${ZFS_C}"
-contrib/openzfs/module/os/freebsd/zfs/zio_crypt.c		optional zfs compile-with "${ZFS_C}"
+contrib/openzfs/module/os/freebsd/zfs/zio_crypt_os.c		optional zfs compile-with "${ZFS_C}"
 contrib/openzfs/module/os/freebsd/zfs/zvol_os.c		optional zfs compile-with "${ZFS_C}"
 
 #zfs checksums / zcommon
@@ -378,6 +377,7 @@ contrib/openzfs/module/zfs/zil.c		optional zfs compile-with "${ZFS_C}"
 contrib/openzfs/module/zfs/zio.c		optional zfs compile-with "${ZFS_C}"
 contrib/openzfs/module/zfs/zio_checksum.c		optional zfs compile-with "${ZFS_C}"
 contrib/openzfs/module/zfs/zio_compress.c		optional zfs compile-with "${ZFS_C}"
+contrib/openzfs/module/zfs/zio_crypt.c		optional zfs compile-with "${ZFS_C}"
 contrib/openzfs/module/zfs/zio_inject.c		optional zfs compile-with "${ZFS_C}"
 contrib/openzfs/module/zfs/zle.c		optional zfs compile-with "${ZFS_C}"
 contrib/openzfs/module/zfs/zrlock.c		optional zfs compile-with "${ZFS_C}"
@@ -2357,6 +2357,8 @@ dev/ixgbe/ixgbe_common.c	optional ix inet | ixv inet \
 	compile-with "${NORMAL_C} -I$S/dev/ixgbe"
 dev/ixgbe/ixgbe_fw_logging.c	optional ix inet | ixv inet \
 	compile-with "${NORMAL_C} -I$S/dev/ixgbe"
+dev/ixgbe/ixgbe_hv_vf.c		optional ixv inet \
+	compile-with "${NORMAL_C} -I$S/dev/ixgbe"
 dev/ixgbe/ixgbe_mbx.c		optional ix inet | ixv inet \
 	compile-with "${NORMAL_C} -I$S/dev/ixgbe"
 dev/ixgbe/ixgbe_vf.c		optional ix inet | ixv inet \
@@ -2382,10 +2384,6 @@ dev/jme/if_jme.c		optional jme pci
 dev/kbd/kbd.c			optional atkbd | pckbd | sc | ukbd | vt | hkbd
 dev/kbdmux/kbdmux.c		optional kbdmux
 dev/ksyms/ksyms.c		optional ksyms
-dev/le/am7990.c			optional le
-dev/le/am79900.c		optional le
-dev/le/if_le_pci.c		optional le pci
-dev/le/lance.c			optional le
 dev/led/led.c			standard
 dev/lge/if_lge.c		optional lge
 dev/liquidio/base/cn23xx_pf_device.c		optional lio	\
@@ -3343,6 +3341,7 @@ dev/ufshci/ufshci_acpi.c	optional ufshci acpi
 dev/ufshci/ufshci_ctrlr.c	optional ufshci
 dev/ufshci/ufshci_ctrlr_cmd.c	optional ufshci
 dev/ufshci/ufshci_dev.c		optional ufshci
+dev/ufshci/ufshci_ioctl.c	optional ufshci
 dev/ufshci/ufshci_pci.c		optional ufshci pci
 dev/ufshci/ufshci_req_queue.c	optional ufshci
 dev/ufshci/ufshci_req_sdb.c	optional ufshci
@@ -5423,7 +5422,7 @@ vm/vm_pager.c			standard
 vm/vm_phys.c			standard
 vm/vm_radix.c			standard
 vm/vm_reserv.c			standard
-vm/vm_swapout.c			optional racct
+vm/vm_swapout.c			standard
 vm/vm_unix.c			standard
 vm/vnode_pager.c		standard
 xen/features.c			optional xenhvm

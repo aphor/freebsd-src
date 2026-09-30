@@ -94,22 +94,20 @@
 #define SBSDIO_WATERMARK		0x10008	/* F2 RX watermark */
 #define SBSDIO_DEVICE_CTL		0x10009	/* device control */
 #define SBSDIO_FUNC1_FRAMECTRL		0x1000d	/* F2 frame control (SFC_*) */
-#define  SBSDIO_FUNC1_FRAMECTRL_RF_TERM	0x02	/* terminate current RX frame */
+/*
+ * Linux sdio.c: SFC_RF_TERM (1 << 0), SFC_WF_TERM (1 << 1).  RF_TERM used to
+ * be 0x02 here, so cyw_rxfail() terminated the write frame, not the read.
+ */
+#define  SBSDIO_FUNC1_FRAMECTRL_RF_TERM	0x01	/* terminate current RX frame */
+#define  SBSDIO_FUNC1_FRAMECTRL_WF_TERM	0x02	/* terminate current TX frame */
+#define SBSDIO_FUNC1_WFRAMEBCLO		0x10019	/* TX frame byte count low */
+#define SBSDIO_FUNC1_WFRAMEBCHI		0x1001a	/* TX frame byte count high */
 #define SBSDIO_FUNC1_RFRAMEBCLO		0x1001b	/* RX frame byte count low */
 #define SBSDIO_FUNC1_RFRAMEBCHI		0x1001c	/* RX frame byte count high */
 
 /* CCCR I/O Abort register (F0 address space, SDIO spec §6.9) */
 #define SD_IO_CCCR_CTL			0x06	/* I/O Abort: bits[2:0] = func# to abort */
 
-/*
- * Maximum bytes per CMD53 F2 read in byte-mode.
- *
- * sdiob's F2 block size is 512.  Any SDIO_READ_EXTENDED with size >= 512
- * triggers block-mode CMD53, which fails on this hardware (EIO).  Cap each
- * call to 448 bytes (7 × CYW_F2_BLKSIZE = 7 × 64) to stay in byte-mode.
- * See doc/cyw43455.md §16 and the rxfail diagnosis in the Step 6 notes.
- */
-#define CYW_F2_MAX_BYTE_XFER		448
 #define SBSDIO_FUNC1_MESBUSYCTRL	0x1001d	/* busy control */
 #define SBSDIO_FUNC1_WAKEUPCTRL	0x1001e	/* SR wakeup control */
 #define  SBSDIO_FUNC1_WCTRL_ALPWAIT_SHIFT	0	/* ULP chips */
@@ -146,9 +144,14 @@
 #define  SDIO_CCCR_BRCM_CARDCAP_CMD14_SUPPORT	0x02
 #define  SDIO_CCCR_BRCM_CARDCAP_CMD14_EXT	0x04
 
-/* F1 and F2 block sizes for BCM43455 */
+/*
+ * F1 and F2 block sizes for BCM43455, both set with sdio_set_block_size()
+ * so the card and sdiob agree.  Linux uses 64 for F1 and 512 for this
+ * chip's F2 (bcmsdh.c SDIO_FUNC2_BLOCKSIZE); 64 works for F2 and costs at
+ * most 63 bytes of padding per frame instead of 511.
+ */
 #define CYW_F1_BLKSIZE			64
-#define CYW_F2_BLKSIZE			64	/* bump to 512 once F2 is stable */
+#define CYW_F2_BLKSIZE			64
 
 /* F2 FIFO address and transfer alignment (brcmfmac-freebsd sdpcm.c) */
 #define CYW_F2_FIFO_ADDR		0x8000	/* fixed address for F2 FIFO CMD53 */
@@ -156,8 +159,8 @@
 /* RX buffer size: max frame + one extra block for the two-read protocol */
 #define CYW_SDPCM_BUF_SIZE		(CYW_SDPCM_MAX_FRAME + CYW_F2_BLKSIZE)
 
-/* F2 watermark for BCM43455 (CY_435X family, sdio.c:58) */
-#define CYW_F2_WATERMARK		0x40	/* was 0x60 — wrong for 435x */
+/* F2 watermark and MES busy control: Linux's CY_435X values; see cyw_f2_bringup(). */
+#define CYW_F2_WATERMARK		0x40
 #define CYW_MES_WATERMARK		0xc0	/* 0x40 watermark | 0x80 enable */
 #define SBSDIO_DEVCTL_F2WM_ENAB		0x10	/* SBSDIO_DEVICE_CTL: enable F2 watermark */
 
@@ -189,6 +192,8 @@
 #define BCMA_EROM_COREB_NUM_WMP_SHIFT	14
 #define BCMA_EROM_COREB_NUM_WSP_MASK	0x00f80000	/* bits [23:19]: slave wrapper count */
 #define BCMA_EROM_COREB_NUM_WSP_SHIFT	19
+#define BCMA_EROM_COREB_REV_MASK	0xff000000	/* bits [31:24]: core revision */
+#define BCMA_EROM_COREB_REV_SHIFT	24
 
 /* Region descriptor */
 #define BCMA_EROM_REGION_BASE_MASK	0xfffff000	/* bits [31:12]: region base */
@@ -281,6 +286,8 @@ struct cyw_sdpcm_hdr {
 #define CYW_SDPCM_CHAN_CTRL		0	/* IOCTL / IOVAR */
 #define CYW_SDPCM_CHAN_EVENT		1	/* async firmware events */
 #define CYW_SDPCM_CHAN_DATA		2	/* 802.3 Ethernet frames */
+#define CYW_SDPCM_CHAN_GLOM		3	/* superframe, see cyw_sdpcm_rxglom() */
+#define CYW_SDPCM_GLOMDESC		0x80	/* chan_flags: glom descriptor */
 
 /* -------------------------------------------------------------------------
  * BCDC command header (16 bytes, follows SDPCM header on control channel)
@@ -373,7 +380,9 @@ typedef void (*cyw_event_handler_t)(struct cyw_softc *,
 #define WLC_GET_CHANNEL			29
 #define WLC_SET_CHANNEL			30
 #define WLC_DISASSOC			52	/* deauthenticate */
+#define WLC_GET_PM			85	/* get power management mode */
 #define WLC_SET_PM			86	/* set power management mode */
+#define  CYW_PM_OFF			0	/* Linux PM_OFF (brcm80211 defs.h) */
 #define WLC_SET_ROAM_TRIGGER		55	/* set roam trigger level */
 #define WLC_SET_ROAM_DELTA		57	/* set roam delta */
 #define WLC_SET_SCAN_CHANNEL_TIME	185	/* active dwell time per channel (ms) */
@@ -465,6 +474,12 @@ struct cyw_join_params {
  * Linux brcmf_join_scan_params_le (fwil_types.h:519-532).  Each int32
  * field accepts -1 to mean "use firmware default", which is what we
  * use to keep the wire format identical to Linux's normal operation.
+ *
+ * Naturally aligned, as in Linux: 3 pad bytes follow scan_type, so the
+ * struct is 20 bytes.  It used to be __packed (17 bytes), which moved
+ * assoc_le 3 bytes early.  The firmware then read chanspec_num from the
+ * chanspec itself (e.g. 0x00e32a00) and rejected every "join" with
+ * BCME_BUFTOOSHORT (-14).  cyw_cfg.c asserts the Linux offsets.
  */
 struct cyw_join_scan_params_le {
 	uint8_t		scan_type;	/* 0 = active (default) */
@@ -472,7 +487,7 @@ struct cyw_join_scan_params_le {
 	int32_t		active_time;	/* -1 = default */
 	int32_t		passive_time;	/* -1 = default */
 	int32_t		home_time;	/* -1 = default */
-} __packed;
+};
 
 /*
  * Extended join params — payload for the "join" IOVAR.  Mirrors Linux
@@ -486,7 +501,7 @@ struct cyw_ext_join_params {
 	struct cyw_ssid_le		ssid_le;
 	struct cyw_join_scan_params_le	scan_le;
 	struct cyw_assoc_params_le	assoc_le;
-} __packed;
+};
 
 /* -------------------------------------------------------------------------
  * Softc
@@ -515,6 +530,11 @@ struct cyw_softc {
 	struct sysctl_ctx_list	sysctl_ctx;
 	struct sysctl_oid	*sysctl_tree;
 
+	/* Firmware bring-up, deferred from attach to cyw_init_task */
+	struct taskqueue	*init_tq;
+	struct task		init_task;
+	bool			init_done;	/* bring-up succeeded */
+
 	/* RX poll callout + taskqueue task */
 	struct taskqueue	*rx_tq;
 	struct callout		rx_callout;
@@ -533,6 +553,7 @@ struct cyw_softc {
 	struct mtx		tx_queue_mtx;
 	struct mbuf		*tx_queue_head;
 	struct mbuf		**tx_queue_tail;
+	u_int			tx_queue_len;	/* frames on tx_queue */
 
 	/*
 	 * F2 exclusion lock — serializes all SDIO F2 reads and writes.
@@ -556,8 +577,9 @@ struct cyw_softc {
 	 */
 	struct sx		ioctl_sx;
 
-	/* SDIO device core backplane base (found via EROM scan) */
+	/* SDIO device core backplane base and revision (found via EROM scan) */
 	uint32_t		sdio_core_base;
+	uint8_t			sdio_core_rev;
 
 	/* SDPCM state */
 	uint8_t			sdpcm_tx_seq;
@@ -566,9 +588,12 @@ struct cyw_softc {
 	/* RX diagnostic counters (Step 6 — F2 EIO classification) */
 	uint64_t		rx_ok_count;	/* successful F2 reads */
 	uint64_t		rx_eio_count;	/* CMD53 returned EIO */
+	uint64_t		tx_eio_count;	/* F2 write failed (cyw_txfail) */
 	uint64_t		rx_eagain_count; /* gate or hdr checks bounced */
 	int			rx_last_ok_ticks; /* ticks of last successful read */
 	int			rx_last_eio_ticks; /* ticks of last EIO */
+	int			fwready_ticks;	/* ticks at FWREADY, for TX EIO diag */
+	bool			first_tx_logged; /* first IOCTL write timing logged */
 
 	/* Data-channel RX counters (Step 7 — RX path verification) */
 	uint64_t		rx_data_frames;	/* SDPCM chan-2 frames delivered up */
@@ -576,6 +601,14 @@ struct cyw_softc {
 	uint64_t		rx_eapol_frames; /* subset with EtherType 0x888E */
 	/* Data-channel TX counters (added for 4-way handshake diagnosis) */
 	uint64_t		tx_data_frames;	/* all frames handed to cyw_transmit */
+	/* TX flow control, see cyw_tx_credits_ok() */
+	uint64_t		tx_credit_waits; /* tx_task paused for credits */
+	uint64_t		tx_credit_drops; /* dropped for credits (should be 0) */
+	uint64_t		tx_queue_drops;	/* dropped, tx_queue full */
+	uint64_t		rx_credit_clamps; /* implausible credit headers */
+	uint64_t		rx_glom_frames;	/* superframes received */
+	uint64_t		rx_glom_subframes; /* subframes delivered from them */
+	uint64_t		rx_glom_errors;	/* bad descriptors, dropped superframes */
 	uint64_t		tx_eapol_frames; /* TX subset with EtherType 0x888E */
 	uint64_t		tx_eapol_bytes;	/* TX EAPOL byte total */
 	int			tx_hdr_debug;	/* dump SDPCM/BDC TX hdrs when set */
@@ -715,12 +748,42 @@ int  cyw_sdpcm_attach(struct cyw_softc *);
 void cyw_sdpcm_detach(struct cyw_softc *);
 
 /* cyw_cfg.c — deferred TX task driven by cyw_vap_transmit */
+/*
+ * TX flow control.  The firmware grants credits as a sequence-number
+ * ceiling (sdpcm_rx_max, from every RX header); a frame may be sent while
+ * sdpcm_tx_seq is below it.  The window is 8-bit and wraps, so -- as
+ * Linux brcmf_sdio data_ok() does -- a difference with the top bit set
+ * means the ceiling is *behind* tx_seq, i.e. no credit, not 200-odd of
+ * them.  Testing only for zero, as this driver did, let a burst overrun
+ * the firmware whenever the ceiling lagged.
+ */
+/*
+ * Frames held while waiting for the bus or for credit.  Kept short on
+ * purpose: with the SDIO bus at 400 kHz, 1-bit, one 1536-byte frame takes
+ * about 36 ms (measured 28 frames/s, ~41 KB/s), so 512 queued frames meant
+ * about 17 s of queueing delay -- long enough for ARP and TCP to give up
+ * ("Host is down") mid-transfer.  64 is about 2.3 s; past that, dropping
+ * lets TCP back off instead.
+ */
+#define	CYW_TX_QUEUE_MAX	64
+
+static inline bool
+cyw_tx_credits_ok(struct cyw_softc *sc)
+{
+	uint8_t w = (uint8_t)(sc->sdpcm_rx_max - sc->sdpcm_tx_seq);
+
+	return (w != 0 && (w & 0x80) == 0);
+}
+
 void cyw_tx_task(void *arg, int pending);
 
 /* cyw_fwil.c — IOVAR/IOCTL encoding layer */
 int  cyw_sdpcm_recv_one(struct cyw_softc *, uint8_t *buf, uint16_t *out_flen);
 void cyw_rxfail(struct cyw_softc *);
+void cyw_txfail(struct cyw_softc *);
+void cyw_sdpcm_update_credit(struct cyw_softc *, uint8_t credit);
 void cyw_rx_eio_diag(struct cyw_softc *, size_t rdlen, int err, const char *tag);
+void cyw_tx_eio_diag(struct cyw_softc *, size_t txlen, int err, const char *tag);
 int  cyw_fil_iovar_data_get(struct cyw_softc *, const char *name,
 		void *buf, size_t len);
 int  cyw_fil_iovar_data_set(struct cyw_softc *, const char *name,

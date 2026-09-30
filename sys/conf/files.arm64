@@ -60,9 +60,10 @@ arm64/arm64/gic_v3.c				standard
 arm64/arm64/gic_v3_acpi.c			optional acpi
 arm64/arm64/gic_v3_fdt.c			optional fdt
 arm64/arm64/gicv5.c				standard
+arm64/arm64/gicv5_acpi.c			optional acpi
 arm64/arm64/gicv5_fdt.c				optional fdt
-arm64/arm64/gicv5_its.c				optional fdt
-arm64/arm64/gicv5_iwb.c				optional fdt
+arm64/arm64/gicv5_its.c				standard
+arm64/arm64/gicv5_iwb.c				standard
 arm64/arm64/hyp_stub.S				standard
 arm64/arm64/identcpu.c				standard
 arm64/arm64/kexec_support.c			standard
@@ -621,8 +622,18 @@ arm64/apple/exynos_uart.c			optional soc_apple_t8103 fdt
 
 # Broadcom
 arm64/broadcom/bcm2712/bcm2712.c			optional bcm2712
-arm64/broadcom/bcm2712/bcm2712_pcie.c			optional bcm2712_pcie acpi
+arm64/broadcom/bcm2712/bcm2712_sdhci.c			optional sdhci_bcm2712 sdhci fdt
+arm64/broadcom/bcm2712/bcm2712_pinctrl.c		optional bcm2712_pinctrl fdt fdt_pinctrl
+arm64/broadcom/bcm2712/bcm2712_pcie.c			optional bcm2712_pcie
 arm64/broadcom/bcm2712/rpi5_fan.c			optional rpi5_fan bcm2712
+arm64/broadcom/bcm2712/rpi5_nn.c			optional rpi5_fan bcm2712
+arm64/broadcom/bcm2712/rpi_fw.c			optional rpi_fw fdt
+arm64/broadcom/bcm2712/bcm2712_pcib.c			optional bcm2712_pcib fdt pci
+arm64/broadcom/bcm2712/bcm2712_mip.c			optional bcm2712_mip fdt pci
+arm64/broadcom/bcm2712/brcmstb_reset.c			optional brcmstb_reset fdt hwreset
+arm64/broadcom/bcm2712/brcmstb_rescal.c			optional brcmstb_rescal fdt hwreset
+arm64/broadcom/bcm2712/brcmstb_gpio.c			optional brcmstb_gpio gpio fdt
+arm64/broadcom/rp1/rp1.c				optional rp1 bcm2712 fdt pci
 arm64/broadcom/rp1/rp1_eth.c				optional rp1_eth fdt
 arm64/broadcom/rp1/rp1_eth_cfg.c			optional rp1_eth fdt
 arm64/broadcom/rp1/rp1_gpio.c				optional rp1_gpio gpio fdt

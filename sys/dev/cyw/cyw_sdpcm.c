@@ -11,12 +11,15 @@
  *                    ioctl_cv.  Unmatched control frames are discarded.
  *   CHAN_EVENT (1) — async firmware events: dispatched via cyw_event_dispatch().
  *   CHAN_DATA  (2) — 802.3 Ethernet frames: delivered via if_input to VAP ifp.
+ *   CHAN_GLOM  (3) — superframe descriptor: the next frame carries several
+ *                    event and data frames, see cyw_sdpcm_rxglom().
  */
 
 #include <sys/param.h>
 #include <sys/bus.h>
 #include <sys/callout.h>
 #include <sys/condvar.h>
+#include <sys/endian.h>
 #include <sys/epoch.h>
 #include <sys/kernel.h>
 #include <sys/lock.h>
@@ -138,6 +141,142 @@ cyw_sdpcm_copy_data(struct cyw_softc *sc, const uint8_t *buf, uint16_t flen)
 }
 
 /*
+ * cyw_sdpcm_rxglom — receive the superframe announced by a glom descriptor.
+ *
+ * The firmware may coalesce event and data frames into one F2 transfer.  It
+ * first sends a descriptor, a channel-3 frame with CYW_SDPCM_GLOMDESC set,
+ * whose payload after the 12-byte SDPCM header is one little-endian 16-bit
+ * length per subframe.  The next F2 frame is the superframe: the sum of
+ * those lengths, rounded up to the F2 block size, read here in one CMD53.
+ * It opens with its own channel-3 header, whose data_offset locates the
+ * first subframe inside the first length; each subframe then starts at the
+ * next length boundary with a normal SDPCM header.  Every header is checked
+ * before any subframe is delivered, and a bad superframe is dropped whole.
+ *
+ * Mirrors Linux brcmf_sdio_rxglom() and the BRCMF_SDIO_FT_SUPER and
+ * BRCMF_SDIO_FT_SUB checks in brcmf_sdio_hdparse().  If the superframe is
+ * not read here (bad descriptor, no memory), it arrives next as a channel-3
+ * frame without a descriptor and is dropped, again as in Linux.
+ */
+static void
+cyw_sdpcm_rxglom(struct cyw_softc *sc, const uint8_t *desc, uint16_t dlen,
+    struct mbuf ***rxq_tailp)
+{
+	device_t parent = device_get_parent(sc->dev);
+	const struct cyw_sdpcm_hdr *h;
+	struct mbuf *m;
+	uint8_t *sf;
+	size_t totlen, start, avail, sublen;
+	u_int i, n, delivered;
+	uint16_t len;
+	int chan, err;
+
+	sf = NULL;
+	delivered = 0;
+	err = EINVAL;
+
+	/* Descriptor: subframe lengths, the first holding both headers. */
+	if (dlen <= CYW_SDPCM_HDR_LEN || ((dlen - CYW_SDPCM_HDR_LEN) & 1) != 0)
+		goto out;
+	n = (dlen - CYW_SDPCM_HDR_LEN) / 2;
+	desc += CYW_SDPCM_HDR_LEN;
+	totlen = 0;
+	for (i = 0; i < n; i++) {
+		sublen = le16dec(desc + 2 * i);
+		if (sublen < (i == 0 ? 2 : 1) * CYW_SDPCM_HDR_LEN)
+			goto out;
+		totlen += sublen;
+	}
+	totlen = roundup2(totlen, CYW_F2_BLKSIZE);
+	if (totlen > UINT16_MAX)
+		goto out;
+
+	sf = malloc(totlen, M_CYW, M_NOWAIT);
+	if (sf == NULL) {
+		err = ENOMEM;
+		goto out;
+	}
+	err = SDIO_READ_EXTENDED(parent, 2 /* F2 */, CYW_F2_FIFO_ADDR,
+	    totlen, sf, false /* FIFO, fixed addr */);
+	if (err != 0) {
+		cyw_rx_eio_diag(sc, totlen, err, "glom");
+		cyw_rxfail(sc);
+		goto out;
+	}
+	err = EINVAL;
+
+	/* Superframe header. */
+	h = (const struct cyw_sdpcm_hdr *)sf;
+	len = le16toh(h->len);
+	if ((uint16_t)~(len ^ le16toh(h->len_inv)) != 0 ||
+	    len < CYW_SDPCM_HDR_LEN || roundup2(len, CYW_F2_BLKSIZE) != totlen ||
+	    (h->chan_flags & 0x0f) != CYW_SDPCM_CHAN_GLOM ||
+	    (h->chan_flags & CYW_SDPCM_GLOMDESC) != 0 ||
+	    h->data_offset < CYW_SDPCM_HDR_LEN ||
+	    h->data_offset >= le16dec(desc))
+		goto bad;
+	cyw_sdpcm_update_credit(sc, h->credit);
+
+	/* Check every subframe header before delivering any of them. */
+	for (int pass = 0; pass < 2; pass++) {
+		start = h->data_offset;
+		avail = le16dec(desc) - start;
+		for (i = 0; i < n; i++) {
+			const struct cyw_sdpcm_hdr *sh;
+
+			if (i > 0) {
+				start += avail;
+				avail = le16dec(desc + 2 * i);
+			}
+			if (i == n - 1)		/* the last one holds the padding */
+				avail = totlen - start;
+			if (avail < CYW_SDPCM_HDR_LEN)
+				goto bad;
+			sh = (const struct cyw_sdpcm_hdr *)(sf + start);
+			len = le16toh(sh->len);
+			chan = sh->chan_flags & 0x0f;
+			if (pass == 0) {
+				if ((uint16_t)~(len ^ le16toh(sh->len_inv)) != 0 ||
+				    len < CYW_SDPCM_HDR_LEN || len > avail ||
+				    (chan != CYW_SDPCM_CHAN_EVENT &&
+				    chan != CYW_SDPCM_CHAN_DATA) ||
+				    sh->data_offset < CYW_SDPCM_HDR_LEN ||
+				    sh->data_offset > len)
+					goto bad;
+				continue;
+			}
+			if (sh->data_offset == len)	/* empty, as Linux skips */
+				continue;
+			if (chan == CYW_SDPCM_CHAN_EVENT)
+				cyw_event_dispatch(sc, sf + start, len);
+			else {
+				m = cyw_sdpcm_copy_data(sc, sf + start, len);
+				if (m != NULL) {
+					**rxq_tailp = m;
+					*rxq_tailp = &m->m_nextpkt;
+				}
+			}
+			delivered++;
+		}
+	}
+	err = 0;
+	goto out;
+
+bad:
+	/* As Linux does, abort whatever is left of a superframe that fails. */
+	cyw_rxfail(sc);
+out:
+	free(sf, M_CYW);
+	CYW_LOCK(sc);
+	if (err == 0) {
+		sc->rx_glom_frames++;
+		sc->rx_glom_subframes += delivered;
+	} else
+		sc->rx_glom_errors++;
+	CYW_UNLOCK(sc);
+}
+
+/*
  * cyw_sdpcm_task — runs in taskqueue_thread (sleepable), does actual SDIO I/O.
  *
  * Drains all available F2 frames in one pass, dispatching each by channel.
@@ -194,6 +333,17 @@ cyw_sdpcm_task(void *arg, int pending __unused)
 				*rxq_tail = m;
 				rxq_tail  = &m->m_nextpkt;
 			}
+			break;
+
+		case CYW_SDPCM_CHAN_GLOM:
+			if ((hdr->chan_flags & CYW_SDPCM_GLOMDESC) != 0) {
+				cyw_sdpcm_rxglom(sc, buf, flen, &rxq_tail);
+				break;
+			}
+			/* A superframe without its descriptor: drop it. */
+			CYW_LOCK(sc);
+			sc->rx_glom_errors++;
+			CYW_UNLOCK(sc);
 			break;
 
 		default:
@@ -275,11 +425,19 @@ int
 cyw_sdpcm_attach(struct cyw_softc *sc)
 {
 	/*
-	 * Seed 4 initial TX credits (brcmfmac convention: bus->tx_max = 4).
-	 * The firmware updates this via hdr->credit in its first response.
-	 * Without seeding, sdpcm_rx_max==sdpcm_tx_seq==0 blocks the first TX.
+	 * Keep the credit ceiling the boot-time IOCTLs have already learned
+	 * from the firmware's headers.  This used to re-seed it to 4, the
+	 * brcmfmac starting value -- which means "4 frames past tx_seq 0" and
+	 * was set by cyw_attach already.  By the time this runs, those IOCTLs
+	 * have moved tx_seq to about 20, so a fixed 4 put the ceiling 16
+	 * frames *behind* tx_seq.  The old zero-only credit test read that as
+	 * 240 credits, i.e. no flow control at all; the correct test reads it
+	 * as none, and with nothing sent the firmware never sends the header
+	 * that would correct it.  Seed relative to tx_seq only if the window
+	 * is not valid.
 	 */
-	sc->sdpcm_rx_max = 4;
+	if (!cyw_tx_credits_ok(sc))
+		sc->sdpcm_rx_max = sc->sdpcm_tx_seq + 4;
 
 	cv_init(&sc->ioctl_cv, "cyw_ioctl");
 	sx_init(&sc->f2_sx, "cyw_f2");

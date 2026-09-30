@@ -417,6 +417,10 @@ cyw_erom_find_sdio_core_base(struct cyw_softc *sc)
 			(void)ndp;
 
 			in_sdiod = (corid == BHND_COREID_SDIOD);
+			if (in_sdiod)
+				sc->sdio_core_rev =
+				    (coreb & BCMA_EROM_COREB_REV_MASK) >>
+				    BCMA_EROM_COREB_REV_SHIFT;
 			CYW_DPRINTF(sc, CYW_DBG_SDIO,
 			    "EROM: core 0x%03x nmp=%u%s\n",
 			    corid, nmp, in_sdiod ? " *** SDIOD ***" : "");
@@ -545,6 +549,9 @@ cyw_sdio_attach(struct cyw_softc *sc)
 
 	/* Find real SDIO device core base via EROM scan */
 	sc->sdio_core_base = cyw_erom_find_sdio_core_base(sc);
+	if (sc->sdio_core_base != 0)
+		device_printf(sc->dev, "SDIO device core rev %u\n",
+		    sc->sdio_core_rev);
 
 	/*
 	 * For ARM CR4 chips, brcmf_chip_get_raminfo() uses brcmf_chip_tcm_ramsize()
@@ -560,16 +567,31 @@ cyw_sdio_attach(struct cyw_softc *sc)
 	device_printf(sc->dev, "RAM: base=0x%08x size=0x%x (%u KB)\n",
 	    sc->ram_base, sc->ram_size, sc->ram_size / 1024);
 
-	sdio_f0_write_1(sc->f1,
-	    SDIO_FBR_BASE(2) + SDIO_FBR_BLKSIZE_LO,
-	    CYW_F2_BLKSIZE & 0xff, &err);
-	if (err)
+	/*
+	 * F2 block size, through sdio_set_block_size() so that the card's
+	 * FBR register and sdiob's cur_blksize agree.
+	 *
+	 * This used to write the FBR bytes directly through F0.  The card
+	 * then framed F2 blocks of CYW_F2_BLKSIZE while sdiob, never told,
+	 * kept cur_blksize at the CIS maximum of 512 and issued every F2
+	 * transfer of 512 bytes or more as block-mode CMD53 with 512-byte
+	 * blocks.  The card lost step after its first block and the host
+	 * reported DATA_TIMEOUT together with the command response
+	 * (INT_STATUS 0x108001).  That was the whole of "block-mode CMD53
+	 * fails on this hardware": frames needing a block-mode F2 write
+	 * never left, and RX and the CLM upload were cut into byte-mode
+	 * chunks to avoid it.  F1 was never affected because it has always
+	 * been set with sdio_set_block_size().  Diagnosis in
+	 * rpi5_modules.git doc/cyw43455.md section 17.
+	 */
+	err = sdio_set_block_size(sc->f2, CYW_F2_BLKSIZE);
+	if (err) {
+		device_printf(sc->dev, "F2 set_block_size(%u) failed: %d\n",
+		    CYW_F2_BLKSIZE, err);
 		return (err);
-	sdio_f0_write_1(sc->f1,
-	    SDIO_FBR_BASE(2) + SDIO_FBR_BLKSIZE_HI,
-	    (CYW_F2_BLKSIZE >> 8) & 0xff, &err);
-	if (err)
-		return (err);
+	}
+	device_printf(sc->dev, "F2 block size %u (card and host)\n",
+	    sc->f2->cur_blksize);
 
 	/* Halt ARM so we can download firmware */
 	cyw_arm_halt(sc);
