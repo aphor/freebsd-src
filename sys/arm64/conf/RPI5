@@ -68,6 +68,7 @@ device		brcmstb_rescal		# SATA/PCIe resistor calibration ("rescal" reset)
 device		bcm2712_pcib		# PCIe host controller (brcm,bcm2712-pcie)
 device		bcm2712_mip		# MSI for PCIe1/PCIe2 (brcm,bcm2712-mip)
 device		rp1			# RP1 on PCIe2: owns BAR1, publishes it to the RP1 drivers
+device		rp1_clk			# RP1 clock manager (raspberrypi,rp1-clocks) as a clk provider
 device		dwc3			# RP1 USB 3 hosts (snps,dwc3) on the rp1 simplebus
 
 # RP1 southbridge

@@ -634,6 +634,7 @@ arm64/broadcom/bcm2712/brcmstb_reset.c			optional brcmstb_reset fdt hwreset
 arm64/broadcom/bcm2712/brcmstb_rescal.c			optional brcmstb_rescal fdt hwreset
 arm64/broadcom/bcm2712/brcmstb_gpio.c			optional brcmstb_gpio gpio fdt
 arm64/broadcom/rp1/rp1.c				optional rp1 bcm2712 fdt pci
+arm64/broadcom/rp1/rp1_clk.c				optional rp1_clk clk fdt
 arm64/broadcom/rp1/rp1_eth.c				optional rp1_eth fdt
 arm64/broadcom/rp1/rp1_eth_cfg.c			optional rp1_eth fdt
 arm64/broadcom/rp1/rp1_gpio.c				optional rp1_gpio gpio fdt

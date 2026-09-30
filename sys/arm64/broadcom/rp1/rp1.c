@@ -134,6 +134,7 @@ struct rp1_softc {
  * FreeBSD FDT driver handles and none of ours does.
  */
 static const char * const rp1_ofw_compat[] = {
+	"raspberrypi,rp1-clocks", /* clock manager, clocks@18000: rp1_clk */
 	"snps,dwc3",		/* USB 3 hosts, usb@200000 and usb@300000 */
 	NULL
 };
