@@ -755,7 +755,8 @@ rp1_simplebus_ranges(device_t dev, struct simplebus_softc *sc)
 static int
 rp1_simplebus_attach(device_t dev)
 {
-	struct simplebus_softc *sc = device_get_softc(dev);
+	struct simplebus_softc *sc =
+	    device_get_softc_class(dev, &simplebus_driver);
 	phandle_t node;
 	int i;
 
@@ -785,7 +786,7 @@ static device_method_t rp1_simplebus_methods[] = {
 };
 
 DEFINE_CLASS_1(simplebus, rp1_simplebus_driver, rp1_simplebus_methods,
-    sizeof(struct simplebus_softc), simplebus_driver);
+    0, simplebus_driver);
 DRIVER_MODULE(rp1_simplebus, rp1pci, rp1_simplebus_driver, NULL, NULL);
 MODULE_DEPEND(rp1, pci, 1, 1, 1);
 MODULE_DEPEND(rp1, bcm2712, 1, 1, 1);
