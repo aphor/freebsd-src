@@ -32,6 +32,14 @@ include		"std.dev"
 
 options 	FDT
 
+# ZFS, compiled in: the FDT lane's kernel is embedded in rpiboot.bin, and
+# its root is the boot environment dunn/ROOT/fdt on the NVMe pool (M4),
+# which the kernel must import before any module could be loaded from it.
+# That BE's /boot/kernel holds this kernel's own modules (installkernel), so
+# rc's kldloads (linux64, autofs) match it.  Adds 3.3 MB to the stripped
+# kernel (15.9 MB), which is why rpiboot's memory disk is 20 MiB.
+options 	ZFS
+
 # Serial console.  The PL011 at 0x107d001000 is a native BCM2712 peripheral,
 # not behind RP1/PCIe, and is already what hw.uart.console points at.
 device		pl011
