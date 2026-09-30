@@ -34,8 +34,9 @@ LOADER_INTERP?=	simp
 # script has a non-ELF path using strings(1), so it works on the raw binary.
 LOADER_MD_SUPPORT=	yes
 #
-# 16 MiB, so the image can carry a stripped kernel and the cyw43455
-# firmware.
+# 20 MiB, so the image can carry a stripped kernel with ZFS compiled in
+# (15.9 MB since M4) and the cyw43455 firmware (0.6 MB).
+# rpiboot_image_build.sh passes the size it builds the image for (-m).
 #
 # This is what lets the handoff be tested with one new variable instead of
 # two: the loader has no storage driver yet, so without an embedded kernel
@@ -45,13 +46,14 @@ LOADER_MD_SUPPORT=	yes
 # is mounted.
 #
 # 14 MiB held the 12.45 MB kernel alone; with the 0.61 MB of firmware added,
-# makefs ran out of space.  16 MiB makes the loader about 17 MiB, which the
-# firmware loads at 0x200000 and which ends near 0x1300000 -- still far below
-# the device tree at 0x4000000 and the heap at 0x8000000.
+# makefs ran out of space, and 16 MiB followed until ZFS.  20 MiB makes the
+# loader about 21 MiB, which the firmware loads at 0x200000 and which ends
+# near 0x1650000 -- still far below the device tree at 0x4000000 and the
+# heap at 0x8000000.  The firmware FAT (51 MB) is the tighter limit.
 #
 # Must be a multiple of 512; stand/common/md.c #errors otherwise.  Changing it
 # needs a clean build: md.o takes it through CFLAGS, which make does not track.
-MD_IMAGE_SIZE?=		16777216
+MD_IMAGE_SIZE?=		20971520
 
 # What this loader does and does not carry.  Network and ZFS are off because
 # there are no drivers for them here yet; MSDOS is on because the firmware
