@@ -57,6 +57,18 @@
  * initialised before the bus method is chosen, so this works on the ACPI
  * lane as well as the FDT one.
  *
+ * THE RTC
+ *
+ * The Pi 5's battery-backed RTC is in the PMIC, and only the VPU talks to
+ * the PMIC.  Vendor Linux reaches it through this same mailbox
+ * (drivers/rtc/rtc-rpi.c, "raspberrypi,rpi-rtc"): GET_RTC_REG and
+ * SET_RTC_REG, register 0 being seconds since the epoch.  So when the device
+ * tree has that node and the firmware answers, this driver registers itself
+ * as a clock(9) device, and the kernel has a time of day before the network
+ * is up.  As rtc-rpi.c does at probe, it also sets the backup battery's
+ * trickle-charge voltage to the node's trickle-charge-microvolt (0, which
+ * disables charging, when absent).  No alarm support.
+ *
  * CONCURRENCY
  *
  * The mailbox is shared with anything else that talks to the VPU.  On the
@@ -69,6 +81,7 @@
 #include <sys/param.h>
 #include <sys/systm.h>
 #include <sys/bus.h>
+#include <sys/clock.h>
 #include <sys/eventhandler.h>
 #include <sys/kernel.h>
 #include <sys/lock.h>
@@ -85,7 +98,12 @@
 #include <machine/atomic.h>
 #include <machine/bus.h>
 
+#include <dev/ofw/openfirm.h>
+#include <dev/ofw/ofw_bus_subr.h>
+
 #include <arm64/broadcom/bcm2712/bcm2712_fdt.h>
+
+#include "clock_if.h"
 
 #define	RPI_FW_MBOX_PHYS	0x107c013880UL	/* fallback only */
 #define	RPI_FW_MBOX_SIZE	0x40
@@ -109,6 +127,12 @@
 #define	TAG_NOTIFY_REBOOT		0x00030048U
 #define	TAG_GET_REBOOT_FLAGS		0x00030064U
 #define	TAG_SET_REBOOT_FLAGS		0x00038064U
+#define	TAG_GET_RTC_REG			0x00030087U
+#define	TAG_SET_RTC_REG			0x00038087U
+
+/* RTC registers, as rtc-rpi.c numbers them. */
+#define	RTC_REG_TIME			0	/* seconds since the epoch */
+#define	RTC_REG_BBAT_CHG_VOLTS		4	/* trickle charge, microvolts */
 
 #define	REBOOT_FLAG_TRYBOOT		0x1U
 
@@ -130,6 +154,7 @@ struct rpi_fw_softc {
 	bus_size_t		sc_regs_size;
 	eventhandler_tag	sc_shutdown_tag;
 	bool			sc_tryboot_armed;
+	bool			sc_rtc;		/* registered with clock(9) */
 	uint32_t		sc_last_code;	/* buf[1] of the last reply */
 };
 
@@ -362,6 +387,71 @@ rpi_fw_shutdown_final(void *arg, int howto)
 	    error == 0 ? "" : " (NOTIFY_REBOOT failed)");
 }
 
+/*
+ * clock(9): the PMIC RTC through the firmware.  A request carries the
+ * register number and a value, and the reply the register number and its
+ * value, as in rtc-rpi.c.
+ */
+static int
+rpi_fw_gettime(device_t dev, struct timespec *ts)
+{
+	struct rpi_fw_softc *sc = device_get_softc(dev);
+	uint32_t v[2] = { RTC_REG_TIME, 0 };
+	int error;
+
+	if ((error = rpi_fw_tag(sc, TAG_GET_RTC_REG, v, 8, 8)) != 0)
+		return (error);
+	ts->tv_sec = v[1];
+	ts->tv_nsec = 0;
+	return (0);
+}
+
+static int
+rpi_fw_settime(device_t dev, struct timespec *ts)
+{
+	struct rpi_fw_softc *sc = device_get_softc(dev);
+	uint32_t v[2] = { RTC_REG_TIME, (uint32_t)ts->tv_sec };
+
+	return (rpi_fw_tag(sc, TAG_SET_RTC_REG, v, 8, 8));
+}
+
+static void
+rpi_fw_rtc_attach(struct rpi_fw_softc *sc)
+{
+	phandle_t node;
+	pcell_t uv;
+	uint32_t v[2];
+	int error;
+
+	node = ofw_bus_find_compatible(OF_finddevice("/"),
+	    "raspberrypi,rpi-rtc");
+	if (node <= 0)
+		return;
+
+	v[0] = RTC_REG_TIME;
+	v[1] = 0;
+	if ((error = rpi_fw_tag(sc, TAG_GET_RTC_REG, v, 8, 8)) != 0) {
+		device_printf(sc->sc_dev, "RTC: firmware did not answer (%d)\n",
+		    error);
+		return;
+	}
+
+	uv = 0;
+	(void)OF_getencprop(node, "trickle-charge-microvolt", &uv, sizeof(uv));
+	v[0] = RTC_REG_BBAT_CHG_VOLTS;
+	v[1] = uv;
+	error = rpi_fw_tag(sc, TAG_SET_RTC_REG, v, 8, 8);
+	if (error != 0)
+		device_printf(sc->sc_dev,
+		    "RTC: setting trickle charge to %u uV failed (%d)\n", uv,
+		    error);
+
+	clock_register(sc->sc_dev, 1000000);
+	sc->sc_rtc = true;
+	device_printf(sc->sc_dev, "RTC in the PMIC registered%s\n",
+	    uv != 0 ? ", battery trickle charging on" : "");
+}
+
 static phandle_t
 rpi_fw_find_node(void)
 {
@@ -484,6 +574,8 @@ rpi_fw_attach(device_t dev)
 	    "Throttling flags as vcgencmd get_throttled reports them "
 	    "(bit 16: under-voltage has occurred)");
 
+	rpi_fw_rtc_attach(sc);
+
 	sc->sc_shutdown_tag = EVENTHANDLER_REGISTER(shutdown_final,
 	    rpi_fw_shutdown_final, sc, SHUTDOWN_PRI_FIRST);
 	return (0);
@@ -494,6 +586,10 @@ rpi_fw_detach(device_t dev)
 {
 	struct rpi_fw_softc *sc = device_get_softc(dev);
 
+	if (sc->sc_rtc) {
+		clock_unregister(dev);
+		sc->sc_rtc = false;
+	}
 	if (sc->sc_shutdown_tag != NULL) {
 		EVENTHANDLER_DEREGISTER(shutdown_final, sc->sc_shutdown_tag);
 		sc->sc_shutdown_tag = NULL;
@@ -518,6 +614,9 @@ static device_method_t rpi_fw_methods[] = {
 	DEVMETHOD(device_probe,		rpi_fw_probe),
 	DEVMETHOD(device_attach,	rpi_fw_attach),
 	DEVMETHOD(device_detach,	rpi_fw_detach),
+
+	DEVMETHOD(clock_gettime,	rpi_fw_gettime),
+	DEVMETHOD(clock_settime,	rpi_fw_settime),
 	DEVMETHOD_END
 };
 
