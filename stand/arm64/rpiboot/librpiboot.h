@@ -8,8 +8,20 @@
 struct env_var;
 
 /* main.c */
+#define	RPI_LOAD_ADDR	0x00200000UL	/* where the firmware loads us */
+#define	RPI_HEAP_START	0x08000000UL	/* see main.c */
+#define	RPI_HEAP_SIZE	(48UL * 1024 * 1024)
 int	rpi_autoload(void);
 void	rpi_psci_reset(void);
+
+/* rpi_mmu.c, rpi_mmu_asm.S -- the MMU, the caches, and the kernel handoff. */
+int	rpi_mmu_init(uintptr_t heap_start, uintptr_t heap_end);
+int	rpi_mmu_set_nc(uint64_t pa, uint64_t size);
+bool	rpi_mmu_enabled(void);
+void	rpi_mmu_report(void);
+void	rpi_dcache_wbinv(const void *p, size_t len);
+void	rpi_mmu_handoff(void *entry, uint64_t arg, uintptr_t start,
+	    uintptr_t end) __dead2;
 
 /* rpi_mbox.c -- the VPU property mailbox and TryBoot. */
 void	rpi_print_boot_config(void);

@@ -13,10 +13,11 @@
  *					 rpi_translate(); see copy.c for why a
  *					 translation is needed at all
  *
- * Everything else -- elf64_loadfile, bi_load, the cache maintenance -- is
- * shared with the EFI path, deliberately.  The metadata layout handed to the
- * kernel is fiddly and is a contract with sys/arm64, so reusing bi_load() is
- * safer than reimplementing it however much smaller the result might be.
+ * Everything else -- elf64_loadfile, bi_load -- is shared with the EFI path,
+ * deliberately.  The metadata layout handed to the kernel is fiddly and is a
+ * contract with sys/arm64, so reusing bi_load() is safer than reimplementing
+ * it however much smaller the result might be.  The cache maintenance is the
+ * exception; see elf64_exec().
  */
 
 #include <sys/param.h>
@@ -26,7 +27,6 @@
 #include <stand.h>
 #include <bootstrap.h>
 
-#include "cache.h"
 #include "librpiboot.h"
 
 static int	elf64_exec(struct preloaded_file *amp);
@@ -46,11 +46,10 @@ static int
 elf64_exec(struct preloaded_file *fp)
 {
 	vm_offset_t modulep, kernendp;
-	vm_offset_t clean_addr;
-	size_t clean_size;
+	vm_offset_t clean_addr, clean_end;
 	struct file_metadata *md;
 	Elf_Ehdr *ehdr;
-	void (*entry)(vm_offset_t);
+	void *entry;
 	int err;
 
 	if ((md = file_findmetadata(fp, MODINFOMD_ELFHDR)) == NULL)
@@ -76,36 +75,42 @@ elf64_exec(struct preloaded_file *fp)
 		return (EINVAL);
 
 	/*
-	 * Clean the D-cache over the kernel image and invalidate the whole
-	 * I-cache.
+	 * Enter the kernel with the MMU and the D-cache off, and nothing in the
+	 * caches for any memory this loader used.
 	 *
-	 * This matters more here than it looks.  The kernel was written as
-	 * data and is about to be executed, and we are about to jump to it
-	 * with the MMU off, where accesses do not go through the caches the
-	 * writes may still be sitting in.  Skipping this is the classic way
-	 * to get a kernel that crashes in its first few instructions on some
-	 * boots and not others.
+	 * The kernel was written as data through the D-cache (rpi_mmu.c) and
+	 * is about to be executed with the caches off, so it has to reach
+	 * memory first.  Skipping that is the classic way to get a kernel that
+	 * crashes in its first few instructions on some boots and not others.
+	 * rpi_mmu_handoff() turns the D-cache off before cleaning, which is
+	 * stricter than the EFI loader's clean-then-jump with the cache still
+	 * on: see rpi_mmu_asm.S for why that order matters.
+	 *
+	 * The range is everything this loader wrote or read through the
+	 * cache: its own image (with its stack and page tables), the
+	 * firmware's device tree, the heap, and the staging area up to the end
+	 * of the kernel, its modules and their metadata, all of which lie in
+	 * that order between the load address and kernendp.
 	 */
 	clean_addr = (vm_offset_t)rpi_translate(fp->f_addr);
-	clean_size = (vm_offset_t)rpi_translate(kernendp) - clean_addr;
+	clean_end = (vm_offset_t)rpi_translate(kernendp);
+	if (clean_end < RPI_HEAP_START + RPI_HEAP_SIZE)
+		clean_end = RPI_HEAP_START + RPI_HEAP_SIZE;
 
 	printf("Jumping to kernel entry 0x%lx (module 0x%lx), modulep 0x%lx\n",
 	    (unsigned long)entry, (unsigned long)ehdr->e_entry,
 	    (unsigned long)modulep);
-	printf("Flushing D-cache 0x%lx + 0x%lx and invalidating I-cache.\n",
-	    (unsigned long)clean_addr, (unsigned long)clean_size);
-
-	cpu_flush_dcache((void *)clean_addr, clean_size);
-	cpu_inval_icache();
+	printf("Kernel at 0x%lx + 0x%lx; MMU and D-cache off, then "
+	    "0x%lx..0x%lx cleaned and invalidated.\n",
+	    (unsigned long)clean_addr, (unsigned long)(clean_end - clean_addr),
+	    (unsigned long)RPI_LOAD_ADDR, (unsigned long)clean_end);
 
 	/*
 	 * modulep is passed UNTRANSLATED, as a module address above KERNBASE.
 	 * sys/arm64/arm64/locore.S discriminates on exactly that: a high x0
 	 * is a modulep, a low one a bare DTB pointer.  See copy.c.
 	 */
-	(*entry)(modulep);
-
-	panic("exec returned");
+	rpi_mmu_handoff(entry, modulep, RPI_LOAD_ADDR, clean_end);
 }
 
 static int

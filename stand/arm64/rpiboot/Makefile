@@ -76,6 +76,7 @@ SRCS+=	pl011.c pl011_console.c
 SRCS+=	exec.c bootinfo_arch.c
 SRCS+=	rpi_mbox.c rpi_peek.c
 SRCS+=	rpi_fb.c
+SRCS+=	rpi_mmu.c rpi_mmu_asm.S
 
 # The HDMI console: stand/common/gfx_fb.c on teken with the built-in 8x16
 # font, as the EFI loader builds it, but without EFI (gfx_fb.c's non-EFI
@@ -113,12 +114,6 @@ SRCS+=	vers.c
 .PATH:		${BOOTSRC}/efi/loader
 SRCS+=		bootinfo.c
 
-# cpu_flush_dcache()/cpu_inval_icache() for the handoff, the same two lines
-# stand/efi/loader/arch/arm64/Makefile.inc uses.
-.PATH:		${BOOTSRC}/arm64/libarm64
-CFLAGS+=	-I${BOOTSRC}/arm64/libarm64
-SRCS+=		cache.c
-
 # FDT comes from x0, so the platform contract is three small functions.
 .if ${MK_FDT} != "no"
 SRCS+=		rpi_fdt.c
@@ -134,6 +129,8 @@ CFLAGS+=	-I${SYSDIR}/contrib/libfdt
 # Freestanding, and every bit of it load-bearing at EL2 with the MMU off:
 # unaligned accesses fault because all memory is Device-nGnRnE, and CPTR_EL2
 # may trap FP/SIMD.  Both were established by the bare-metal test images.
+# rpi_mmu.c makes RAM Normal memory early in main(), but start.S and the
+# console probe run before that, so -mstrict-align stays.
 CFLAGS+=	-mstrict-align -mgeneral-regs-only
 CFLAGS+=	-fno-stack-protector -ffreestanding -fno-builtin
 

@@ -42,11 +42,7 @@ extern char	_end[];
  * that properly means an early bootstrap allocator, which is worth doing when
  * something actually needs it.
  */
-#define	RPI_HEAP_START	0x08000000UL
-#define	RPI_HEAP_SIZE	(48UL * 1024 * 1024)
-
-/* Sanity values checked at startup and reported; see rpi_report_entry(). */
-#define	RPI_LOAD_ADDR	0x00200000UL
+/* RPI_HEAP_START and RPI_HEAP_SIZE are in librpiboot.h, for exec.c. */
 
 /*
  * PSCI, which is how this loader resets the board.
@@ -130,6 +126,7 @@ rpi_report_entry(void)
 	printf("   Heap:            0x%lx + %lu MiB\n",
 	    (unsigned long)RPI_HEAP_START,
 	    (unsigned long)(RPI_HEAP_SIZE / (1024 * 1024)));
+	rpi_mmu_report();
 
 	/*
 	 * A loader whose heap overlaps the device tree would corrupt the tree
@@ -187,15 +184,34 @@ main(void)
 	 * Console next, so that everything after this point can report what
 	 * it is doing.  cons_probe() walks the consoles[] array in conf.c.
 	 *
-	 * The HDMI console is opt-in for now ("set console=uart,vidconsole"),
-	 * until "fbtest" has measured its set-up: the first boot that
-	 * started it by default never printed a line.
+	 * The PL011 alone at first: the HDMI console joins once the MMU is
+	 * on, below.
 	 */
 	setenv("console", "uart", 1);
 	cons_probe();
 
 	printf("\n%s", bootprog_info);
 	printf("\n");
+
+	/*
+	 * MMU and caches on, as soon as there is a console to report a
+	 * failure on (rpi_mmu.c).  Everything up to here ran uncached.
+	 */
+	(void)rpi_mmu_init(RPI_HEAP_START, RPI_HEAP_START + RPI_HEAP_SIZE);
+
+	/*
+	 * Then the HDMI console, second: the PL011 stays first and is the
+	 * only input, for the UART tooling.  Not with the MMU off -- the
+	 * console's set-up alone took over 4 s uncached (fbtest), and
+	 * scrolling a second per line.  Without a display, cons_change()
+	 * reports "console vidconsole failed to initialize" and the PL011
+	 * carries on alone.
+	 */
+	if (rpi_mmu_enabled())
+		setenv("console", "uart,vidconsole", 1);
+	else
+		printf("HDMI console off: the MMU is off, and it is too slow "
+		    "uncached.\n");
 	rpi_report_entry();
 
 	archsw.arch_getdev = rpi_getdev;

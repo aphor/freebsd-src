@@ -41,3 +41,13 @@
 	(from /chosen/bootloader/tryboot in the firmware's device tree).
 
 ################################################################################
+# Tmmu DShow the loader's MMU, cache and memory map
+
+	mmu
+
+	Whether the MMU and caches are on, the EL2 translation registers,
+	the /memory ranges from the device tree, and the map as runs of one
+	attribute: RAM write-back, the framebuffer non-cacheable, the rest
+	Device-nGnRnE.  The kernel is entered with the MMU and D-cache off.
+
+################################################################################

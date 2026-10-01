@@ -230,7 +230,7 @@ rpi_fb_bootargs_swap(void)
 static int
 rpi_fb_setup(uint32_t w, uint32_t h)
 {
-	static uint32_t buf[48] __aligned(16);
+	static uint32_t buf[48] __aligned(64);	/* see rpi_mbox.c */
 	uint32_t *alloc, *depth, *pitch;
 	int error, n;
 
@@ -331,6 +331,13 @@ rpi_fb_probe(void)
 		fb.format = NULL;
 	}
 	fb.valid = true;
+
+	/*
+	 * The HVS scans the buffer out of memory, so it must not be cached:
+	 * Normal non-cacheable, which still lets the CPU merge writes.  Before
+	 * the MMU is on this only records the range (rpi_mmu.c).
+	 */
+	(void)rpi_mmu_set_nc(fb.base, fb.size);
 	return (0);
 }
 

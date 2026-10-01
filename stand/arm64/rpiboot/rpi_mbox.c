@@ -25,8 +25,11 @@
  * board: four GET tags answered, and the board revision and serial matched
  * what the firmware printed on the same boot.
  *
- * With the MMU off every access is Device-nGnRnE, so the buffer needs no cache
- * maintenance before the VPU reads it or after it writes back.
+ * The VPU is not coherent with the ARM caches, and since rpi_mmu.c turned the
+ * D-cache on the buffer lives in cached RAM: mbox_property() cleans it to
+ * memory before the VPU reads it and invalidates it after the VPU has written
+ * the reply.  Buffers are 64-byte aligned and sized in whole lines, so the
+ * maintenance never touches a neighbour's data.
  *
  * Register layout and MBOX_MSG from sys/arm/broadcom/bcm2835/bcm2835_mbox.c;
  * tags from the vendor include/soc/bcm2835/raspberrypi-firmware.h.
@@ -91,7 +94,8 @@ mbox_wait(uint32_t mask, uint32_t want)
 /*
  * One property-channel transaction on a caller-built buffer.  The buffer must
  * be 16-byte aligned and below 4 GB: the message carries a 32-bit address
- * with the channel in its low four bits.
+ * with the channel in its low four bits.  It should also be 64-byte aligned
+ * (a cache line) and a whole number of lines long; see above.
  */
 static int
 mbox_property(uint32_t *buf)
@@ -102,6 +106,9 @@ mbox_property(uint32_t *buf)
 
 	if ((pa & 0xf) != 0 || pa > 0xffffffffUL)
 		return (EINVAL);
+
+	/* The request, out to memory for the VPU. */
+	rpi_dcache_wbinv(buf, buf[0]);
 
 	/* Discard anything stale in the VPU -> ARM mailbox. */
 	for (us = 0; us < MBOX_TIMEOUT_US; us++) {
@@ -123,6 +130,12 @@ mbox_property(uint32_t *buf)
 			break;
 	}
 
+	/*
+	 * The reply, which the VPU wrote to memory.  Nothing here wrote the
+	 * buffer since the clean above, so this drops only clean lines --
+	 * including any the CPU fetched speculatively while it waited.
+	 */
+	rpi_dcache_wbinv(buf, buf[0] > 0 ? buf[0] : 4);
 	if (buf[1] != RESP_SUCCESS)
 		return (EIO);
 	return (0);
@@ -145,7 +158,7 @@ rpi_mbox_property(uint32_t *buf)
 int
 rpi_mbox_tag(uint32_t tag, uint32_t *val, uint32_t vallen, uint32_t inlen)
 {
-	static uint32_t buf[32] __aligned(16);
+	static uint32_t buf[32] __aligned(64);
 	uint32_t i, n, words;
 	int error;
 

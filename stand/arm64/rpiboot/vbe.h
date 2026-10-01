@@ -12,7 +12,8 @@
  * EFI's EFI_GRAPHICS_OUTPUT_BLT_PIXEL) and for pe8, the palette of 8-bit VBE
  * modes.  This loader has neither BIOS nor VBE: the framebuffer is the one
  * the VPU firmware set up, 32 bits per pixel, so pe8 is never used (see
- * rpi_fb.c).  ptov() is the identity with the MMU off.
+ * rpi_fb.c).  ptov() is the identity: the MMU is either off or an identity
+ * map (rpi_mmu.c).
  */
 
 #ifndef _RPIBOOT_VBE_H_
