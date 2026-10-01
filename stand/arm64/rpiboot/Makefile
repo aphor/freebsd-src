@@ -21,11 +21,14 @@ INTERNALPROG=
 NEWVERSWHAT=	"Raspberry Pi 5 loader" ${MACHINE_CPUARCH}
 INSTALLFLAGS=	-b
 
-# The interpreter.  "simp" rather than lua or 4th on purpose: it needs no
-# script files on a filesystem, so the loader reaches an interactive prompt
-# even if the memory disk is empty or broken.  A prompt that survives its own
-# filesystem being wrong is worth more during bring-up than a scripted menu.
-LOADER_INTERP?=	simp
+# The interpreter: lua, for the boot menu (on the PL011 and, with the MMU on,
+# the HDMI console).  It reads its scripts from /boot/lua on the memory disk,
+# which tools/rpiboot_image_build.sh copies from this tree, and loader.conf
+# rather than loader.rc.  The property simp was chosen for during bring-up
+# survives: if loader.lua is missing or broken, interp_lua.c prints the error,
+# cancels autoboot and leaves the prompt working.  LOADER_INTERP=simp still
+# builds the script-free loader, which reads loader.rc.
+LOADER_INTERP?=	lua
 
 # Memory disk.  This is what gives the loader a filesystem without any
 # storage driver at all: stand/common/md.c reserves MD_IMAGE_SIZE bytes of
@@ -138,8 +141,7 @@ LDSCRIPT=	${.CURDIR}/ldscript.arm64
 LDFLAGS=	-nostdlib -static -T ${LDSCRIPT}
 
 # libsa is the loader's libc; LIBFDT is the device-tree library when FDT is
-# enabled.  LDR_INTERP is empty for the "simp" interpreter, which is one of
-# the reasons it was chosen -- no ficl or liblua to build and link.
+# enabled.  LDR_INTERP is liblua (empty for simp).
 DPADD=		${LDR_INTERP} ${LIBSAFDT} ${LIBFDT} ${LIBSA} ${LDSCRIPT}
 LDADD=		${LDR_INTERP} ${LIBSAFDT} ${LIBFDT} ${LIBSA}
 

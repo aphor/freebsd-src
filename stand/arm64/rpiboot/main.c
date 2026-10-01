@@ -214,6 +214,15 @@ main(void)
 		    "uncached.\n");
 	rpi_report_entry();
 
+	/*
+	 * Tell the Lua scripts that ACPI was probed early, so that they
+	 * believe acpi.rsdp, which is never set here: this board is described
+	 * by the firmware's device tree alone.  Without the feature,
+	 * core.lua assumes ACPI, asks for an "acpi" module that does not
+	 * exist, and boots with hint.acpi.0.disabled=0.
+	 */
+	feature_enable(FEATURE_EARLY_ACPI);
+
 	archsw.arch_getdev = rpi_getdev;
 	archsw.arch_copyin = rpi_copyin;
 	archsw.arch_copyout = rpi_copyout;
