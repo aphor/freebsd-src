@@ -80,6 +80,7 @@ SRCS+=	exec.c bootinfo_arch.c
 SRCS+=	rpi_mbox.c rpi_peek.c
 SRCS+=	rpi_fb.c
 SRCS+=	rpi_mmu.c rpi_mmu_asm.S
+SRCS+=	rpi_pcie.c rpi_usbkbd.c
 
 # The HDMI console: stand/common/gfx_fb.c on teken with the built-in 8x16
 # font, as the EFI loader builds it, but without EFI (gfx_fb.c's non-EFI

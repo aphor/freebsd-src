@@ -106,6 +106,12 @@ elf64_exec(struct preloaded_file *fp)
 	    (unsigned long)RPI_LOAD_ADDR, (unsigned long)clean_end);
 
 	/*
+	 * The USB keyboard's controllers DMA into memory that is about to be
+	 * the kernel's: stop them, and RP1's bus mastering, first.
+	 */
+	rpi_usbkbd_shutdown();
+
+	/*
 	 * modulep is passed UNTRANSLATED, as a module address above KERNBASE.
 	 * sys/arm64/arm64/locore.S discriminates on exactly that: a high x0
 	 * is a modulep, a low one a bare DTB pointer.  See copy.c.

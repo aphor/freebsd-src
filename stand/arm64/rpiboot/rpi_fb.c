@@ -566,9 +566,9 @@ fbcons_probe(struct console *cp)
 {
 
 	/*
-	 * Input "present" too, though there is none: cons_change() counts a
-	 * console as up only when both are, and would otherwise report this
-	 * one failed.  fbcons_getchar() never has anything.
+	 * Input "present" too: the USB keyboard (rpi_usbkbd.c), when there
+	 * is one.  cons_change() counts a console as up only when both are,
+	 * and would otherwise report this one failed.
 	 */
 	if (rpi_fb_probe() == 0)
 		cp->c_flags |= C_PRESENTIN | C_PRESENTOUT;
@@ -757,14 +757,15 @@ fbcons_putchar(int c)
 	teken_input(&gfx_state.tg_teken, &ch, sizeof(ch));
 }
 
+/* Input is the USB keyboard, if rpi_usbkbd_init() found one. */
 static int
 fbcons_getchar(void)
 {
-	return (-1);
+	return (rpi_usbkbd_getchar());
 }
 
 static int
 fbcons_poll(void)
 {
-	return (0);
+	return (rpi_usbkbd_poll() ? 1 : 0);
 }

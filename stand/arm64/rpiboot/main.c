@@ -215,6 +215,13 @@ main(void)
 	rpi_report_entry();
 
 	/*
+	 * A USB keyboard for the HDMI console (rpi_usbkbd.c): RP1's xHCI
+	 * controllers, reachable when the firmware leaves PCIe2 trained
+	 * (config.txt pciex4_reset=0).  "usbinfo" says what it found.
+	 */
+	rpi_usbkbd_init();
+
+	/*
 	 * Tell the Lua scripts that ACPI was probed early, so that they
 	 * believe acpi.rsdp, which is never set here: this board is described
 	 * by the firmware's device tree alone.  Without the feature,

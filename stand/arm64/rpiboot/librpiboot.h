@@ -34,6 +34,17 @@ int	rpi_fb_probe(void);
 int	rpi_fb_fdt_node(void *dtb);
 extern struct console rpi_fb_console;
 
+/* rpi_pcie.c -- PCIe2 and RP1, for the USB keyboard. */
+int	rpi_pcie_rp1_init(const char **why);
+uint64_t rpi_pcie_rp1_base(void);
+void	rpi_pcie_shutdown(void);
+
+/* rpi_usbkbd.c -- a USB keyboard on RP1's xHCI controllers. */
+void	rpi_usbkbd_init(void);
+bool	rpi_usbkbd_poll(void);
+int	rpi_usbkbd_getchar(void);
+void	rpi_usbkbd_shutdown(void);
+
 /* rpi_fdt.c */
 int	rpi_fdt_tryboot(void);
 

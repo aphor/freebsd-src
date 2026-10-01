@@ -51,3 +51,15 @@
 	Device-nGnRnE.  The kernel is entered with the MMU and D-cache off.
 
 ################################################################################
+# Tusbinfo DShow the USB keyboard controllers and ports
+
+	usbinfo
+
+	The loader drives a USB keyboard for the HDMI console through RP1's
+	two xHCI controllers, polled, with HID boot-protocol keyboards
+	directly on a root port (no hubs).  RP1 is reachable only when the
+	firmware leaves PCIe2 trained: config.txt pciex4_reset=0.  usbinfo
+	prints why there is no keyboard, or each controller and what is on
+	each connected port.
+
+################################################################################
