@@ -129,10 +129,20 @@ mbox_property(uint32_t *buf)
 }
 
 /*
+ * A caller-built property buffer with several tags (rpi_fb.c).  buf must be
+ * 16-byte aligned and below 4 GB; the reply overwrites it.
+ */
+int
+rpi_mbox_property(uint32_t *buf)
+{
+	return (mbox_property(buf));
+}
+
+/*
  * A single tag.  inlen bytes of val are sent; up to vallen bytes of the reply
  * are copied back into val.  Same buffer layout as tools/vcio_test.c.
  */
-static int
+int
 rpi_mbox_tag(uint32_t tag, uint32_t *val, uint32_t vallen, uint32_t inlen)
 {
 	static uint32_t buf[32] __aligned(16);

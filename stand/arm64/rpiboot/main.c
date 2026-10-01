@@ -186,7 +186,12 @@ main(void)
 	/*
 	 * Console next, so that everything after this point can report what
 	 * it is doing.  cons_probe() walks the consoles[] array in conf.c.
+	 *
+	 * The HDMI console is opt-in for now ("set console=uart,vidconsole"),
+	 * until "fbtest" has measured its set-up: the first boot that
+	 * started it by default never printed a line.
 	 */
+	setenv("console", "uart", 1);
 	cons_probe();
 
 	printf("\n%s", bootprog_info);

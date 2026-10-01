@@ -13,6 +13,14 @@ void	rpi_psci_reset(void);
 
 /* rpi_mbox.c -- the VPU property mailbox and TryBoot. */
 void	rpi_print_boot_config(void);
+int	rpi_mbox_tag(uint32_t tag, uint32_t *val, uint32_t vallen,
+	    uint32_t inlen);
+int	rpi_mbox_property(uint32_t *buf);
+
+/* rpi_fb.c -- the firmware's framebuffer: console and device-tree node. */
+int	rpi_fb_probe(void);
+int	rpi_fb_fdt_node(void *dtb);
+extern struct console rpi_fb_console;
 
 /* rpi_fdt.c */
 int	rpi_fdt_tryboot(void);

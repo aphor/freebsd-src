@@ -75,6 +75,33 @@ SRCS+=	main.c conf.c copy.c time.c devicename.c
 SRCS+=	pl011.c pl011_console.c
 SRCS+=	exec.c bootinfo_arch.c
 SRCS+=	rpi_mbox.c rpi_peek.c
+SRCS+=	rpi_fb.c
+
+# The HDMI console: stand/common/gfx_fb.c on teken with the built-in 8x16
+# font, as the EFI loader builds it, but without EFI (gfx_fb.c's non-EFI
+# branch; its <vbe.h> is ./vbe.h).
+SRCS+=	gfx_fb.c teken.c 8x16.c
+.PATH:	${SYSDIR}/teken
+GFX_CFLAGS=	-I${SYSDIR}/teken -I${SRCTOP}/contrib/pnglite
+CFLAGS.gfx_fb.c+= ${GFX_CFLAGS} ${ZLIB_CFLAGS}
+CFLAGS.gfx_fb.c+= -I${SRCTOP}/sys/cddl/contrib/opensolaris/common/lz4
+CFLAGS.teken.c+= -I${SYSDIR}/teken
+CFLAGS.rpi_fb.c+= ${GFX_CFLAGS}
+CFLAGS.main.c+=	${GFX_CFLAGS}
+CFLAGS.conf.c+=	${GFX_CFLAGS}
+CLEANFILES+=	8x16.c
+# The built-in font is lz4-compressed, and libsa's lz4.c is built without
+# -mstrict-align: clang then defines __ARM_FEATURE_UNALIGNED, which makes
+# lz4.c copy with unaligned 64-bit accesses, and those fault here (MMU off,
+# all memory Device-nGnRnE; see below).  Measured: the console set-up hung
+# in setup_font(), the step that decompresses the font.  This copy is built
+# with this loader's flags, and as a program object it is linked in place
+# of libsa's.
+.PATH:	${SRCTOP}/sys/cddl/contrib/opensolaris/common/lz4
+SRCS+=	lz4.c
+CFLAGS.lz4.c+= -I${SRCTOP}/sys/cddl/contrib/opensolaris/common/lz4
+8x16.c:		${SRCTOP}/contrib/terminus/ter-u16b.bdf
+	vtfontcvt -f compressed-source -o ${.TARGET} ${.ALLSRC}
 SRCS+=	vers.c
 
 # bi_load() builds the metadata the kernel reads, which is a contract with

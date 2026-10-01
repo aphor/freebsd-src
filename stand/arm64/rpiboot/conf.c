@@ -58,5 +58,6 @@ struct fs_ops *file_system[] = {
  */
 struct console *consoles[] = {
 	&pl011_console,
+	&rpi_fb_console,	/* HDMI, output only; see rpi_fb.c */
 	NULL
 };

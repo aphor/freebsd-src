@@ -27,10 +27,17 @@
 
 extern uint64_t rpi_dtb_pa;	/* from start.S: x0 at entry */
 
+/* rpi_fb.c; librpiboot.h would need bootstrap.h here. */
+int	rpi_fb_probe(void);
+int	rpi_fb_fdt_node(void *dtb);
+
 int
 fdt_platform_load_dtb(void)
 {
 	struct fdt_header *hdr;
+	void *fb_dtb;
+	size_t size;
+	int error = 0;
 
 	if (rpi_dtb_pa == 0) {
 		printf("No device tree: x0 was zero at entry.\n");
@@ -40,12 +47,35 @@ fdt_platform_load_dtb(void)
 	/* MMU off, so the physical address is directly usable. */
 	hdr = (struct fdt_header *)(uintptr_t)rpi_dtb_pa;
 
+	/*
+	 * The firmware's framebuffer, as a simple-framebuffer node for the
+	 * kernel's vt_simplefb (rpi_fb.c): added to a padded copy, which
+	 * fdt_load_dtb_addr() copies again, so the firmware's blob is left
+	 * as it was.
+	 */
+	fb_dtb = NULL;
+	if (rpi_fb_probe() == 0) {
+		size = fdt_totalsize(hdr) + 1024;
+		if ((fb_dtb = malloc(size)) != NULL &&
+		    fdt_open_into(hdr, fb_dtb, size) == 0 &&
+		    (error = rpi_fb_fdt_node(fb_dtb)) == 0) {
+			fdt_pack(fb_dtb);
+			hdr = fb_dtb;
+		} else if (fb_dtb != NULL) {
+			printf("Framebuffer node not added (%d).\n", error);
+		}
+	}
+
 	if (fdt_load_dtb_addr(hdr) != 0) {
 		printf("Device tree at %p is not usable.\n", hdr);
+		free(fb_dtb);
 		return (1);
 	}
 
-	printf("Using DTB provided by the VPU firmware at %p.\n", hdr);
+	printf("Using DTB provided by the VPU firmware at %p%s.\n",
+	    (void *)(uintptr_t)rpi_dtb_pa,
+	    hdr == fb_dtb ? ", with a simple-framebuffer node" : "");
+	free(fb_dtb);
 	return (0);
 }
 
