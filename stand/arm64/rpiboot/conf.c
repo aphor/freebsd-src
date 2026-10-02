@@ -16,24 +16,21 @@
 /*
  * Devices.
  *
- * Just the memory disk for now, and that is the point of it: md needs no
- * hardware driver, so the loader has a filesystem before it has a disk.  The
- * SDHCI block reader proven in rpi5_modules.git/loader/sdhci.c is the next
- * entry here.
+ * The memory disk first: md needs no hardware driver, so the loader has a
+ * filesystem whatever else is true.  Then the SD card, disk0 (rpi_sd.c).
  */
 struct devsw *devsw[] = {
 	&md_dev,
+	&rpi_sd_dev,
 	NULL
 };
 
 /*
  * Filesystems.
  *
- * UFS first because the embedded image is UFS -- makefs produces that by
- * default and the loader already has to carry UFS for a real root.  dosfs is
- * present for the firmware's FAT16 partition, which is where config.txt and
- * the loader itself live, and is the obvious thing to read once the SD device
- * is wired up.
+ * UFS first because the embedded image is UFS, and so is a root or a /boot
+ * on the card.  dosfs is for the firmware's FAT partition, where config.txt,
+ * the loader itself and loader.env live.
  */
 struct fs_ops *file_system[] = {
 	&ufs_fsops,

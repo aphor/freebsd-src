@@ -45,6 +45,11 @@ bool	rpi_usbkbd_poll(void);
 int	rpi_usbkbd_getchar(void);
 void	rpi_usbkbd_shutdown(void);
 
+/* rpi_sd.c -- the SD card as disk0. */
+extern struct devsw rpi_sd_dev;
+bool	rpi_sd_present(void);
+void	rpi_sd_report(void);
+
 /* rpi_fdt.c */
 int	rpi_fdt_tryboot(void);
 

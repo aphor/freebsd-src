@@ -2,6 +2,9 @@ $FreeBSD$
 
 NOTE ANY CHANGES YOU MAKE TO THE BOOTBLOCKS HERE.
 
+3.1:	The SD card as disk0 (polled SDHCI, read-only), and rootdev from
+	loader.env on the firmware's FAT: the loader can read /boot from a
+	UFS on the card instead of its memory disk.
 3.0:	Lua interpreter and boot menu, at the Lua scripts API level that
 	stand/lua requires (core.lua checks for 3.0, as stand/efi/loader/version
 	declares it).  Also MMU and caches on, and the HDMI console second.

@@ -58,9 +58,11 @@ LOADER_MD_SUPPORT=	yes
 # needs a clean build: md.o takes it through CFLAGS, which make does not track.
 MD_IMAGE_SIZE?=		20971520
 
-# What this loader does and does not carry.  Network and ZFS are off because
-# there are no drivers for them here yet; MSDOS is on because the firmware
-# partition this board boots from is FAT16 and reading it is the next step.
+# What this loader does and does not carry.  Network is off because there is
+# no driver for it here, and ZFS because the only disk is the SD card
+# (rpi_sd.c), where a pool is out of scope.  MSDOS is on for the firmware's
+# FAT partition, where loader.env lives; UFS for a root or a /boot on the
+# card, and for the memory disk.
 LOADER_NET_SUPPORT=	no
 LOADER_NFS_SUPPORT=	no
 LOADER_TFTP_SUPPORT=	no
@@ -68,6 +70,9 @@ LOADER_MSDOS_SUPPORT=	yes
 LOADER_UFS_SUPPORT=	yes
 LOADER_GZIP_SUPPORT=	no
 LOADER_BZIP2_SUPPORT=	no
+
+# The block cache, for the SD card's reads (rpi_sd.c).
+HAVE_BCACHE=	yes
 
 HELP_FILENAME=	loader.help.rpiboot
 
@@ -81,6 +86,7 @@ SRCS+=	rpi_mbox.c rpi_peek.c
 SRCS+=	rpi_fb.c
 SRCS+=	rpi_mmu.c rpi_mmu_asm.S
 SRCS+=	rpi_pcie.c rpi_usbkbd.c
+SRCS+=	rpi_sdhci.c rpi_sd.c
 
 # The HDMI console: stand/common/gfx_fb.c on teken with the built-in 8x16
 # font, as the EFI loader builds it, but without EFI (gfx_fb.c's non-EFI

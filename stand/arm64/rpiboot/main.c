@@ -17,6 +17,7 @@
 #include <stand.h>
 #include <sys/param.h>
 #include <sys/reboot.h>
+#include <sys/boot.h>
 
 #include "bootstrap.h"
 #include "librpiboot.h"
@@ -168,6 +169,94 @@ rpi_report_entry(void)
 	rpi_print_boot_config();
 }
 
+/*
+ * Read loader variables from a file: name=value words separated by blanks
+ * or newlines, as the EFI loader reads /efi/freebsd/loader.env from its ESP
+ * (boot_parse_cmdline(); no comments, no quoting, no blanks in a value).
+ */
+static int
+rpi_env_file(const char *path)
+{
+	struct stat st;
+	char *buf;
+	int fd, howto;
+
+	if (stat(path, &st) != 0 || st.st_size <= 0 || st.st_size > 4096)
+		return (-1);
+	if ((fd = open(path, O_RDONLY)) < 0)
+		return (-1);
+	buf = malloc(st.st_size + 1);
+	if (buf == NULL || read(fd, buf, st.st_size) != st.st_size) {
+		free(buf);
+		close(fd);
+		return (-1);
+	}
+	close(fd);
+	buf[st.st_size] = '\0';
+	printf("Reading loader variables from %s\n", path);
+	howto = boot_parse_cmdline(buf);
+	if (howto != 0)
+		boot_howto_to_env(howto);
+	free(buf);
+	return (0);
+}
+
+/*
+ * What to boot from.
+ *
+ * The memory disk inside this image, unless the card says otherwise: the
+ * firmware's FAT (the first partition of disk0) may hold loader.env, and its
+ * rootdev names the filesystem that has /boot, for example
+ *
+ *	rootdev=disk0s2a:
+ *
+ * The loader then reads its Lua scripts, loader.conf, the kernel and the
+ * modules from there, as it does on any other machine, and installkernel
+ * on the running system reaches the next boot.  The EFI loader takes
+ * rootdev the same way, from its own loader.env.
+ *
+ * A boot that the firmware started from tryboot.txt reads tryboot.env
+ * first, so that one image can be tried against another root, once.
+ *
+ * A rootdev without /boot/lua/loader.lua is not used: the interpreter
+ * would have nothing to run, where the memory disk still boots.
+ */
+static void
+rpi_choose_currdev(void)
+{
+	static const char *fat[] = { "disk0s1:", "disk0p1:" };
+	char dev[40], path[80];
+	const char *rootdev;
+	struct stat st;
+	size_t i;
+
+	for (i = 0; rpi_sd_present() && i < nitems(fat); i++) {
+		if (rpi_fdt_tryboot() == 1) {
+			snprintf(path, sizeof(path), "%s/tryboot.env", fat[i]);
+			if (rpi_env_file(path) == 0)
+				break;
+		}
+		snprintf(path, sizeof(path), "%s/loader.env", fat[i]);
+		if (rpi_env_file(path) == 0)
+			break;
+	}
+
+	rootdev = getenv("rootdev");
+	if (rootdev != NULL && *rootdev != '\0') {
+		snprintf(dev, sizeof(dev), "%s%s", rootdev,
+		    strchr(rootdev, ':') == NULL ? ":" : "");
+		snprintf(path, sizeof(path), "%s/boot/lua/loader.lua", dev);
+		if (stat(path, &st) == 0) {
+			printf("Booting from %s (rootdev)\n", dev);
+			set_currdev(dev);
+			return;
+		}
+		printf("rootdev %s has no /boot/lua/loader.lua; "
+		    "using the memory disk\n", dev);
+	}
+	set_currdev("md0:");
+}
+
 int
 main(void)
 {
@@ -237,10 +326,11 @@ main(void)
 	archsw.arch_autoload = rpi_autoload;
 
 	/*
-	 * Probe the device switch.  Today that is the embedded memory disk
-	 * and nothing else, which is the point: it needs no hardware driver,
-	 * so the loader has a filesystem before it has a disk.
+	 * Probe the device switch: the embedded memory disk, which needs no
+	 * hardware driver, and the SD card (rpi_sd.c), whose reads go through
+	 * the block cache.  8 MiB of cache, out of a 48 MiB heap.
 	 */
+	bcache_init(16384, 512);
 	for (i = 0; devsw[i] != NULL; i++) {
 		if (devsw[i]->dv_init == NULL)
 			continue;
@@ -250,7 +340,7 @@ main(void)
 	}
 
 	/*
-	 * Point currdev at the memory disk.
+	 * The card, if it says so, else the memory disk.
 	 *
 	 * set_currdev() is the MI helper in stand/common/misc.c: it sets both
 	 * currdev and loaddev and installs gen_setcurrdev() as the hook, so a
@@ -258,7 +348,7 @@ main(void)
 	 * An earlier version of this file installed a local hook that
 	 * duplicated gen_setcurrdev() badly enough to break every path.
 	 */
-	set_currdev("md0:");
+	rpi_choose_currdev();
 	setenv("LINES", "24", 1);
 
 	interact();			/* doesn't return */

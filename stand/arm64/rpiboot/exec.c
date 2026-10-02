@@ -109,6 +109,7 @@ elf64_exec(struct preloaded_file *fp)
 	 * The USB keyboard's controllers DMA into memory that is about to be
 	 * the kernel's: stop them, and RP1's bus mastering, first.
 	 */
+	rpi_sd_report();
 	rpi_usbkbd_shutdown();
 
 	/*

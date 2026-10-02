@@ -10,7 +10,12 @@
 	already configured to 115200 8N1 before entry.
 
 	md0: is a memory disk embedded in the loader image itself, so it is
-	available with no storage driver at all.
+	available with no storage driver at all.  disk0: is the SD card.
+
+	The loader boots from md0: unless loader.env on the card's FAT
+	partition (disk0s1:) sets rootdev, for example "rootdev=disk0s2a:".
+	It then reads /boot from that filesystem.  A boot started from
+	tryboot.txt reads tryboot.env first.
 
 ################################################################################
 # Ttryboot DReboot once using tryboot.txt
@@ -49,6 +54,16 @@
 	the /memory ranges from the device tree, and the map as runs of one
 	attribute: RAM write-back, the framebuffer non-cacheable, the rest
 	Device-nGnRnE.  The kernel is entered with the MMU and D-cache off.
+
+################################################################################
+# Tsdinfo DShow the SD card and its controller
+
+	sdinfo
+
+	The loader reads the SD card in the board's slot as disk0:, polled
+	and read-only, through the BCM2712's own SDHCI.  sdinfo prints the
+	controller's state, the card's identity and size, and what the reads
+	so far have cost.  Without a card it says why there is no disk0.
 
 ################################################################################
 # Tusbinfo DShow the USB keyboard controllers and ports
